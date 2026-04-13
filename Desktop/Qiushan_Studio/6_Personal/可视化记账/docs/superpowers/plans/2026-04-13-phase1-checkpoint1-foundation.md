@@ -907,7 +907,8 @@ Expected: FAIL because the fixture and migration helpers do not exist.
 ```ts
 // /app/src/storage/migrations/legacyCategoryPath.ts
 export function buildCategoryPath(parentPath: string | null, name: string): string {
-  return parentPath ? `${parentPath}/${name}` : name;
+  const encodedSegment = encodeURIComponent(name);
+  return parentPath ? `${parentPath}/${encodedSegment}` : encodedSegment;
 }
 ```
 
@@ -934,7 +935,7 @@ export interface LegacyMigrationReport {
 ```ts
 // /app/src/storage/migrations/legacyDeterministicId.ts
 export function deterministicId(prefix: string, path: string): string {
-  const normalized = path.replaceAll('/', '__').replaceAll(' ', '_');
+  const normalized = encodeURIComponent(path);
   return `${prefix}_${normalized}`;
 }
 ```
