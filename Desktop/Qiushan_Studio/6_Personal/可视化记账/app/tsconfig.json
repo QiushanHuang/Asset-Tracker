@@ -5,6 +5,10 @@
     "module": "ESNext",
     "moduleResolution": "Node",
     "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "rollup/parseAst": ["node_modules/rollup/dist/parseAst.d.ts"]
+    },
     "resolveJsonModule": true,
     "isolatedModules": true,
     "esModuleInterop": true,
