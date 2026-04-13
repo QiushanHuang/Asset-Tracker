@@ -678,13 +678,13 @@ export class CategoryRepository {
   constructor(private readonly db: AssetTrackerDb) {}
 
   async put(category: Category): Promise<void> {
-    const existing = await this.db.categories.get(category.id);
-
-    if (existing && category.revision <= existing.revision) {
-      throw new Error('Revision conflict');
-    }
-
     await this.db.transaction('rw', this.db.categories, this.db.operations, async () => {
+      const existing = await this.db.categories.get(category.id);
+
+      if (existing && category.revision <= existing.revision) {
+        throw new Error('Revision conflict');
+      }
+
       await this.db.categories.put(category);
       await this.db.operations.put({
         id: `op_${category.id}_${category.revision}`,
@@ -713,8 +713,28 @@ export class BookRepository {
     return this.db.books.get(id);
   }
 
-  put(book: Book): Promise<string> {
-    return this.db.books.put(book);
+  async put(book: Book): Promise<string> {
+    await this.db.transaction('rw', this.db.books, this.db.operations, async () => {
+      const existing = await this.db.books.get(book.id);
+
+      if (existing && book.revision <= existing.revision) {
+        throw new Error('Revision conflict');
+      }
+
+      await this.db.books.put(book);
+      await this.db.operations.put({
+        id: `op_${book.id}_${book.revision}`,
+        bookId: book.id,
+        entityType: 'book',
+        entityId: book.id,
+        operationType: 'put',
+        payload: JSON.stringify(book),
+        deviceId: book.deviceId,
+        createdAt: book.updatedAt
+      });
+    });
+
+    return book.id;
   }
 }
 ```
@@ -733,6 +753,12 @@ export class TransactionRepository {
 
   async put(transaction: Transaction): Promise<void> {
     await this.db.transaction('rw', this.db.transactions, this.db.operations, async () => {
+      const existing = await this.db.transactions.get(transaction.id);
+
+      if (existing && transaction.revision <= existing.revision) {
+        throw new Error('Revision conflict');
+      }
+
       await this.db.transactions.put(transaction);
       await this.db.operations.put({
         id: `op_${transaction.id}_${transaction.revision}`,
