@@ -1,5 +1,8 @@
 # Asset Tracker
 
+[![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](./README.md)
+[![English](https://img.shields.io/badge/Language-English-24292f)](./README.en.md)
+
 本仓库用于维护一个本地优先的资产记账与可视化分析系统，支持多币种资产管理、历史资产状态、自动记账、导入导出和数据分析大屏。
 
 当前主代码位于 `app/`，采用 `Vite + TypeScript + IndexedDB`；根目录静态页面与 `记账/` 目录保留为旧版实现和迁移参考。
@@ -38,10 +41,12 @@
 ├── docs/               # 设计文档与阶段计划
 ├── legacy/             # 旧版迁移说明
 ├── 记账/              # 旧版静态实现
+├── LICENSE             # MIT 许可证
 ├── index.html          # 根目录旧版页面入口
 ├── styles.css          # 根目录旧版样式
 ├── script.js           # 根目录旧版逻辑
-└── README.md           # 仓库说明
+├── README.md           # 中文说明
+└── README.en.md        # English README
 ```
 
 ## 🛠 技术栈
