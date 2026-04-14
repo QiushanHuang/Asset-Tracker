@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-04-14
+## v0.2.0 - 2026-04-14
 
 ### Template and transaction workflow
 - Allowed transaction templates without preset amounts so a template can prefill category, direction, purpose, and note while leaving the amount for the current entry.
