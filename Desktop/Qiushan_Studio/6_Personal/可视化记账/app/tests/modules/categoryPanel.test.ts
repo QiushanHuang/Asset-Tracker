@@ -319,7 +319,7 @@ describe('renderCategoryPanel', () => {
       '储蓄卡'
     );
 
-    collapseAllButton.click();
+    target.querySelector<HTMLButtonElement>('[data-action="collapse-all"]')?.click();
     await flushAsyncWork();
 
     expect((target.querySelector<HTMLElement>('[data-role="category-list"]')?.textContent ?? '')).not.toContain(

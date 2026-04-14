@@ -24,6 +24,9 @@
 - Changed income and expense pie charts to group by transaction purpose instead of account category.
 - Reworked analytics card layout so smaller cards stack beside larger charts with matched row heights.
 - Swapped the positions of the pie-composition card and the recurring cashflow heat-zone card for a denser analytics column layout.
+- Changed the analytics tree snapshot to start folded by default and added one-click expand-all / collapse-all controls.
+- Split the lower analytics area into dedicated forecast, composition, and snapshot rows so the right edge stays aligned with the upper charts.
+- Moved the cashflow heat-zone and category-composition cards into the same balanced row and paired the radar/custom cards beside the tree snapshot to reduce bottom whitespace.
 
 ### Stability and compatibility
 - Preserved template, rule, and transaction compatibility for older local data and legacy imports.

@@ -30,7 +30,7 @@ describe('renderAnalyticsPanel', () => {
     document.body.innerHTML = '';
   });
 
-  it('renders richer analytics controls, multi-pie composition, and collapsible tree snapshots', async () => {
+  it('renders richer analytics controls, balanced analytics rows, and default-collapsed tree snapshots', async () => {
     const book = await loadOrCreateLocalBook(db);
     const walletGroup = await createCategory(db, {
       bookId: book.id,
@@ -140,24 +140,54 @@ describe('renderAnalyticsPanel', () => {
     );
     expect(target.querySelectorAll('[data-role="composition-pie"]').length).toBe(3);
     expect(target.querySelector('details[data-role="tree-node"]')).not.toBeNull();
-    expect(target.querySelector('[data-role="forecast-side-stack"]')).not.toBeNull();
-    expect(target.querySelector('[data-role="insight-side-stack"]')).not.toBeNull();
+    expect(target.querySelector('[data-role="expand-tree-all"]')).not.toBeNull();
+    expect(target.querySelector('[data-role="collapse-tree-all"]')).not.toBeNull();
+    expect(target.querySelector('[data-role="forecast-balance-row"]')).not.toBeNull();
+    expect(target.querySelector('[data-role="composition-balance-row"]')).not.toBeNull();
+    expect(target.querySelector('[data-role="snapshot-balance-row"]')).not.toBeNull();
 
     const configCard = target.querySelector<HTMLElement>('[data-role="analytics-config"]');
     const historyCard = target.querySelector<HTMLElement>('[data-role="historical-comparison"]');
+    const forecastRow = target.querySelector<HTMLElement>('[data-role="forecast-balance-row"]');
+    const compositionRow = target.querySelector<HTMLElement>('[data-role="composition-balance-row"]');
+    const snapshotRow = target.querySelector<HTMLElement>('[data-role="snapshot-balance-row"]');
     const pieCard = target.querySelector<HTMLElement>('[data-role="pie-compositions-card"]');
     const heatmapCard = target.querySelector<HTMLElement>('[data-role="cashflow-heatmap-card"]');
+    const compositionCard = target.querySelector<HTMLElement>('[data-role="category-composition-card"]');
     const radarCard = target.querySelector<HTMLElement>('[data-role="radar-card"]');
     const insightCard = target.querySelector<HTMLElement>('[data-role="custom-insights-card"]');
+    const treeSnapshotCard = target.querySelector<HTMLElement>('[data-role="tree-snapshot-card"]');
+    const snapshotSideStack = target.querySelector<HTMLElement>('[data-role="snapshot-side-stack"]');
 
-    if (!configCard || !historyCard || !pieCard || !heatmapCard || !radarCard || !insightCard) {
+    if (
+      !configCard ||
+      !historyCard ||
+      !forecastRow ||
+      !compositionRow ||
+      !snapshotRow ||
+      !pieCard ||
+      !heatmapCard ||
+      !compositionCard ||
+      !radarCard ||
+      !insightCard ||
+      !treeSnapshotCard ||
+      !snapshotSideStack
+    ) {
       throw new Error('Missing analytics cards');
     }
 
     expect(configCard.compareDocumentPosition(historyCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(pieCard.parentElement).toBe(heatmapCard.parentElement);
-    expect(radarCard.parentElement).toBe(insightCard.parentElement);
-    expect(pieCard.compareDocumentPosition(heatmapCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(forecastRow.contains(pieCard)).toBe(true);
+    expect(compositionRow.contains(heatmapCard)).toBe(true);
+    expect(compositionRow.contains(compositionCard)).toBe(true);
+    expect(snapshotRow.contains(snapshotSideStack)).toBe(true);
+    expect(snapshotRow.contains(treeSnapshotCard)).toBe(true);
+    expect(snapshotSideStack.contains(radarCard)).toBe(true);
+    expect(snapshotSideStack.contains(insightCard)).toBe(true);
+    expect(forecastRow.compareDocumentPosition(compositionRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(compositionRow.compareDocumentPosition(snapshotRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(heatmapCard.compareDocumentPosition(compositionCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(radarCard.compareDocumentPosition(insightCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
     const compositionForm = target.querySelector<HTMLFormElement>('[data-role="composition-controls"]');
 
@@ -179,13 +209,22 @@ describe('renderAnalyticsPanel', () => {
     expect(target.textContent).toContain('150.00');
 
     const treeNode = target.querySelector<HTMLDetailsElement>('details[data-role="tree-node"]');
+    const expandTreeButton = target.querySelector<HTMLButtonElement>('[data-role="expand-tree-all"]');
+    const collapseTreeButton = target.querySelector<HTMLButtonElement>('[data-role="collapse-tree-all"]');
 
-    if (!treeNode) {
-      throw new Error('Missing tree node');
+    if (!treeNode || !expandTreeButton || !collapseTreeButton) {
+      throw new Error('Missing tree controls');
     }
 
-    treeNode.open = false;
-    treeNode.dispatchEvent(new Event('toggle'));
+    expect(treeNode.open).toBe(false);
+
+    expandTreeButton.click();
+    await flushAsyncWork();
+
+    expect(target.querySelector<HTMLDetailsElement>('details[data-role="tree-node"]')?.open).toBe(true);
+
+    target.querySelector<HTMLButtonElement>('[data-role="collapse-tree-all"]')?.click();
+    await flushAsyncWork();
 
     const analyticsForm = target.querySelector<HTMLFormElement>('[data-role="analytics-form"]');
 

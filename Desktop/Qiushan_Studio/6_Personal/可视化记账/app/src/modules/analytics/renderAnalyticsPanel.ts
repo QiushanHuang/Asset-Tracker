@@ -475,6 +475,18 @@ function buildTreeNodes(
   return roots;
 }
 
+function buildBranchTreeIds(
+  items: Awaited<ReturnType<typeof calculateAnalyticsSnapshot>>['categoryTree']
+): string[] {
+  const parentIds = new Set(
+    items
+      .map((item) => item.parentId)
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+  );
+
+  return items.filter((item) => parentIds.has(item.id)).map((item) => item.id);
+}
+
 function readOpenTreeIds(target: HTMLElement, defaultIds: string[]): Set<string> {
   try {
     const raw = target.dataset.analyticsOpenTreeIds
@@ -707,9 +719,8 @@ export async function renderAnalyticsPanel({
       )
     ];
     const radarPolygon = buildRadarPolygon(snapshot.radarMetrics.map((item) => item.value));
-    const defaultOpenTreeIds = snapshot.categoryTree
-      .filter((item) => item.depth < 1)
-      .map((item) => item.id);
+    const branchTreeIds = buildBranchTreeIds(snapshot.categoryTree);
+    const defaultOpenTreeIds: string[] = [];
     const openTreeIds = readOpenTreeIds(target, defaultOpenTreeIds);
     const treeMarkup = renderTreeNodes(buildTreeNodes(snapshot.categoryTree), openTreeIds);
     const assetCompositionMode = currentState.compositionMode === 'asset';
@@ -894,7 +905,8 @@ export async function renderAnalyticsPanel({
           </div>
           ${buildLineChart(analysisNetValues, snapshot.analysisSeries.map((item) => item.label), '净收入分析趋势图')}
         </section>
-        <section class="card analytics-span-7">
+        <div class="analytics-balanced-row" data-role="forecast-balance-row">
+          <section class="card analytics-span-7">
           <div class="card-header">
             <h3>未来预计曲线</h3>
             <span class="tag">周期扣款 / 工资预计</span>
@@ -903,9 +915,8 @@ export async function renderAnalyticsPanel({
             lineClass: 'forecast-line',
             areaClass: 'forecast-area'
           })}
-        </section>
-        <div class="analytics-card-stack analytics-span-5" data-role="forecast-side-stack">
-          <section class="card" data-role="pie-compositions-card">
+          </section>
+          <section class="card analytics-span-5" data-role="pie-compositions-card">
             <div class="card-header">
               <h3>饼图构成</h3>
               <span class="tag">${escapeHtml(snapshot.pieRange.label)}</span>
@@ -961,7 +972,9 @@ export async function renderAnalyticsPanel({
                 .join('')}
             </div>
           </section>
-          <section class="card" data-role="cashflow-heatmap-card">
+        </div>
+        <div class="analytics-balanced-row" data-role="composition-balance-row">
+          <section class="card analytics-span-5" data-role="cashflow-heatmap-card">
             <div class="card-header">
               <h3>周期现金流热区</h3>
               <span class="tag">自动规则聚合</span>
@@ -991,8 +1004,7 @@ export async function renderAnalyticsPanel({
               }
             </div>
           </section>
-        </div>
-        <section class="card analytics-span-7">
+          <section class="card analytics-span-7" data-role="category-composition-card">
           <div class="card-header">
             <h3>分类构成</h3>
             <span class="tag">${escapeHtml(assetCompositionMode ? '按观察时点' : snapshot.categoryCompositionRange.label)}</span>
@@ -1043,8 +1055,10 @@ export async function renderAnalyticsPanel({
                     .join('')
             }
           </div>
-        </section>
-        <div class="analytics-card-stack analytics-span-5" data-role="insight-side-stack">
+          </section>
+        </div>
+        <div class="analytics-balanced-row" data-role="snapshot-balance-row">
+          <div class="analytics-card-stack analytics-card-stack--balanced analytics-span-5" data-role="snapshot-side-stack">
           <section class="card" data-role="radar-card">
             <div class="card-header">
               <h3>结构分布雷达</h3>
@@ -1093,16 +1107,21 @@ export async function renderAnalyticsPanel({
               </table>
             </div>
           </section>
-        </div>
-        <section class="card analytics-span-12">
+          </div>
+          <section class="card analytics-span-7" data-role="tree-snapshot-card">
           <div class="card-header">
             <h3>分类树快照</h3>
-            <span class="tag">可折叠层级</span>
+            <div class="card-header-actions" data-role="tree-controls">
+              <span class="tag">默认折叠</span>
+              <button type="button" class="btn btn-secondary btn-sm" data-action="expand-all" data-role="expand-tree-all">全部展开</button>
+              <button type="button" class="btn btn-secondary btn-sm" data-action="collapse-all" data-role="collapse-tree-all">全部折叠</button>
+            </div>
           </div>
           <div class="analytics-tree">
             ${treeMarkup || '<p class="panel__empty">暂无分类树数据。</p>'}
           </div>
-        </section>
+          </section>
+        </div>
       </div>
     `;
 
@@ -1122,6 +1141,23 @@ export async function renderAnalyticsPanel({
         }
 
         writeOpenTreeIds(target, nextOpenIds);
+      });
+    });
+
+    content.querySelector<HTMLElement>('[data-role="tree-controls"]')?.addEventListener('click', (event) => {
+      const actionButton = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-action]');
+
+      if (!actionButton) {
+        return;
+      }
+
+      const nextOpenIds =
+        actionButton.dataset.action === 'expand-all' ? new Set(branchTreeIds) : new Set<string>();
+
+      writeOpenTreeIds(target, nextOpenIds);
+
+      content.querySelectorAll<HTMLDetailsElement>('[data-role="tree-node"]').forEach((details) => {
+        details.open = nextOpenIds.has(details.dataset.treeId ?? '');
       });
     });
 
