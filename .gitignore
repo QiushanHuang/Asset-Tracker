@@ -1,0 +1,7 @@
+.DS_Store
+.claude/
+.playwright-cli/
+*.rtf
+**/node_modules/
+**/dist/
+**/*.tsbuildinfo

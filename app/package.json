@@ -1,0 +1,26 @@
+{
+  "name": "asset-tracker-foundation",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run typecheck && vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "dexie": "^4.0.8",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/chai": "^5.2.0",
+    "@types/node": "^22.10.2",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vitest": "^2.1.8"
+  }
+}
