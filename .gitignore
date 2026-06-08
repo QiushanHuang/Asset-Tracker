@@ -1,0 +1,20 @@
+.DS_Store
+
+# Local assistant/editor state
+.claude/
+记账/.claude/
+
+# Test and browser automation output
+.playwright-cli/
+*.log
+
+# macOS / SwiftPM build output
+macos-app/.build/
+.build/
+DerivedData/
+
+# Packaged app artifacts
+dist/
+
+# Dependency folders
+node_modules/

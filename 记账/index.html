@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能资产记账 - Asset Tracker</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- 侧边栏导航 -->
+        <nav class="sidebar">
+            <div class="logo">
+                <h1>💰 Asset Tracker</h1>
+            </div>
+            <ul class="nav-menu">
+                <li><a href="#dashboard" class="nav-link active" data-section="dashboard">📊 资产概览</a></li>
+                <li><a href="#categories" class="nav-link" data-section="categories">🏷️ 分类管理</a></li>
+                <li><a href="#transactions" class="nav-link" data-section="transactions">💳 账单记录</a></li>
+                <li><a href="#automation" class="nav-link" data-section="automation">⚙️ 自动记账</a></li>
+                <li><a href="#analytics" class="nav-link" data-section="analytics">📈 数据分析</a></li>
+                <li><a href="#settings" class="nav-link" data-section="settings">⚙️ 系统设置</a></li>
+                <li><a href="#import-export" class="nav-link" data-section="import-export">📁 导入导出</a></li>
+            </ul>
+        </nav>
+
+        <!-- 主内容区域 -->
+        <main class="main-content">
+            <!-- 头部工具栏 -->
+            <header class="header">
+                <div class="header-left">
+                    <h2 id="section-title">资产概览</h2>
+                </div>
+                <div class="header-right">
+                    <button class="btn btn-primary" id="add-transaction-btn">+ 添加账单</button>
+                    <button class="btn btn-secondary" id="backup-btn">备份数据</button>
+                </div>
+            </header>
+
+            <!-- 资产概览页面 -->
+            <section id="dashboard" class="content-section active">
+                <div class="dashboard-grid">
+                    <!-- 总资产卡片 -->
+                    <div class="card asset-summary">
+                        <h3>资产总览</h3>
+                        <div class="summary-grid">
+                            <div class="summary-item clickable" data-type="total">
+                                <span class="label">总资产</span>
+                                <span class="value total-assets">¥0.00</span>
+                            </div>
+                            <div class="summary-item clickable" data-type="digital">
+                                <span class="label">数字资产</span>
+                                <span class="value digital-assets">¥0.00</span>
+                            </div>
+                            <div class="summary-item clickable" data-type="cash">
+                                <span class="label">现金</span>
+                                <span class="value cash-assets">¥0.00</span>
+                            </div>
+                            <div class="summary-item clickable" data-type="balance">
+                                <span class="label">现余额</span>
+                                <span class="value current-balance">¥0.00</span>
+                            </div>
+                            <div class="summary-item clickable" data-type="debt">
+                                <span class="label">待还款</span>
+                                <span class="value debt-assets">¥0.00</span>
+                            </div>
+                        </div>
+
+                        <!-- 外币详情显示区域 -->
+                        <div id="currency-details" class="currency-details" style="display: none;">
+                            <div class="currency-details-header">
+                                <h4 id="details-title">资产详情</h4>
+                                <button class="btn btn-sm" id="close-details-btn">✕</button>
+                            </div>
+                            <div class="currency-breakdown" id="currency-breakdown">
+                                <!-- 货币分解详情将在这里显示 -->
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 资产分布饼图 -->
+                    <div class="card chart-container">
+                        <div class="chart-header">
+                            <h3>资产分布</h3>
+                            <div class="chart-controls">
+                                <select id="pie-chart-level">
+                                    <option value="top">顶级分类</option>
+                                    <option value="all" selected>所有子分类</option>
+                                    <option value="leaf">最底层分类</option>
+                                </select>
+                                <button class="btn btn-sm" onclick="assetTracker.updateAssetPieChart()">刷新</button>
+                            </div>
+                        </div>
+                        <canvas id="assetPieChart"></canvas>
+                    </div>
+
+                    <!-- 趋势图 -->
+                    <div class="card chart-container">
+                        <div class="chart-header">
+                            <h3>资产趋势</h3>
+                            <div class="chart-controls">
+                                <select id="trend-time-range">
+                                    <option value="7">最近7天</option>
+                                    <option value="30" selected>最近30天</option>
+                                    <option value="90">最近90天</option>
+                                    <option value="180">最近半年</option>
+                                    <option value="365">最近一年</option>
+                                    <option value="all">全部历史</option>
+                                </select>
+                                <button class="btn btn-sm" onclick="assetTracker.zoomOut()">缩小</button>
+                                <button class="btn btn-sm" onclick="assetTracker.zoomIn()">放大</button>
+                                <button class="btn btn-sm" onclick="assetTracker.updateAssetTrendChart()">刷新</button>
+                            </div>
+                        </div>
+                        <canvas id="assetTrendChart"></canvas>
+                    </div>
+
+                    <!-- 最近交易 -->
+                    <div class="card recent-transactions">
+                        <h3>最近交易</h3>
+                        <div id="recent-transactions-list">
+                            <p class="empty-state">暂无交易记录</p>
+                        </div>
+                    </div>
+
+                    <!-- 备忘录 -->
+                    <div class="card memo-section">
+                        <div class="card-header">
+                            <h3>备忘录</h3>
+                            <button class="btn btn-sm" id="edit-memo-btn">✏️ 编辑</button>
+                        </div>
+                        <div class="memo-content">
+                            <div id="memo-display" class="memo-display">
+                                <p class="empty-state">点击编辑按钮添加备忘录</p>
+                            </div>
+                            <div id="memo-editor" class="memo-editor" style="display: none;">
+                                <textarea id="memo-textarea" rows="5" placeholder="在此输入备忘录内容..."></textarea>
+                                <div class="memo-actions">
+                                    <button class="btn btn-sm btn-primary" id="save-memo-btn">保存</button>
+                                    <button class="btn btn-sm btn-secondary" id="cancel-memo-btn">取消</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 历史资产分析 -->
+                    <div class="card history-analysis-section">
+                        <div class="card-header">
+                            <h3>历史资产分析</h3>
+                            <button class="btn btn-sm btn-primary" id="calculate-history-btn">📊 计算历史状况</button>
+                        </div>
+                        <div class="history-analysis">
+                            <div id="history-result" style="display: none; margin-top: 1rem;">
+                                <!-- 分析结果将在这里显示 -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 分类管理页面 -->
+            <section id="categories" class="content-section">
+                <div class="categories-container">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>资产分类管理</h3>
+                            <button class="btn btn-primary" id="add-category-btn">+ 添加分类</button>
+                        </div>
+                        <div class="categories-tree" id="categories-tree">
+                            <!-- 分类树将在这里动态生成 -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 账单记录页面 -->
+            <section id="transactions" class="content-section">
+                <div class="transactions-container">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>账单记录</h3>
+                            <div class="filter-controls">
+                                <select id="category-filter">
+                                    <option value="">全部分类</option>
+                                </select>
+                                <input type="date" id="date-from">
+                                <input type="date" id="date-to">
+                                <button class="btn btn-secondary" id="filter-btn">筛选</button>
+                            </div>
+                        </div>
+                        <div class="transactions-table">
+                            <table id="transactions-table">
+                                <thead>
+                                    <tr>
+                                        <th>日期</th>
+                                        <th>类别</th>
+                                        <th>子类别</th>
+                                        <th>金额</th>
+                                        <th>类型</th>
+                                        <th>用途</th>
+                                        <th>描述</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="transactions-tbody">
+                                    <!-- 交易记录将在这里动态生成 -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 自动记账页面 -->
+            <section id="automation" class="content-section">
+                <div class="automation-container">
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>自动记账规则</h3>
+                            <button class="btn btn-primary" id="add-rule-btn">+ 添加规则</button>
+                        </div>
+                        <div id="automation-rules">
+                            <!-- 自动记账规则将在这里显示 -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 数据分析页面 -->
+            <section id="analytics" class="content-section">
+                <div class="analytics-container">
+                    <div class="analytics-controls">
+                        <div class="card">
+                            <h3>图表配置</h3>
+                            <div class="chart-config">
+                                <select id="chart-type">
+                                    <option value="line">折线图</option>
+                                    <option value="bar">柱状图</option>
+                                    <option value="pie">饼图</option>
+                                    <option value="area">面积图</option>
+                                </select>
+                                <select id="chart-categories" multiple>
+                                    <!-- 分类选项将动态生成 -->
+                                </select>
+                                <select id="time-range">
+                                    <option value="7">最近7天</option>
+                                    <option value="30">最近30天</option>
+                                    <option value="90">最近90天</option>
+                                    <option value="365">最近一年</option>
+                                </select>
+                                <button class="btn btn-primary" id="generate-chart-btn">生成图表</button>
+                                <button class="btn btn-secondary" id="hypothesis-btn">设置假设</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="chart-display">
+                        <div class="card">
+                            <h3>自定义图表</h3>
+                            <canvas id="customChart"></canvas>
+                        </div>
+                        <div class="card">
+                            <h3>未来预测</h3>
+                            <canvas id="predictionChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 系统设置页面 -->
+            <section id="settings" class="content-section">
+                <div class="settings-container">
+                    <div class="card">
+                        <h3>汇率设置</h3>
+                        <div class="currency-settings">
+                            <div class="form-group">
+                                <label>基准币种</label>
+                                <select id="base-currency">
+                                    <option value="CNY">人民币 (CNY)</option>
+                                    <option value="SGD">新加坡元 (SGD)</option>
+                                    <option value="USD">美元 (USD)</option>
+                                    <option value="MYR">马来西亚令吉 (MYR)</option>
+                                </select>
+                            </div>
+                            <div id="exchange-rates-list">
+                                <!-- 汇率列表将动态生成 -->
+                            </div>
+                            <button class="btn btn-primary" id="save-currency-btn">保存汇率设置</button>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>自动备份设置</h3>
+                        <div class="backup-settings">
+                            <div class="form-group">
+                                <label>
+                                    <input type="checkbox" id="auto-backup-enabled"> 启用自动备份
+                                </label>
+                            </div>
+                            <div class="form-group">
+                                <label>备份间隔（小时）</label>
+                                <input type="number" id="backup-interval" min="1" max="168" value="24">
+                            </div>
+                            <button class="btn btn-primary" id="save-backup-btn">保存备份设置</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 导入导出页面 -->
+            <section id="import-export" class="content-section">
+                <div class="import-export-container">
+                    <div class="card">
+                        <h3>数据导入</h3>
+                        <div class="import-section">
+                            <input type="file" id="import-file" accept=".xlsx,.csv">
+                            <button class="btn btn-primary" id="import-btn">导入数据</button>
+                            <a href="#" id="download-template" class="btn btn-secondary">下载Excel模板</a>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>数据导出</h3>
+                        <div class="export-section">
+                            <button class="btn btn-primary" id="export-excel-btn">导出Excel</button>
+                            <button class="btn btn-secondary" id="export-json-btn">导出JSON</button>
+                            <button class="btn btn-secondary" id="export-chart-btn">导出图表</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- 弹窗模态框 -->
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <div id="modal-body">
+                <!-- 弹窗内容将动态插入 -->
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
