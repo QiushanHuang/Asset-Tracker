@@ -1,5 +1,6 @@
 index.html
 styles.css
+legacy-safety.js
 script.js
 vendor/chart.umd.min.js
 vendor/xlsx.full.min.js

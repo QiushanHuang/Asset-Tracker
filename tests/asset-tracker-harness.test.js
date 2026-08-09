@@ -90,6 +90,33 @@ test('setting textContent clears children and detaches their parent links', () =
     assert.equal(child.parentElement, null);
 });
 
+test('element attributes reflect hidden and inert DOM properties', () => {
+    const element = createElementStub({
+        attributes: { hidden: '', inert: '', 'aria-hidden': 'true' }
+    });
+
+    assert.equal(element.hidden, true);
+    assert.equal(element.inert, true);
+    element.removeAttribute('hidden');
+    element.removeAttribute('inert');
+    assert.equal(element.hidden, false);
+    assert.equal(element.inert, false);
+});
+
+test('harness loads the legacy safety runtime and exposes mutable source observations', (t) => {
+    const app = loadAssetTracker({
+        localStorageSeed: { assetTrackerData: '{"memo":"before"}' }
+    });
+    t.after(app.dispose);
+
+    assert.equal(typeof app.context.AssetTrackerLegacySafety.validateBookText, 'function');
+    assert.equal(app.readLocalStorage('assetTrackerData'), '{"memo":"before"}');
+    app.setLocalStorage('assetTrackerData', '{"memo":"after"}');
+    assert.equal(app.readLocalStorage('assetTrackerData'), '{"memo":"after"}');
+    app.setLocalStorage('assetTrackerData', null);
+    assert.equal(app.readLocalStorage('assetTrackerData'), null);
+});
+
 test('document override receives the VM DOMContentLoaded registration', (t) => {
     const registrations = [];
     const documentOverride = {
@@ -131,8 +158,24 @@ test('storage override handles real production adapter reads and writes', async 
     assert.equal(app.context.localStorage, storageOverride);
     const loaded = await tracker.storageAdapter.load();
     assert.equal(loaded.stateJson, '{"memo":"injected"}');
-    await tracker.storageAdapter.save('{"memo":"written"}');
+    const confirmation = await tracker.storageAdapter.confirmLoad({
+        protocolVersion: 2,
+        loadId: loaded.loadId,
+        outcome: 'valid',
+        reason: null,
+        validatedSourceHash: loaded.rawHash
+    });
+    assert.equal(confirmation.ok, true);
+    await tracker.storageAdapter.save('{"memo":"written"}', {
+        protocolVersion: 2,
+        loadId: loaded.loadId,
+        writeSessionToken: confirmation.writeSessionToken,
+        expectedHash: loaded.rawHash,
+        validatedSourceHash: loaded.rawHash
+    });
     assert.deepEqual(calls, [
+        { method: 'getItem', key: 'assetTrackerData' },
+        { method: 'getItem', key: 'assetTrackerData' },
         { method: 'getItem', key: 'assetTrackerData' },
         { method: 'setItem', key: 'assetTrackerData', value: '{"memo":"written"}' }
     ]);

@@ -9,7 +9,26 @@
     <script src="vendor/xlsx.full.min.js"></script>
 </head>
 <body>
-    <div class="app-container">
+    <div id="app-status" class="app-status" role="status" aria-live="polite">正在安全打开账本…</div>
+    <div id="data-safety-status" class="data-safety-status" role="status" aria-live="polite"></div>
+
+    <section id="recovery-surface" class="recovery-surface" hidden aria-labelledby="recovery-title">
+        <div class="recovery-card">
+            <p class="recovery-kicker">数据保护</p>
+            <h1 id="recovery-title" tabindex="-1">账本暂时无法打开</h1>
+            <p id="recovery-detail" class="recovery-detail"></p>
+            <p class="recovery-protection">只读保护已开启。所有修改功能已停用；本次启动未对原始账本执行写入或替换。</p>
+            <dl id="recovery-source-detail" class="recovery-source-detail"></dl>
+            <div class="recovery-actions">
+                <button class="btn btn-primary" id="retry-book-load-btn" type="button" hidden>重试读取</button>
+                <button class="btn btn-secondary" id="export-raw-book-btn" type="button" hidden>导出原始账本</button>
+                <button class="btn btn-secondary" id="reveal-storage-folder-btn" type="button" hidden>打开数据目录</button>
+            </div>
+            <p id="recovery-relaunch-note" class="recovery-relaunch-note" hidden>请重新启动应用后再试。</p>
+        </div>
+    </section>
+
+    <div class="app-container" id="normal-app-shell" hidden inert aria-hidden="true">
         <!-- 侧边栏导航 -->
         <nav class="sidebar">
             <div class="logo">
@@ -31,7 +50,7 @@
             <!-- 头部工具栏 -->
             <header class="header">
                 <div class="header-left">
-                    <h2 id="section-title">资产概览</h2>
+                    <h2 id="section-title" tabindex="-1">资产概览</h2>
                 </div>
                 <div class="header-right">
                     <button class="btn btn-primary" id="add-transaction-btn">+ 添加账单</button>
@@ -341,7 +360,7 @@
                         <div class="export-section">
                             <button class="btn btn-primary" id="export-excel-btn">导出Excel</button>
                             <button class="btn btn-secondary" id="export-json-btn">导出完整账本(JSON)</button>
-                            <button class="btn btn-secondary" id="reveal-storage-folder-btn">打开数据目录</button>
+                            <button class="btn btn-secondary" id="reveal-storage-folder-main-btn">打开数据目录</button>
                             <button class="btn btn-secondary" id="reset-data-btn">恢复默认账本</button>
                             <button class="btn btn-secondary" id="export-chart-btn">导出图表</button>
                         </div>
@@ -362,6 +381,7 @@
     </div>
 
 
+    <script src="legacy-safety.js"></script>
     <script src="script.js"></script>
 </body>
 </html>

@@ -1,7 +1,9 @@
 import AppKit
+import AssetTrackerCore
 import Foundation
 import WebKit
 
+@MainActor
 final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var webView: WKWebView?
@@ -55,10 +57,20 @@ final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate {
 
         self.window = window
         self.webView = webView
+        let applicationSupportURL = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0]
+        let storageDirectoryURL = applicationSupportURL.appendingPathComponent(
+            "com.qiushan.AssetTracker",
+            isDirectory: true
+        )
+        let bookStore = AssetTrackerBookStore(storageDirectoryURL: storageDirectoryURL)
         self.bridge = AssetTrackerHostBridge.attach(
             to: userContentController,
             webView: webView,
-            hostWindow: window
+            hostWindow: window,
+            bookStore: bookStore
         )
 
         loadRootPage(in: webView)
@@ -86,8 +98,10 @@ final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-let application = NSApplication.shared
-let delegate = AssetTrackerAppDelegate()
-application.setActivationPolicy(.regular)
-application.delegate = delegate
-application.run()
+MainActor.assumeIsolated {
+    let application = NSApplication.shared
+    let delegate = AssetTrackerAppDelegate()
+    application.setActivationPolicy(.regular)
+    application.delegate = delegate
+    application.run()
+}

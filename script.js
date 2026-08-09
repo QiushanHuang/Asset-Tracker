@@ -1,6 +1,12 @@
 const ASSET_BOOK_FORMAT = 'qiushan.asset-book';
 const ASSET_BOOK_FORMAT_VERSION = 1;
 const ASSET_BOOK_SCHEMA_VERSION = 1;
+const ASSET_BOOK_PROTOCOL_VERSION = 2;
+const LegacySafety = globalThis.AssetTrackerLegacySafety;
+
+if (!LegacySafety || typeof LegacySafety.validateBookText !== 'function') {
+    throw new Error('AssetTrackerLegacySafety must load before script.js');
+}
 
 (function installAssetTrackerHost() {
     if (window.AssetTrackerHost) {
@@ -68,15 +74,16 @@ const ASSET_BOOK_SCHEMA_VERSION = 1;
 })();
 
 function safeComputeHash(text) {
-    let hash = 2166136261;
-    const str = String(text || '');
+    return LegacySafety.inspectDOMString(String(text)).rawHash;
+}
 
-    for (let i = 0; i < str.length; i++) {
-        hash ^= str.charCodeAt(i);
-        hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+function bytesToBase64(bytes) {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        binary += Array.from(bytes.subarray(offset, offset + chunkSize), byte => String.fromCharCode(byte)).join('');
     }
-
-    return `h${(hash >>> 0).toString(16)}`;
+    return btoa(binary);
 }
 
 class AssetTrackerFileAdapter {
@@ -191,6 +198,18 @@ class AssetTrackerFileAdapter {
         return Promise.reject(new Error('Web环境不支持打开数据目录'));
     }
 
+    async exportRawBook({ expectedHash, suggestedName = 'AssetTrackerBook.raw' }) {
+        if (!window.AssetTrackerHost?.isAvailable?.()) {
+            throw new Error('Web环境不支持原生原始账本导出');
+        }
+
+        return window.AssetTrackerHost.invoke('file.saveRawBook', {
+            protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+            expectedHash,
+            suggestedName
+        });
+    }
+
     normalizeImportedContent(text, encoding = 'text', { output = 'binary' } = {}) {
         if (encoding !== 'base64' && encoding !== 'binary') {
             if (output === 'binary') {
@@ -239,42 +258,214 @@ class AssetTrackerStorageAdapter {
         this.storagePath = 'localStorage';
         this.storageMode = 'localStorage';
         this.supportsNative = !!(window.AssetTrackerHost?.isAvailable?.());
+        this.loadSequence = 0;
+        this.confirmedSession = null;
+        this.pendingCandidate = null;
+        this.webGateState = 'neverLoaded';
     }
 
-    async load() {
-        if (this.supportsNative) {
-            const result = await window.AssetTrackerHost.invoke('storage.load', {});
-            if (result && result.stateJson !== undefined) {
-                this.stateHash = result.stateHash || '';
-                this.storagePath = result.storagePath || this.storagePath;
+    nextWebLoadId() {
+        this.loadSequence += 1;
+        return `web-load-${Date.now()}-${this.loadSequence}`;
+    }
 
-                return {
-                    stateJson: result.stateJson,
-                    stateHash: this.stateHash,
-                    schemaVersion: result.schemaVersion || ASSET_BOOK_SCHEMA_VERSION,
-                    updatedAt: result.updatedAt || null,
-                    storagePath: this.storagePath
-                };
+    async load({ retry = false } = {}) {
+        if (this.supportsNative) {
+            const result = await window.AssetTrackerHost.invoke('storage.load', {
+                protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+                retry: Boolean(retry)
+            });
+            if (!result || result.protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION) {
+                throw new Error('UNSUPPORTED_NATIVE_STORAGE_PROTOCOL');
+            }
+
+            this.stateHash = result.rawHash || result.stateHash || '';
+            this.storagePath = result.storagePath || this.storagePath;
+            return {
+                ...result,
+                stateHash: this.stateHash,
+                rawHash: result.rawHash || (result.status === 'readableBytes' ? result.stateHash : null),
+                updatedAt: result.updatedAt || null,
+                storagePath: this.storagePath
+            };
+        }
+
+        const previousGateState = this.webGateState;
+        this.confirmedSession = null;
+        this.pendingCandidate = null;
+        const loadId = this.nextWebLoadId();
+        let stateJson;
+        try {
+            stateJson = localStorage.getItem(this.storageKey);
+        } catch (error) {
+            return this.registerWebLoad({
+                protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+                loadId,
+                status: 'ioError',
+                reason: 'readFailed',
+                stateJson: null,
+                stateHash: '',
+                rawHash: null,
+                hashAlgorithm: 'sha256',
+                updatedAt: null,
+                storagePath: this.storagePath,
+                canExportRaw: false,
+                canRevealFolder: false,
+                error
+            }, { retry, previousGateState });
+        }
+
+        this.storageMode = 'localStorage';
+        if (stateJson === null) {
+            this.stateHash = '';
+            return this.registerWebLoad({
+                protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+                loadId,
+                status: 'missing',
+                reason: null,
+                stateJson: null,
+                stateHash: '',
+                rawHash: null,
+                hashAlgorithm: 'sha256',
+                updatedAt: null,
+                storagePath: this.storagePath,
+                canExportRaw: false,
+                canRevealFolder: false
+            }, { retry, previousGateState });
+        }
+
+        const evidence = LegacySafety.inspectDOMString(stateJson);
+        this.stateHash = evidence.rawHash;
+        return this.registerWebLoad({
+            protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+            loadId,
+            status: 'readableBytes',
+            reason: null,
+            stateJson,
+            stateHash: evidence.rawHash,
+            rawHash: evidence.rawHash,
+            hashAlgorithm: evidence.hashAlgorithm,
+            rawEvidence: evidence,
+            updatedAt: null,
+            storagePath: this.storagePath,
+            canExportRaw: true,
+            canRevealFolder: false
+        }, { retry, previousGateState });
+    }
+
+    registerWebLoad(result, { retry, previousGateState }) {
+        if (previousGateState === 'terminalLocked') {
+            this.webGateState = 'terminalLocked';
+            return result;
+        }
+
+        const isInitialLoad = !retry && previousGateState === 'neverLoaded';
+        const isRecoveryRetry = retry && previousGateState === 'recoverableLocked';
+        if (isInitialLoad && result.status === 'missing') {
+            this.webGateState = 'candidateMissing';
+            this.pendingCandidate = { loadId: result.loadId, status: 'missing', rawHash: null };
+        } else if ((isInitialLoad || isRecoveryRetry) && result.status === 'readableBytes') {
+            this.webGateState = isRecoveryRetry ? 'retryCandidateExisting' : 'candidateExisting';
+            this.pendingCandidate = {
+                loadId: result.loadId,
+                status: 'readableBytes',
+                rawHash: result.rawHash
+            };
+        } else {
+            this.webGateState = 'recoverableLocked';
+        }
+        return result;
+    }
+
+    async confirmLoad(request) {
+        if (this.supportsNative) {
+            return window.AssetTrackerHost.invoke('storage.confirmLoad', request);
+        }
+
+        if (request.protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION) {
+            return { ok: false, error: 'unsupported protocol' };
+        }
+        if (this.webGateState === 'terminalLocked') {
+            return { ok: false, error: 'terminal gate lock' };
+        }
+        const candidate = this.pendingCandidate;
+        if (!candidate || candidate.loadId !== request.loadId) {
+            return { ok: false, error: 'stale or missing load candidate' };
+        }
+        if (!['missing', 'valid', 'recovery'].includes(request.outcome)) {
+            return { ok: false, error: 'invalid confirmation outcome' };
+        }
+
+        const expectedOutcome = candidate.status === 'missing' ? 'missing' : 'valid';
+        const expectedHash = candidate.rawHash;
+        if (request.outcome !== 'recovery' && request.outcome !== expectedOutcome) {
+            return { ok: false, error: 'confirmation outcome does not match candidate' };
+        }
+        if (request.validatedSourceHash !== expectedHash) {
+            return { ok: false, error: 'candidate hash mismatch' };
+        }
+
+        const current = localStorage.getItem(this.storageKey);
+        if (candidate.status === 'missing') {
+            if (current !== null) return { ok: false, error: 'stale missing candidate' };
+        } else {
+            if (current === null) return { ok: false, error: 'source disappeared' };
+            if (LegacySafety.inspectDOMString(current).rawHash !== expectedHash) {
+                return { ok: false, error: 'stale source hash' };
             }
         }
 
-        const stateJson = localStorage.getItem(this.storageKey);
-        this.stateHash = safeComputeHash(stateJson || '');
-        this.storageMode = 'localStorage';
+        this.pendingCandidate = null;
+        if (request.outcome === 'recovery') {
+            this.confirmedSession = null;
+            this.webGateState = request.reason?.endsWith('.postRender') || request.reason?.startsWith('renderError')
+                ? 'terminalLocked'
+                : 'recoverableLocked';
+            return { ok: true, writeSessionToken: null };
+        }
 
-        return {
-            stateJson: stateJson || null,
-            stateHash: this.stateHash,
-            schemaVersion: ASSET_BOOK_SCHEMA_VERSION,
-            updatedAt: null,
-            storagePath: this.storagePath
+        const token = `web-session-${Date.now()}-${request.loadId}-${++this.loadSequence}`;
+        this.confirmedSession = {
+            loadId: request.loadId,
+            token,
+            rawHash: request.validatedSourceHash
         };
+        this.webGateState = candidate.status === 'missing' ? 'validatedMissing' : 'validatedExisting';
+        return { ok: true, writeSessionToken: token };
     }
 
-    async save(stateJson, { expectedHash = null, reason = 'autosave' } = {}) {
+    lockTerminal() {
+        this.confirmedSession = null;
+        this.pendingCandidate = null;
+        this.webGateState = 'terminalLocked';
+    }
+
+    async terminalize(request) {
+        this.lockTerminal();
+        if (!this.supportsNative) {
+            return { ok: true };
+        }
+        return window.AssetTrackerHost.invoke('storage.terminalize', request);
+    }
+
+    async save(stateJson, {
+        protocolVersion = null,
+        loadId = null,
+        writeSessionToken = null,
+        expectedHash = null,
+        validatedSourceHash = null,
+        reason = 'autosave'
+    } = {}) {
+        if (this.webGateState === 'terminalLocked') {
+            throw new Error('WRITE_SESSION_NOT_VALIDATED');
+        }
         if (this.supportsNative) {
             const result = await window.AssetTrackerHost.invoke('storage.save', {
+                protocolVersion,
+                loadId,
+                writeSessionToken,
                 expectedHash,
+                validatedSourceHash,
                 stateJson,
                 schemaVersion: ASSET_BOOK_SCHEMA_VERSION,
                 reason
@@ -287,8 +478,31 @@ class AssetTrackerStorageAdapter {
             return result;
         }
 
+        const session = this.confirmedSession;
+        if (
+            protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION ||
+            !session ||
+            !['validatedMissing', 'validatedExisting'].includes(this.webGateState) ||
+            session.loadId !== loadId ||
+            session.token !== writeSessionToken ||
+            session.rawHash !== expectedHash ||
+            expectedHash !== validatedSourceHash
+        ) {
+            throw new Error('WRITE_SESSION_NOT_VALIDATED');
+        }
+        const current = localStorage.getItem(this.storageKey);
+        if (expectedHash === null) {
+            if (current !== null) throw new Error('STALE_MISSING_SOURCE');
+        } else {
+            if (current === null || LegacySafety.inspectDOMString(current).rawHash !== expectedHash) {
+                throw new Error('STALE_SOURCE_HASH');
+            }
+        }
+
         localStorage.setItem(this.storageKey, stateJson);
         this.stateHash = safeComputeHash(stateJson);
+        session.rawHash = this.stateHash;
+        this.webGateState = 'validatedExisting';
 
         return {
             ok: true,
@@ -314,13 +528,437 @@ class AssetTracker {
         this.storageMode = this.storageAdapter.supportsNative ? 'native' : 'browser';
         this.autoBackupTimer = null;
         this.lastError = null;
+        this.lastLoadResult = null;
+        this.pendingRawLoad = null;
+        this.rawEvidence = null;
+        this.writeSessionToken = null;
+        this.validatedSourceHash = null;
+        this.openAttemptEpoch = 0;
+        this.retryInFlight = null;
+        this.appState = 'booting';
+        this.recoveryMode = {
+            active: false,
+            reason: null,
+            phase: null,
+            terminal: false
+        };
+        this.recoveryActionsBound = false;
+        this.isolateNormalShell();
+        this.hideRecoveryActions();
+        this.setupRecoveryActions();
     }
 
     async initialize() {
-        this.data = this.normalizeLoadedData(await this.loadData());
-        this.initializeApp();
-        this.refreshStorageDisplay();
-        this.setupAutoBackup();
+        this.isolateNormalShell();
+        this.setAppState('loading');
+        await this.openBook({ retry: false });
+    }
+
+    isolateNormalShell() {
+        const shell = document.getElementById('normal-app-shell');
+        if (!shell) return;
+        shell.hidden = true;
+        shell.inert = true;
+        shell.setAttribute('hidden', '');
+        shell.setAttribute('inert', '');
+        shell.setAttribute('aria-hidden', 'true');
+    }
+
+    revealNormalShell() {
+        const shell = document.getElementById('normal-app-shell');
+        if (!shell) return;
+        shell.hidden = false;
+        shell.inert = false;
+        shell.removeAttribute('hidden');
+        shell.removeAttribute('inert');
+        shell.removeAttribute('aria-hidden');
+    }
+
+    setAppState(state, detail = '') {
+        this.appState = state;
+        this.appStateDetail = detail;
+        this.refreshAppStatus();
+    }
+
+    refreshAppStatus() {
+        const node = document.getElementById('app-status');
+        if (!node) return;
+        const labels = {
+            booting: '正在准备安全打开…',
+            loading: '正在安全读取账本…',
+            rendering: '账本已验证，正在准备界面…',
+            confirming: '正在确认本次安全打开…',
+            writable: '账本已安全打开',
+            readOnlyRecovery: '只读保护已开启',
+            terminalRecovery: '本次启动已进入终止性只读保护'
+        };
+        node.textContent = this.appStateDetail || labels[this.appState] || '';
+    }
+
+    renderDataSafetyState() {
+        const node = document.getElementById('data-safety-status');
+        if (!node) return;
+        if (this.recoveryMode.active) {
+            node.textContent = '只读保护已开启：本次启动不会写入或替换原始账本。';
+        } else if (this.appState === 'writable') {
+            node.textContent = this.storageAdapter.supportsNative
+                ? '账本已通过读取验证；写入会携带本次会话令牌。'
+                : '账本已从浏览器本地存储安全打开。';
+        } else {
+            node.textContent = '';
+        }
+    }
+
+    setupRecoveryActions() {
+        if (this.recoveryActionsBound) return;
+        this.recoveryActionsBound = true;
+        document.getElementById('retry-book-load-btn')?.addEventListener('click', () => {
+            this.retryBookLoad().catch(() => {});
+        });
+        document.getElementById('export-raw-book-btn')?.addEventListener('click', () => {
+            this.exportRawBook().catch(error => this.showMessage(error?.message || '原始账本导出失败', 'error'));
+        });
+        document.getElementById('reveal-storage-folder-btn')?.addEventListener('click', () => {
+            this.revealStorageFolder().catch(() => {});
+        });
+    }
+
+    hideRecoveryActions() {
+        for (const id of ['retry-book-load-btn', 'export-raw-book-btn', 'reveal-storage-folder-btn']) {
+            const action = document.getElementById(id);
+            if (action) action.hidden = true;
+        }
+    }
+
+    resetRawEvidenceForAttempt() {
+        this.pendingRawLoad = null;
+        this.rawEvidence = null;
+        this.hideRecoveryActions();
+    }
+
+    recordRawEvidence(evidence, rawResult, attemptEpoch) {
+        if (!evidence?.rawHash) return null;
+        const source = this.storageAdapter.supportsNative ? 'native' : 'web';
+        const recorded = {
+            ...evidence,
+            attemptEpoch,
+            source,
+            canExportRaw: rawResult.canExportRaw === true,
+            canRevealFolder: source === 'native' && rawResult.canRevealFolder === true
+        };
+        this.rawEvidence = recorded;
+        this.pendingRawLoad = { ...rawResult, rawEvidence: recorded };
+        return recorded;
+    }
+
+    canExportCurrentRawEvidence() {
+        const evidence = this.rawEvidence;
+        if (
+            !this.recoveryMode.active ||
+            !evidence ||
+            evidence.attemptEpoch !== this.openAttemptEpoch ||
+            evidence.canExportRaw !== true ||
+            typeof evidence.rawHash !== 'string' ||
+            !evidence.rawHash
+        ) {
+            return false;
+        }
+        if (this.storageAdapter.supportsNative) {
+            return evidence.source === 'native';
+        }
+        return evidence.source === 'web' &&
+            evidence.bytes instanceof Uint8Array &&
+            LegacySafety.sha256Hex(evidence.bytes) === evidence.rawHash;
+    }
+
+    canRevealCurrentRecoveryFolder() {
+        const evidence = this.rawEvidence;
+        return this.recoveryMode.active &&
+            this.storageAdapter.supportsNative &&
+            evidence?.attemptEpoch === this.openAttemptEpoch &&
+            evidence.source === 'native' &&
+            evidence.canRevealFolder === true;
+    }
+
+    validateRawBook(stateJson) {
+        return LegacySafety.validateBookText(stateJson);
+    }
+
+    async openBook({ retry }) {
+        if (retry && this.recoveryMode.terminal) {
+            throw new Error('TERMINAL_RECOVERY');
+        }
+        const attemptEpoch = ++this.openAttemptEpoch;
+        const isCurrentAttempt = () => attemptEpoch === this.openAttemptEpoch;
+
+        this.isolateNormalShell();
+        this.resetRawEvidenceForAttempt();
+        this.writeSessionToken = null;
+        this.setAppState('loading');
+
+        let loadResult;
+        try {
+            loadResult = await this.loadData({ retry, attemptEpoch });
+        } catch (error) {
+            if (!isCurrentAttempt()) return;
+            this.lastError = error;
+            const evidence = this.pendingRawLoad || this.lastLoadResult || {};
+            this.lastLoadResult = evidence;
+            const confirmed = await this.confirmRecoveryCandidate(evidence, 'internalError', 'preRender');
+            if (!isCurrentAttempt()) return;
+            this.enterReadOnlyRecovery('internalError', evidence, {
+                phase: 'preRender',
+                terminal: !confirmed
+            });
+            return;
+        }
+        if (!isCurrentAttempt()) return;
+
+        this.lastLoadResult = loadResult;
+        if (retry && loadResult.status === 'missing') {
+            this.enterReadOnlyRecovery('ioError', {
+                ...loadResult,
+                reason: 'sourceMissingDuringRetry',
+                rawEvidence: this.rawEvidence
+            }, { phase: 'preRender', terminal: false });
+            return;
+        }
+
+        if (loadResult.status !== 'missing' && loadResult.status !== 'valid') {
+            const recoveryReason = loadResult.status === 'unsupported'
+                ? 'unsupported'
+                : loadResult.status === 'ioError'
+                    ? 'ioError'
+                    : 'corrupt';
+            const confirmed = await this.confirmRecoveryCandidate(loadResult, recoveryReason, 'preRender');
+            if (!isCurrentAttempt()) return;
+            this.enterReadOnlyRecovery(confirmed ? recoveryReason : 'internalError', loadResult, {
+                phase: 'preRender',
+                terminal: !confirmed
+            });
+            return;
+        }
+
+        try {
+            this.data = this.normalizeLoadedData(
+                loadResult.status === 'missing' ? this.getDefaultState() : loadResult.payload
+            );
+        } catch (error) {
+            this.lastError = error;
+            const confirmed = await this.confirmRecoveryCandidate(loadResult, 'internalError', 'preRender');
+            if (!isCurrentAttempt()) return;
+            this.enterReadOnlyRecovery('internalError', loadResult, {
+                phase: 'preRender',
+                terminal: !confirmed
+            });
+            return;
+        }
+
+        this.setAppState('rendering');
+        try {
+            this.initializeApp();
+            this.refreshStorageDisplay();
+        } catch (error) {
+            this.lastError = error;
+            if (!isCurrentAttempt()) return;
+            await this.terminalizeAndEnterRecovery('renderError', loadResult);
+            return;
+        }
+
+        this.setAppState('confirming');
+        const confirmationRequest = {
+            protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+            loadId: loadResult.loadId,
+            outcome: loadResult.status === 'missing' ? 'missing' : 'valid',
+            reason: null,
+            validatedSourceHash: loadResult.status === 'valid' ? loadResult.rawHash : null
+        };
+        try {
+            const acknowledgement = await this.storageAdapter.confirmLoad(confirmationRequest);
+            if (!isCurrentAttempt()) return;
+            if (!acknowledgement?.ok || typeof acknowledgement.writeSessionToken !== 'string' || !acknowledgement.writeSessionToken) {
+                throw new Error(acknowledgement?.error || 'CONFIRM_LOAD_TOKEN_MISSING');
+            }
+            this.writeSessionToken = acknowledgement.writeSessionToken;
+        } catch (error) {
+            this.lastError = error;
+            this.writeSessionToken = null;
+            await this.terminalizeAndEnterRecovery('internalError', loadResult, {
+                writeSessionToken: null
+            });
+            return;
+        }
+
+        try {
+            this.validatedSourceHash = loadResult.status === 'valid' ? loadResult.rawHash : null;
+            this.storageMeta.stateHash = this.validatedSourceHash || '';
+            this.recoveryMode = { active: false, reason: null, phase: null, terminal: false };
+            document.getElementById('recovery-surface').hidden = true;
+            this.setAppState('writable');
+            this.renderDataSafetyState();
+            this.revealNormalShell();
+            document.getElementById('section-title')?.focus();
+            await this.setupAutoBackup();
+        } catch (error) {
+            this.lastError = error;
+            const acknowledgedToken = this.writeSessionToken;
+            await this.terminalizeAndEnterRecovery('internalError', loadResult, {
+                writeSessionToken: acknowledgedToken
+            });
+        }
+    }
+
+    async confirmRecoveryCandidate(loadResult, reason, phase) {
+        const requiresConfirmation = loadResult?.requiresConfirmation ?? [
+            'missing',
+            'readableBytes',
+            'valid',
+            'corrupt',
+            'unsupported'
+        ].includes(loadResult?.status);
+        if (!requiresConfirmation) return true;
+        if (!loadResult?.loadId || typeof this.storageAdapter.confirmLoad !== 'function') return false;
+        try {
+            const acknowledgement = await this.storageAdapter.confirmLoad({
+                protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+                loadId: loadResult.loadId,
+                outcome: 'recovery',
+                reason: phase === 'postRender' ? `${reason}.postRender` : `${reason}.preRender`,
+                validatedSourceHash: loadResult.rawHash || null
+            });
+            if (!acknowledgement?.ok || acknowledgement.writeSessionToken !== null) {
+                throw new Error(acknowledgement?.error || 'RECOVERY_CONFIRMATION_REJECTED');
+            }
+            return true;
+        } catch (error) {
+            this.lastError = error;
+            return false;
+        }
+    }
+
+    async terminalizeAndEnterRecovery(
+        reason,
+        metadata = {},
+        { writeSessionToken = this.writeSessionToken } = {}
+    ) {
+        const loadId = metadata?.loadId || this.lastLoadResult?.loadId || null;
+        const capturedToken = typeof writeSessionToken === 'string' && writeSessionToken
+            ? writeSessionToken
+            : null;
+        const terminalReason = reason === 'renderError'
+            ? 'renderError.postRender'
+            : 'internalError.postRender';
+
+        this.enterReadOnlyRecovery(reason, metadata, { phase: 'postRender', terminal: true });
+        if (!loadId || typeof this.storageAdapter.terminalize !== 'function') {
+            return null;
+        }
+
+        try {
+            return await this.storageAdapter.terminalize({
+                protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+                loadId,
+                writeSessionToken: capturedToken,
+                reason: terminalReason
+            });
+        } catch (error) {
+            this.lastError = error;
+            return null;
+        }
+    }
+
+    enterReadOnlyRecovery(reason, metadata = {}, { phase = 'preRender', terminal = false } = {}) {
+        clearInterval(this.autoBackupTimer);
+        this.autoBackupTimer = null;
+        this.writeSessionToken = null;
+        this.validatedSourceHash = null;
+        if (terminal) {
+            this.storageAdapter.lockTerminal?.();
+        }
+        this.recoveryMode = { active: true, reason, phase, terminal };
+        this.isolateNormalShell();
+        this.setAppState(terminal ? 'terminalRecovery' : 'readOnlyRecovery');
+        try {
+            this.renderDataSafetyState();
+        } catch (error) {
+            this.lastError = error;
+        }
+
+        const copy = {
+            corrupt: {
+                title: '账本内容无法安全读取',
+                detail: '原始账本已保留。请先导出原始账本，再在外部检查内容。'
+            },
+            unsupported: {
+                title: '此版本无法打开该账本；账本不一定损坏',
+                detail: '请使用理解该格式和能力版本的新版应用。'
+            },
+            ioError: {
+                title: '暂时无法读取账本',
+                detail: '请检查文件是否可用以及访问权限，然后重试读取。'
+            },
+            renderError: {
+                title: '账本暂时无法安全显示',
+                detail: '账本已读取，但本次启动的界面准备失败。这不表示账本需要修改。'
+            },
+            internalError: {
+                title: '应用未能完成安全打开',
+                detail: '未对账本写入，请重新启动应用。'
+            }
+        }[reason] || {
+            title: '账本已进入只读保护',
+            detail: '本次启动不会改变原始数据。'
+        };
+
+        const surface = document.getElementById('recovery-surface');
+        const title = document.getElementById('recovery-title');
+        const detail = document.getElementById('recovery-detail');
+        const sourceDetail = document.getElementById('recovery-source-detail');
+        const exportButton = document.getElementById('export-raw-book-btn');
+        const revealButton = document.getElementById('reveal-storage-folder-btn');
+        const retryButton = document.getElementById('retry-book-load-btn');
+        const relaunchNote = document.getElementById('recovery-relaunch-note');
+
+        title.textContent = copy.title;
+        detail.textContent = copy.detail;
+        const metadataEvidence = metadata.rawEvidence?.attemptEpoch === this.openAttemptEpoch
+            ? metadata.rawEvidence
+            : null;
+        const evidence = metadataEvidence || (
+            this.rawEvidence?.attemptEpoch === this.openAttemptEpoch ? this.rawEvidence : null
+        );
+        if (metadataEvidence) this.rawEvidence = metadataEvidence;
+        const rawHash = evidence?.rawHash || null;
+        const hashAlgorithm = metadata.hashAlgorithm || evidence?.hashAlgorithm || null;
+        const storagePath = metadata.storagePath || this.storageMeta.storagePath || null;
+        sourceDetail.textContent = [
+            rawHash ? `Hash (${hashAlgorithm || 'sha256'}): ${rawHash}` : null,
+            storagePath ? `来源: ${storagePath}` : null
+        ].filter(Boolean).join('\n');
+
+        exportButton.hidden = !this.canExportCurrentRawEvidence();
+        revealButton.hidden = !this.canRevealCurrentRecoveryFolder();
+        retryButton.hidden = terminal;
+        relaunchNote.hidden = !terminal;
+        surface.hidden = false;
+        title.focus();
+    }
+
+    retryBookLoad() {
+        if (!this.recoveryMode.active) return Promise.reject(new Error('RECOVERY_NOT_ACTIVE'));
+        if (this.recoveryMode.terminal) return Promise.reject(new Error('TERMINAL_RECOVERY'));
+        if (this.retryInFlight) return this.retryInFlight;
+
+        const retryButton = document.getElementById('retry-book-load-btn');
+        if (retryButton) retryButton.disabled = true;
+        let trackedAttempt;
+        trackedAttempt = this.openBook({ retry: true }).finally(() => {
+            if (this.retryInFlight !== trackedAttempt) return;
+            this.retryInFlight = null;
+            if (retryButton) retryButton.disabled = false;
+        });
+        this.retryInFlight = trackedAttempt;
+        return trackedAttempt;
     }
 
     getDefaultSettings() {
@@ -385,7 +1023,7 @@ class AssetTracker {
         return {
             ...defaultState,
             ...loaded,
-            categories: this.normalizeCategories(loaded.categories),
+            categories: this.normalizeCategories(loaded.categories, normalizedSettings.baseCurrency),
             transactions: Array.isArray(loaded.transactions) ? loaded.transactions : defaultState.transactions,
             automationRules: Array.isArray(loaded.automationRules) ? loaded.automationRules : defaultState.automationRules,
             purposeCategories: Array.isArray(loaded.purposeCategories)
@@ -400,62 +1038,41 @@ class AssetTracker {
         };
     }
 
-    normalizeCategories(rawCategories) {
-        if (!rawCategories || typeof rawCategories !== 'object') {
-            return this.getDefaultCategories();
-        }
+    normalizeCategories(rawCategories, baseCurrency = this.getDefaultSettings().baseCurrency) {
+        const source = rawCategories && typeof rawCategories === 'object' && !Array.isArray(rawCategories)
+            ? rawCategories
+            : this.getDefaultCategories();
+        const cloneValue = value => {
+            if (Array.isArray(value)) return value.map(cloneValue);
+            if (!value || typeof value !== 'object') return value;
+            return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, cloneValue(child)]));
+        };
+        const normalizeMap = (categories, inheritedCurrency) => Object.fromEntries(
+            Object.entries(categories).map(([key, category]) => {
+                if (!category || typeof category !== 'object' || Array.isArray(category)) {
+                    return [key, cloneValue(category)];
+                }
+                const currency = Object.prototype.hasOwnProperty.call(category, 'currency')
+                    ? category.currency
+                    : inheritedCurrency;
+                const normalized = {};
+                for (const [field, value] of Object.entries(category)) {
+                    if (field === 'children' || field === 'currency') continue;
+                    normalized[field] = cloneValue(value);
+                }
+                normalized.currency = currency;
+                if (Object.prototype.hasOwnProperty.call(category, 'children')) {
+                    normalized.children = normalizeMap(category.children, currency);
+                }
+                return [key, normalized];
+            })
+        );
 
-        if (Object.prototype.hasOwnProperty.call(rawCategories, 'children')) {
-            return rawCategories;
-        }
-
-        return rawCategories;
+        return normalizeMap(source, baseCurrency);
     }
 
     parseBookPayload(stateJson) {
-        if (typeof stateJson !== 'string' || !stateJson.trim()) {
-            return null;
-        }
-
-        let parsed;
-        try {
-            parsed = JSON.parse(stateJson);
-        } catch (error) {
-            return null;
-        }
-
-        if (parsed && parsed.format === ASSET_BOOK_FORMAT) {
-            const payload = parsed.payload;
-            if (payload && typeof payload === 'object') {
-                return {
-                    payload,
-                    source: 'book-package',
-                    meta: {
-                        formatVersion: parsed.formatVersion || 1,
-                        schemaVersion: parsed.schemaVersion || ASSET_BOOK_SCHEMA_VERSION,
-                        exportedAt: parsed.exportedAt || null,
-                        source: parsed.source || 'unknown'
-                    }
-                };
-            }
-
-            return null;
-        }
-
-        if (parsed && typeof parsed === 'object') {
-            return {
-                payload: parsed,
-                source: 'legacy-json',
-                meta: {
-                    formatVersion: 0,
-                    schemaVersion: ASSET_BOOK_SCHEMA_VERSION,
-                    exportedAt: null,
-                    source: 'legacy'
-                }
-            };
-        }
-
-        return null;
+        return this.validateRawBook(stateJson);
     }
 
     getBookExportPackage() {
@@ -736,7 +1353,7 @@ class AssetTracker {
             this.exportToJSON();
         });
 
-        document.getElementById('reveal-storage-folder-btn').addEventListener('click', () => {
+        document.getElementById('reveal-storage-folder-main-btn').addEventListener('click', () => {
             this.revealStorageFolder();
         });
 
@@ -750,7 +1367,9 @@ class AssetTracker {
         });
 
         document.getElementById('save-backup-btn').addEventListener('click', () => {
-            this.saveBackupSettings();
+            this.saveBackupSettings().catch(error => {
+                this.showMessage(error?.message || '保存备份设置失败', 'error');
+            });
         });
 
         document.getElementById('backup-btn').addEventListener('click', () => {
@@ -804,16 +1423,22 @@ class AssetTracker {
 
     // 数据持久化
     async saveData({ reason = 'manual' } = {}) {
+        this.assertWritable();
         try {
             this.data = this.normalizeLoadedData(this.data);
             const stateJson = JSON.stringify(this.data);
             const result = await this.storageAdapter.save(stateJson, {
-                expectedHash: this.storageMeta.stateHash || null,
+                protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+                loadId: this.lastLoadResult?.loadId || null,
+                writeSessionToken: this.writeSessionToken,
+                expectedHash: this.validatedSourceHash,
+                validatedSourceHash: this.validatedSourceHash,
                 reason
             });
 
             if (result && result.ok) {
                 this.storageMeta.stateHash = result.stateHash || safeComputeHash(stateJson);
+                this.validatedSourceHash = this.storageMeta.stateHash;
                 this.storageMeta.updatedAt = result.updatedAt || new Date().toISOString();
                 this.storageMeta.storagePath = result.storagePath || this.storageMeta.storagePath;
                 this.lastError = null;
@@ -834,7 +1459,18 @@ class AssetTracker {
     }
 
     persistData(options = {}) {
-        this.saveData(options).catch(() => {});
+        return this.saveData(options);
+    }
+
+    assertWritable() {
+        if (
+            this.recoveryMode.active ||
+            this.appState !== 'writable' ||
+            typeof this.writeSessionToken !== 'string' ||
+            !this.writeSessionToken
+        ) {
+            throw new Error('READ_ONLY_RECOVERY');
+        }
     }
 
     refreshDataViews() {
@@ -850,26 +1486,136 @@ class AssetTracker {
         this.initializeTransactionFilters();
     }
 
-    async loadData() {
-        let stateJson = null;
+    async loadData({ retry = false, attemptEpoch = null } = {}) {
+        let rawResult;
         try {
-            const result = await this.storageAdapter.load();
-            this.storageMeta.stateHash = result.stateHash || '';
-            this.storageMeta.storagePath = result.storagePath || this.storageMeta.storagePath;
-            this.storageMeta.updatedAt = result.updatedAt || null;
-            stateJson = result.stateJson;
+            rawResult = await this.storageAdapter.load({ retry });
         } catch (error) {
             this.lastError = error;
-            this.storageMeta.stateHash = '';
-            this.storageMeta.storagePath = this.storageAdapter.supportsNative ? '未设置路径' : 'localStorage';
-            if (this.storageAdapter.supportsNative) {
-                this.showMessage('读取本地账本失败，已回退到默认账本。', 'error');
-            }
-            stateJson = null;
+            return {
+                status: 'ioError',
+                reason: 'readFailed',
+                loadId: null,
+                rawHash: null,
+                rawEvidence: null,
+                storagePath: this.storageAdapter.supportsNative ? '未设置路径' : 'localStorage',
+                canExportRaw: false,
+                canRevealFolder: this.storageAdapter.supportsNative,
+                error
+            };
         }
 
-        const parsed = this.parseBookPayload(stateJson) || this.parseBookPayload(JSON.stringify(this.getDefaultState()));
-        return parsed ? parsed.payload : this.getDefaultState();
+        if (attemptEpoch !== null && attemptEpoch !== this.openAttemptEpoch) {
+            throw new Error('STALE_OPEN_ATTEMPT');
+        }
+
+        this.pendingRawLoad = rawResult;
+        this.storageMeta.stateHash = rawResult.rawHash || rawResult.stateHash || '';
+        this.storageMeta.storagePath = rawResult.storagePath || this.storageMeta.storagePath;
+        this.storageMeta.updatedAt = rawResult.updatedAt || null;
+
+        if (rawResult.status === 'missing') {
+            return {
+                status: 'missing',
+                loadId: rawResult.loadId,
+                rawHash: null,
+                rawEvidence: null,
+                storagePath: this.storageMeta.storagePath,
+                canExportRaw: false,
+                canRevealFolder: Boolean(rawResult.canRevealFolder),
+                requiresConfirmation: true
+            };
+        }
+        if (rawResult.status === 'invalidUTF8') {
+            const evidence = rawResult.rawHash ? this.recordRawEvidence({
+                rawHash: rawResult.rawHash,
+                hashAlgorithm: rawResult.hashAlgorithm || 'sha256'
+            }, rawResult, attemptEpoch ?? this.openAttemptEpoch) : null;
+            return {
+                status: 'corrupt',
+                reason: 'invalid-utf8',
+                loadId: rawResult.loadId,
+                rawHash: rawResult.rawHash,
+                hashAlgorithm: rawResult.hashAlgorithm || 'sha256',
+                rawEvidence: evidence,
+                storagePath: this.storageMeta.storagePath,
+                canExportRaw: Boolean(rawResult.canExportRaw),
+                canRevealFolder: Boolean(rawResult.canRevealFolder),
+                requiresConfirmation: false
+            };
+        }
+        if (rawResult.status === 'ioError') {
+            const candidateEvidence = rawResult.rawHash ? {
+                rawHash: rawResult.rawHash,
+                hashAlgorithm: rawResult.hashAlgorithm || 'sha256',
+                ...(this.storageAdapter.supportsNative ? {} : (rawResult.rawEvidence || {}))
+            } : (rawResult.rawEvidence || null);
+            const rawEvidence = candidateEvidence ? this.recordRawEvidence(
+                candidateEvidence,
+                rawResult,
+                attemptEpoch ?? this.openAttemptEpoch
+            ) : null;
+            return {
+                status: 'ioError',
+                reason: rawResult.reason || 'readFailed',
+                loadId: rawResult.loadId,
+                rawHash: rawResult.rawHash || null,
+                rawEvidence,
+                storagePath: this.storageMeta.storagePath,
+                canExportRaw: Boolean(rawResult.canExportRaw),
+                canRevealFolder: Boolean(rawResult.canRevealFolder),
+                error: rawResult.error,
+                requiresConfirmation: false
+            };
+        }
+        if (rawResult.status !== 'readableBytes' || typeof rawResult.stateJson !== 'string') {
+            return {
+                status: 'ioError',
+                reason: 'invalidLoadResult',
+                loadId: rawResult.loadId || null,
+                rawHash: null,
+                rawEvidence: null,
+                storagePath: this.storageMeta.storagePath,
+                canExportRaw: false,
+                canRevealFolder: Boolean(rawResult.canRevealFolder),
+                requiresConfirmation: false
+            };
+        }
+
+        const inspectedEvidence = LegacySafety.inspectDOMString(rawResult.stateJson);
+        const nativeRawHash = rawResult.rawHash || rawResult.stateHash || null;
+        const evidence = this.storageAdapter.supportsNative
+            ? (nativeRawHash ? this.recordRawEvidence({
+                rawHash: nativeRawHash,
+                hashAlgorithm: rawResult.hashAlgorithm || 'sha256'
+            }, rawResult, attemptEpoch ?? this.openAttemptEpoch) : null)
+            : this.recordRawEvidence(inspectedEvidence, rawResult, attemptEpoch ?? this.openAttemptEpoch);
+        const parsed = this.validateRawBook(rawResult.stateJson);
+        const validatorEvidence = parsed.rawEvidence || inspectedEvidence;
+        if (!evidence || evidence.rawHash !== validatorEvidence.rawHash) {
+            return {
+                status: 'ioError',
+                reason: 'rawHashMismatch',
+                loadId: rawResult.loadId,
+                rawHash: evidence?.rawHash || null,
+                rawEvidence: evidence,
+                storagePath: this.storageMeta.storagePath,
+                canExportRaw: rawResult.canExportRaw === true,
+                canRevealFolder: rawResult.canRevealFolder === true,
+                requiresConfirmation: true
+            };
+        }
+        return {
+            ...parsed,
+            loadId: rawResult.loadId,
+            rawHash: evidence.rawHash,
+            hashAlgorithm: evidence.hashAlgorithm,
+            rawEvidence: evidence,
+            storagePath: this.storageMeta.storagePath,
+            canExportRaw: Boolean(rawResult.canExportRaw),
+            canRevealFolder: Boolean(rawResult.canRevealFolder),
+            requiresConfirmation: true
+        };
     }
 
     // 分类管理
@@ -1555,10 +2301,14 @@ class AssetTracker {
     }
 
     // 自动备份功能
-    setupAutoBackup() {
-        if (this.autoBackupTimer) {
+    async setupAutoBackup() {
+        if (this.autoBackupTimer !== null) {
             clearInterval(this.autoBackupTimer);
             this.autoBackupTimer = null;
+        }
+
+        if (this.recoveryMode.active || this.appState !== 'writable') {
+            return;
         }
 
         if (!this.data.settings.autoBackup) {
@@ -1573,21 +2323,29 @@ class AssetTracker {
             : localStorage.getItem(fallbackKey);
 
         if (!lastBackup || (now - parseInt(lastBackup)) > backupInterval) {
-            this.performAutoBackup();
+            await this.performAutoBackup();
         }
 
         // 设置定期备份
         this.autoBackupTimer = setInterval(() => {
-            if (this.data.settings.autoBackup) {
-                this.performAutoBackup();
-            }
+            if (!this.data.settings.autoBackup) return Promise.resolve();
+            return this.performAutoBackup().catch(error => {
+                this.lastError = error;
+                return this.terminalizeAndEnterRecovery(
+                    'internalError',
+                    this.lastLoadResult || {},
+                    { writeSessionToken: this.writeSessionToken }
+                );
+            });
         }, backupInterval);
     }
 
-    performAutoBackup() {
-        if (this.storageAdapter.supportsNative) {
-            this.persistData({ reason: 'auto-backup' });
+    async performAutoBackup() {
+        if (this.recoveryMode.active || this.appState !== 'writable') {
             return;
+        }
+        if (this.storageAdapter.supportsNative) {
+            return this.persistData({ reason: 'auto-backup' });
         }
 
         const backupData = {
@@ -1599,7 +2357,8 @@ class AssetTracker {
         localStorage.setItem('assetTrackerLastBackupTime', new Date().getTime().toString());
     }
 
-    saveBackupSettings() {
+    async saveBackupSettings() {
+        this.assertWritable();
         const autoBackupCheckbox = document.getElementById('auto-backup-enabled');
         const intervalInput = document.getElementById('backup-interval');
 
@@ -1615,8 +2374,8 @@ class AssetTracker {
 
         this.data.settings.autoBackup = !!autoBackupCheckbox.checked;
         this.data.settings.backupInterval = intervalHours;
-        this.persistData({ reason: 'save-backup' });
-        this.setupAutoBackup();
+        await this.persistData({ reason: 'save-backup' });
+        await this.setupAutoBackup();
         this.showMessage('备份设置已保存', 'success');
     }
 
@@ -2475,15 +3234,16 @@ class AssetTracker {
         const name = document.getElementById('category-name').value;
         const parentId = document.getElementById('parent-category').value;
         const balance = parseFloat(document.getElementById('category-balance').value) || 0;
+        const parent = parentId ? this.findCategoryById(parentId) : null;
 
         const newCategory = {
             id: Date.now().toString(),
             name: name,
-            balance: balance
+            balance: balance,
+            currency: parent?.currency || this.data.settings.baseCurrency
         };
 
         if (parentId) {
-            const parent = this.findCategoryById(parentId);
             if (parent) {
                 if (!parent.children) {
                     parent.children = {};
@@ -3214,9 +3974,42 @@ class AssetTracker {
         }
     }
 
-    revealStorageFolder() {
-        this.fileAdapter.revealDataFolder().catch((error) => {
+    async revealStorageFolder() {
+        if (!this.storageAdapter.supportsNative) {
+            throw new Error('RECOVERY_ACTION_UNAVAILABLE');
+        }
+        if (this.recoveryMode.active && !this.canRevealCurrentRecoveryFolder()) {
+            throw new Error('RECOVERY_ACTION_UNAVAILABLE');
+        }
+        if (!this.recoveryMode.active && this.appState !== 'writable') {
+            throw new Error('RECOVERY_ACTION_UNAVAILABLE');
+        }
+        try {
+            return await this.fileAdapter.revealDataFolder();
+        } catch (error) {
             this.showMessage(error?.message || '当前环境不支持打开目录', 'error');
+            throw error;
+        }
+    }
+
+    async exportRawBook() {
+        if (!this.canExportCurrentRawEvidence()) {
+            throw new Error('RAW_EVIDENCE_UNAVAILABLE');
+        }
+        if (this.storageAdapter.supportsNative) {
+            return this.fileAdapter.exportRawBook({
+                expectedHash: this.rawEvidence.rawHash,
+                suggestedName: 'AssetTrackerBook.raw'
+            });
+        }
+        if (!(this.rawEvidence.bytes instanceof Uint8Array)) {
+            throw new Error('RAW_EVIDENCE_UNAVAILABLE');
+        }
+        return this.fileAdapter.saveFile({
+            suggestedName: 'AssetTrackerBook.raw',
+            mimeType: 'application/octet-stream',
+            text: bytesToBase64(this.rawEvidence.bytes),
+            encoding: 'base64'
         });
     }
 

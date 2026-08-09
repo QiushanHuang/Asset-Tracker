@@ -15,20 +15,22 @@ test('book payload parsing supports full-book envelope and legacy JSON', (t) => 
         exportedAt: '2026-04-14T00:00:00.000Z',
         source: 'macos-app',
         payload: {
-            transactions: [{ id: 't1' }]
+            transactions: [{ id: 't1', date: '2026-04-14', category: '现金', amount: 1 }]
         }
     });
 
     const parsedEnvelope = tracker.parseBookPayload(bookEnvelope);
+    assert.equal(parsedEnvelope.status, 'valid');
     assert.equal(parsedEnvelope.source, 'book-package');
     assert.equal(parsedEnvelope.payload.transactions[0].id, 't1');
 
     const legacyJson = JSON.stringify({
         memo: 'legacy',
-        transactions: [{ id: 'legacy-1' }]
+        transactions: [{ id: 'legacy-1', date: '2026-04-14', category: '现金', amount: 1 }]
     });
 
     const parsedLegacy = tracker.parseBookPayload(legacyJson);
+    assert.equal(parsedLegacy.status, 'valid');
     assert.equal(parsedLegacy.source, 'legacy-json');
     assert.equal(parsedLegacy.payload.memo, 'legacy');
 });
@@ -66,6 +68,11 @@ test('saveData rejects when storage adapter reports a business failure', async (
     t.after(app.dispose);
     const { AssetTracker } = app;
     const tracker = new AssetTracker();
+
+    tracker.appState = 'writable';
+    tracker.writeSessionToken = 'test-token';
+    tracker.validatedSourceHash = null;
+    tracker.lastLoadResult = { loadId: 'test-load' };
 
     tracker.storageAdapter = {
         supportsNative: true,

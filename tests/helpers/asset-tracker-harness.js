@@ -75,6 +75,8 @@ function createElementStub(initial = {}) {
 
     const element = {
         tagName: String(initial.tagName || 'div').toUpperCase(),
+        hidden: Boolean(initial.hidden),
+        inert: Boolean(initial.inert),
         value: initial.value ?? '',
         checked: Boolean(initial.checked),
         disabled: Boolean(initial.disabled),
@@ -116,6 +118,10 @@ function createElementStub(initial = {}) {
                 this.id = stringValue;
             } else if (name === 'class') {
                 this.className = stringValue;
+            } else if (name === 'hidden') {
+                this.hidden = true;
+            } else if (name === 'inert') {
+                this.inert = true;
             } else if (name.startsWith('data-')) {
                 const key = name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
                 this.dataset[key] = stringValue;
@@ -139,6 +145,10 @@ function createElementStub(initial = {}) {
                 this.id = '';
             } else if (name === 'class') {
                 this.className = '';
+            } else if (name === 'hidden') {
+                this.hidden = false;
+            } else if (name === 'inert') {
+                this.inert = false;
             }
         },
         addEventListener(type, handler) {
@@ -259,6 +269,8 @@ function loadAssetTracker({
     confirmResult = true
 } = {}) {
     const scriptPath = path.join(__dirname, '..', '..', 'script.js');
+    const safetyPath = path.join(__dirname, '..', '..', 'legacy-safety.js');
+    const safetyContent = fs.readFileSync(safetyPath, 'utf8');
     const scriptContent = fs.readFileSync(scriptPath, 'utf8');
     const domEvents = {};
     const windowEvents = {};
@@ -469,7 +481,7 @@ function loadAssetTracker({
     context.URL = window.URL;
 
     vm.createContext(context);
-    vm.runInContext(`${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
+    vm.runInContext(`${safetyContent}\n${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
 
     return {
         AssetTracker: context.__AssetTracker,
@@ -481,6 +493,18 @@ function loadAssetTracker({
         messages,
         deferred,
         dispose,
+        readLocalStorage(key) {
+            const storageKey = String(key);
+            return localStorageValues.has(storageKey) ? localStorageValues.get(storageKey) : null;
+        },
+        setLocalStorage(key, value) {
+            const storageKey = String(key);
+            if (value === null || value === undefined) {
+                localStorageValues.delete(storageKey);
+            } else {
+                localStorageValues.set(storageKey, String(value));
+            }
+        },
         get pendingTimerCount() {
             return pendingTimeouts.size + pendingIntervals.size;
         },

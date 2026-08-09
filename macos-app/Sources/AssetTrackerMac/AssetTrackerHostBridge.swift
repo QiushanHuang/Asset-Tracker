@@ -1,20 +1,17 @@
 import AppKit
+import AssetTrackerCore
 import Foundation
 import UniformTypeIdentifiers
 import WebKit
 
 private enum AssetTrackerBridgeError: LocalizedError {
-    case invalidRequest
     case unsupportedMessage(String)
     case invalidPayload(String)
     case cancelled
     case encodingFailed
-    case staleWrite
 
     var errorDescription: String? {
         switch self {
-        case .invalidRequest:
-            return "无效的原生桥接请求"
         case .unsupportedMessage(let type):
             return "不支持的桥接消息类型: \(type)"
         case .invalidPayload(let message):
@@ -23,29 +20,52 @@ private enum AssetTrackerBridgeError: LocalizedError {
             return "用户取消了操作"
         case .encodingFailed:
             return "文件编码处理失败"
-        case .staleWrite:
-            return "账本文件已被外部修改，请重新载入后再保存"
         }
     }
 }
 
+@MainActor
 final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
     private weak var webView: WKWebView?
     private weak var hostWindow: NSWindow?
-    private let bookStore = AssetTrackerBookStore()
+    private let bookStore: AssetTrackerBookStore
+    private let rawIOExecutor: AssetTrackerSerialRawIOExecutor
+    private let storageCoordinator: AssetTrackerStorageCoordinator
+    private let responsePipeline: AssetTrackerBridgeResponsePipeline
 
-    init(webView: WKWebView, hostWindow: NSWindow?) {
+    init(
+        webView: WKWebView,
+        hostWindow: NSWindow?,
+        bookStore: AssetTrackerBookStore,
+        rawIOExecutor: AssetTrackerSerialRawIOExecutor = AssetTrackerSerialRawIOExecutor()
+    ) {
         self.webView = webView
         self.hostWindow = hostWindow
+        self.bookStore = bookStore
+        self.rawIOExecutor = rawIOExecutor
+        self.storageCoordinator = AssetTrackerStorageCoordinator(
+            store: bookStore,
+            rawIOExecutor: rawIOExecutor
+        )
+        self.responsePipeline = AssetTrackerBridgeResponsePipeline(
+            rawIOExecutor: rawIOExecutor
+        ) { [weak webView] javascript in
+            webView?.evaluateJavaScript(javascript)
+        }
         super.init()
     }
 
     static func attach(
         to userContentController: WKUserContentController,
         webView: WKWebView,
-        hostWindow: NSWindow?
+        hostWindow: NSWindow?,
+        bookStore: AssetTrackerBookStore
     ) -> AssetTrackerHostBridge {
-        let bridge = AssetTrackerHostBridge(webView: webView, hostWindow: hostWindow)
+        let bridge = AssetTrackerHostBridge(
+            webView: webView,
+            hostWindow: hostWindow,
+            bookStore: bookStore
+        )
         userContentController.add(bridge, name: "assetTrackerHost")
         return bridge
     }
@@ -54,51 +74,261 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
         guard
             message.name == "assetTrackerHost",
             let body = message.body as? [String: Any],
-            let requestId = body["id"] as? String,
+            let requestID = body["id"] as? String,
             let type = body["type"] as? String
         else {
             return
         }
 
         let payload = body["payload"] as? [String: Any] ?? [:]
-
-        do {
-            let result = try handleMessage(type: type, payload: payload)
-            sendResponse(id: requestId, ok: true, result: result, error: nil)
-        } catch {
-            sendResponse(id: requestId, ok: false, result: nil, error: error.localizedDescription)
+        switch type {
+        case "storage.load":
+            handleStorageLoad(requestID: requestID, payload: payload)
+        case "storage.confirmLoad":
+            do {
+                let result = try confirmStorageLoad(payload: payload)
+                sendResponse(id: requestID, ok: true, result: result, error: nil)
+            } catch {
+                sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+            }
+        case "storage.terminalize":
+            handleStorageTerminalize(requestID: requestID, payload: payload)
+        case "storage.save":
+            handleStorageSave(requestID: requestID, payload: payload)
+        case "file.saveRawBook":
+            handleRawBookExport(requestID: requestID, payload: payload)
+        default:
+            do {
+                let result = try handleMainThreadMessage(type: type, payload: payload)
+                sendResponse(id: requestID, ok: true, result: result, error: nil)
+            } catch {
+                sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+            }
         }
     }
 
-    private func handleMessage(type: String, payload: [String: Any]) throws -> [String: Any] {
-        switch type {
-        case "storage.load":
-            return try bookStore.load()
-        case "storage.save":
-            guard let stateJson = payload["stateJson"] as? String else {
-                throw AssetTrackerBridgeError.invalidPayload("缺少 stateJson")
+    private func handleStorageLoad(requestID: String, payload: [String: Any]) {
+        guard payload["protocolVersion"] as? Int == 2 else {
+            sendResponse(id: requestID, ok: false, result: nil, error: AssetTrackerWriteGateError.unsupportedProtocol.localizedDescription)
+            return
+        }
+        let retry = payload["retry"] as? Bool ?? false
+
+        do {
+            try storageCoordinator.startLoad(retry: retry) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let loaded):
+                    self.responsePipeline.send(.loadSuccess(requestID: requestID, loaded: loaded))
+                case .failure(let error):
+                    self.sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+                }
             }
-            let expectedHash = payload["expectedHash"] as? String
-            let schemaVersion = payload["schemaVersion"] as? Int ?? 1
-            let reason = payload["reason"] as? String ?? "manual"
-            return try bookStore.save(
-                stateJson: stateJson,
+        } catch {
+            sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+        }
+    }
+
+    private func handleRawBookExport(requestID: String, payload: [String: Any]) {
+        guard payload["protocolVersion"] as? Int == 2 else {
+            sendResponse(id: requestID, ok: false, result: nil, error: AssetTrackerWriteGateError.unsupportedProtocol.localizedDescription)
+            return
+        }
+        guard let expectedHash = payload["expectedHash"] as? String, !expectedHash.isEmpty else {
+            sendResponse(id: requestID, ok: false, result: nil, error: "缺少原始账本哈希")
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = (payload["suggestedName"] as? String) ?? "AssetTrackerBook.raw"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destinationURL = panel.url else {
+            sendResponse(id: requestID, ok: false, result: nil, error: AssetTrackerBridgeError.cancelled.localizedDescription)
+            return
+        }
+
+        do {
+            try storageCoordinator.startRawExport(
                 expectedHash: expectedHash,
-                schemaVersion: schemaVersion,
-                reason: reason
-            )
+                destinationURL: destinationURL
+            ) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let exported):
+                    self.sendResponse(
+                        id: requestID,
+                        ok: true,
+                        result: .object([
+                            "ok": .bool(true),
+                            "rawHash": .string(exported.rawHash),
+                            "byteCount": .integer(exported.byteCount),
+                            "path": .string(exported.destinationPath)
+                        ]),
+                        error: nil
+                    )
+                case .failure(let error):
+                    self.sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+                }
+            }
+        } catch {
+            sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+        }
+    }
+
+    private func handleMainThreadMessage(type: String, payload: [String: Any]) throws -> AssetTrackerBridgeJSONValue {
+        switch type {
         case "file.openImport":
             return try openImportPanel(payload: payload)
         case "file.saveExport":
             return try saveExportFile(payload: payload)
         case "file.revealFolder":
-            return try bookStore.revealStorageDirectory()
+            return try revealStorageDirectory()
         default:
             throw AssetTrackerBridgeError.unsupportedMessage(type)
         }
     }
 
-    private func openImportPanel(payload: [String: Any]) throws -> [String: Any] {
+    private func confirmStorageLoad(payload: [String: Any]) throws -> AssetTrackerBridgeJSONValue {
+        let protocolVersion = payload["protocolVersion"] as? Int
+        guard let loadID = payload["loadId"] as? String else {
+            throw AssetTrackerBridgeError.invalidPayload("缺少 loadId")
+        }
+        guard
+            let outcomeValue = payload["outcome"] as? String,
+            let outcome = AssetTrackerLoadConfirmationOutcome(rawValue: outcomeValue)
+        else {
+            throw AssetTrackerBridgeError.invalidPayload("无效的 outcome")
+        }
+        let reason = try optionalString(payload, key: "reason")
+        let validatedSourceHash = try optionalString(payload, key: "validatedSourceHash")
+        let acknowledgement = try storageCoordinator.confirmLoad(
+            protocolVersion: protocolVersion,
+            loadID: loadID,
+            outcome: outcome,
+            reason: reason,
+            validatedSourceHash: validatedSourceHash
+        )
+        return .object([
+            "ok": .bool(true),
+            "writeSessionToken": acknowledgement.writeSessionToken
+                .map(AssetTrackerBridgeJSONValue.string) ?? .null
+        ])
+    }
+
+    private func handleStorageSave(requestID: String, payload: [String: Any]) {
+        do {
+            let request = try storageSaveRequest(payload: payload)
+            try storageCoordinator.startSave(request: request) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let saved):
+                    self.sendResponse(
+                        id: requestID,
+                        ok: true,
+                        result: .object([
+                            "ok": .bool(true),
+                            "stateHash": .string(saved.rawHash),
+                            "updatedAt": .string(saved.updatedAt.ISO8601Format()),
+                            "storagePath": .string(saved.storagePath)
+                        ]),
+                        error: nil
+                    )
+                case .failure(let error):
+                    self.sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+                }
+            }
+        } catch {
+            sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+        }
+    }
+
+    private func handleStorageTerminalize(requestID: String, payload: [String: Any]) {
+        do {
+            let request = try storageTerminalizationRequest(payload: payload)
+            try storageCoordinator.terminalize(request) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let acknowledgement):
+                    self.sendResponse(
+                        id: requestID,
+                        ok: true,
+                        result: .object([
+                            "ok": .bool(true),
+                            "reason": .string(acknowledgement.reason)
+                        ]),
+                        error: nil
+                    )
+                case .failure(let error):
+                    self.sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+                }
+            }
+        } catch {
+            sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+        }
+    }
+
+    private func storageTerminalizationRequest(
+        payload: [String: Any]
+    ) throws -> AssetTrackerTerminalizationRequest {
+        guard let loadID = payload["loadId"] as? String else {
+            throw AssetTrackerBridgeError.invalidPayload("缺少 loadId")
+        }
+        guard let reason = payload["reason"] as? String else {
+            throw AssetTrackerBridgeError.invalidPayload("缺少 reason")
+        }
+        return AssetTrackerTerminalizationRequest(
+            protocolVersion: payload["protocolVersion"] as? Int,
+            loadID: loadID,
+            writeSessionToken: try optionalString(payload, key: "writeSessionToken"),
+            reason: reason
+        )
+    }
+
+    private func storageSaveRequest(payload: [String: Any]) throws -> AssetTrackerStorageSaveRequest {
+        guard let stateJson = payload["stateJson"] as? String else {
+            throw AssetTrackerBridgeError.invalidPayload("缺少 stateJson")
+        }
+        guard let loadID = payload["loadId"] as? String else {
+            throw AssetTrackerBridgeError.invalidPayload("缺少 loadId")
+        }
+        let protocolVersion = payload["protocolVersion"] as? Int
+        let writeSessionToken = try optionalString(payload, key: "writeSessionToken")
+        let expectedHash = try optionalString(payload, key: "expectedHash")
+        let validatedSourceHash = try optionalString(payload, key: "validatedSourceHash")
+        let authorization = AssetTrackerSaveAuthorization(
+            protocolVersion: protocolVersion,
+            loadID: loadID,
+            writeSessionToken: writeSessionToken,
+            expectedHash: expectedHash,
+            validatedSourceHash: validatedSourceHash
+        )
+        return AssetTrackerStorageSaveRequest(
+            authorization: authorization,
+            stateJson: stateJson,
+            schemaVersion: payload["schemaVersion"] as? Int ?? 1,
+            reason: payload["reason"] as? String ?? "manual"
+        )
+    }
+
+    private func revealStorageDirectory() throws -> AssetTrackerBridgeJSONValue {
+        try FileManager.default.createDirectory(
+            at: bookStore.storageDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+        NSWorkspace.shared.activateFileViewerSelecting([bookStore.storageDirectoryURL])
+        return .object(["path": .string(bookStore.storageDirectoryURL.path)])
+    }
+
+    private func optionalString(_ payload: [String: Any], key: String) throws -> String? {
+        guard let value = payload[key], !(value is NSNull) else { return nil }
+        guard let string = value as? String else {
+            throw AssetTrackerBridgeError.invalidPayload("无效的 \(key)")
+        }
+        return string
+    }
+
+    private func openImportPanel(payload: [String: Any]) throws -> AssetTrackerBridgeJSONValue {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
@@ -110,7 +340,6 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .map { $0.replacingOccurrences(of: ".", with: "") }
                 .filter { !$0.isEmpty }
-
             let contentTypes = extensions.compactMap { UTType(filenameExtension: $0) }
             if !contentTypes.isEmpty {
                 panel.allowedContentTypes = contentTypes
@@ -120,52 +349,41 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
         guard panel.runModal() == .OK, let url = panel.url else {
             throw AssetTrackerBridgeError.cancelled
         }
-
         let readAs = (payload["readAs"] as? String) ?? "text"
         let fileData = try Data(contentsOf: url)
-
         if readAs == "binary" {
-            return [
-                "fileName": url.lastPathComponent,
-                "mime": mimeType(for: url),
-                "text": fileData.base64EncodedString(),
-                "encoding": "base64"
-            ]
+            return .object([
+                "fileName": .string(url.lastPathComponent),
+                "mime": .string(mimeType(for: url)),
+                "text": .string(fileData.base64EncodedString()),
+                "encoding": .string("base64")
+            ])
         }
-
         guard let text = String(data: fileData, encoding: .utf8) else {
             throw AssetTrackerBridgeError.encodingFailed
         }
-
-        return [
-            "fileName": url.lastPathComponent,
-            "mime": mimeType(for: url),
-            "text": text,
-            "encoding": "text"
-        ]
+        return .object([
+            "fileName": .string(url.lastPathComponent),
+            "mime": .string(mimeType(for: url)),
+            "text": .string(text),
+            "encoding": .string("text")
+        ])
     }
 
-    private func saveExportFile(payload: [String: Any]) throws -> [String: Any] {
+    private func saveExportFile(payload: [String: Any]) throws -> AssetTrackerBridgeJSONValue {
         guard let suggestedName = payload["suggestedName"] as? String else {
             throw AssetTrackerBridgeError.invalidPayload("缺少 suggestedName")
         }
-
         let panel = NSSavePanel()
         panel.nameFieldStringValue = suggestedName
         panel.canCreateDirectories = true
-
-        if panel.runModal() != .OK || panel.url == nil {
-            throw AssetTrackerBridgeError.cancelled
-        }
-
-        guard let destinationURL = panel.url else {
+        guard panel.runModal() == .OK, let destinationURL = panel.url else {
             throw AssetTrackerBridgeError.cancelled
         }
 
         let encoding = (payload["encoding"] as? String) ?? "text"
         let text = (payload["text"] as? String) ?? ""
         let fileData: Data
-
         if encoding == "base64" {
             guard let decoded = Data(base64Encoded: text) else {
                 throw AssetTrackerBridgeError.encodingFailed
@@ -174,50 +392,31 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
         } else {
             fileData = Data(text.utf8)
         }
-
         try FileManager.default.createDirectory(
             at: destinationURL.deletingLastPathComponent(),
             withIntermediateDirectories: true,
             attributes: nil
         )
         try fileData.write(to: destinationURL, options: .atomic)
-
-        return [
-            "ok": true,
-            "fileName": destinationURL.lastPathComponent,
-            "path": destinationURL.path
-        ]
+        return .object([
+            "ok": .bool(true),
+            "fileName": .string(destinationURL.lastPathComponent),
+            "path": .string(destinationURL.path)
+        ])
     }
 
-    private func sendResponse(id: String, ok: Bool, result: [String: Any]?, error: String?) {
-        guard let webView else {
-            return
-        }
-
-        var response: [String: Any] = [
-            "id": id,
-            "ok": ok
-        ]
-
-        if let result {
-            response["result"] = result
-        }
-
-        if let error {
-            response["error"] = error
-        }
-
-        guard
-            let responseData = try? JSONSerialization.data(withJSONObject: response, options: [.sortedKeys]),
-            let responseJson = String(data: responseData, encoding: .utf8)
-        else {
-            return
-        }
-
-        let javascript = "window.AssetTrackerHost && window.AssetTrackerHost.__handleResponse(\(responseJson));"
-        DispatchQueue.main.async {
-            webView.evaluateJavaScript(javascript)
-        }
+    private func sendResponse(
+        id: String,
+        ok: Bool,
+        result: AssetTrackerBridgeJSONValue?,
+        error: String?
+    ) {
+        responsePipeline.send(AssetTrackerBridgeResponse(
+            requestID: id,
+            ok: ok,
+            result: result,
+            error: error
+        ))
     }
 
     private func mimeType(for url: URL) -> String {
@@ -225,131 +424,5 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
             return mimeType
         }
         return "application/octet-stream"
-    }
-}
-
-private final class AssetTrackerBookStore {
-    private let bundleIdentifier = "com.qiushan.AssetTracker"
-    private let fileName = "AssetTrackerBook.json"
-
-    private var storageDirectoryURL: URL {
-        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return baseURL.appendingPathComponent(bundleIdentifier, isDirectory: true)
-    }
-
-    private var storageFileURL: URL {
-        storageDirectoryURL.appendingPathComponent(fileName, isDirectory: false)
-    }
-
-    func load() throws -> [String: Any] {
-        try ensureStorageDirectory()
-
-        guard FileManager.default.fileExists(atPath: storageFileURL.path) else {
-            return [
-                "stateJson": NSNull(),
-                "stateHash": "",
-                "schemaVersion": 1,
-                "updatedAt": NSNull(),
-                "storagePath": storageFileURL.path
-            ]
-        }
-
-        let data = try Data(contentsOf: storageFileURL)
-        let stateJson = String(decoding: data, as: UTF8.self)
-        let fileAttributes = try FileManager.default.attributesOfItem(atPath: storageFileURL.path)
-        let updatedAt = (fileAttributes[.modificationDate] as? Date)?.ISO8601Format()
-
-        return [
-            "stateJson": stateJson,
-            "stateHash": safeComputeHash(stateJson),
-            "schemaVersion": schemaVersion(from: data) ?? 1,
-            "updatedAt": updatedAt ?? NSNull(),
-            "storagePath": storageFileURL.path
-        ]
-    }
-
-    func save(
-        stateJson: String,
-        expectedHash: String?,
-        schemaVersion: Int,
-        reason: String
-    ) throws -> [String: Any] {
-        try ensureStorageDirectory()
-
-        if FileManager.default.fileExists(atPath: storageFileURL.path) {
-            let currentText = try String(contentsOf: storageFileURL, encoding: .utf8)
-            let currentHash = safeComputeHash(currentText)
-            if
-                let expectedHash,
-                !expectedHash.isEmpty,
-                currentHash != expectedHash
-            {
-                throw AssetTrackerBridgeError.staleWrite
-            }
-        }
-
-        let payloadData = Data(stateJson.utf8)
-        let payloadObject = try JSONSerialization.jsonObject(with: payloadData)
-        let timestamp = Date().ISO8601Format()
-        let storedEnvelope: [String: Any] = [
-            "format": "qiushan.asset-book",
-            "formatVersion": 1,
-            "schemaVersion": schemaVersion,
-            "exportedAt": timestamp,
-            "source": "macos-app",
-            "reason": reason,
-            "payload": payloadObject
-        ]
-
-        let data = try JSONSerialization.data(withJSONObject: storedEnvelope, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: storageFileURL, options: .atomic)
-        let storedText = String(decoding: data, as: UTF8.self)
-
-        return [
-            "ok": true,
-            "stateHash": safeComputeHash(storedText),
-            "updatedAt": timestamp,
-            "storagePath": storageFileURL.path
-        ]
-    }
-
-    func revealStorageDirectory() throws -> [String: Any] {
-        try ensureStorageDirectory()
-        NSWorkspace.shared.activateFileViewerSelecting([storageDirectoryURL])
-        return [
-            "path": storageDirectoryURL.path
-        ]
-    }
-
-    private func ensureStorageDirectory() throws {
-        try FileManager.default.createDirectory(
-            at: storageDirectoryURL,
-            withIntermediateDirectories: true,
-            attributes: nil
-        )
-    }
-
-    private func schemaVersion(from data: Data) -> Int? {
-        guard
-            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let schemaVersion = object["schemaVersion"] as? Int
-        else {
-            return nil
-        }
-
-        return schemaVersion
-    }
-
-    private func safeComputeHash(_ text: String) -> String {
-        var hash: UInt32 = 2_166_136_261
-        for scalar in text.unicodeScalars {
-            hash ^= UInt32(scalar.value)
-            hash = hash &+ (hash << 1)
-            hash = hash &+ (hash << 4)
-            hash = hash &+ (hash << 7)
-            hash = hash &+ (hash << 8)
-            hash = hash &+ (hash << 24)
-        }
-        return "h" + String(hash, radix: 16)
     }
 }

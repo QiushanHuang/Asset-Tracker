@@ -9,6 +9,7 @@ const root = path.join(__dirname, '..');
 const expectedWebAssets = [
     'index.html',
     'styles.css',
+    'legacy-safety.js',
     'script.js',
     'vendor/chart.umd.min.js',
     'vendor/xlsx.full.min.js'
@@ -95,6 +96,16 @@ test('macOS wrapper scaffold exists', () => {
     assert.match(envConfig, /build_and_run\.sh/);
 });
 
+test('the legacy safety module loads before the application runtime', () => {
+    const indexHtml = mustExist('index.html');
+    const safetyIndex = indexHtml.indexOf('<script src="legacy-safety.js"></script>');
+    const applicationIndex = indexHtml.indexOf('<script src="script.js"></script>');
+
+    assert.notEqual(safetyIndex, -1);
+    assert.notEqual(applicationIndex, -1);
+    assert.ok(safetyIndex < applicationIndex);
+});
+
 test('Swift package exposes a core library and a real test target', () => {
     const packageManifest = mustExist('macos-app/Package.swift');
     const coreSource = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerCore.swift');
@@ -106,6 +117,48 @@ test('Swift package exposes a core library and a real test target', () => {
     assert.doesNotMatch(coreSource, /\bmoduleName\b/);
     assert.match(coreTests, /^import AssetTrackerCore$/m);
     assert.doesNotMatch(coreTests, /@testable import|\bmoduleName\b/);
+});
+
+test('the native raw book store and protocol-v2 write gate live in Core', () => {
+    const storeSource = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerBookStore.swift');
+
+    assert.match(storeSource, /public (?:final )?(?:class|struct) AssetTrackerBookStore/);
+    assert.match(storeSource, /public final class AssetTrackerLegacyWriteGate/);
+    assert.match(storeSource, /import CryptoKit/);
+});
+
+test('the macOS bridge owns the Core protocol-v2 gate and receives an explicit final storage root', () => {
+    const bridgeSource = mustExist('macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift');
+    const appSource = mustExist('macos-app/Sources/AssetTrackerMac/main.swift');
+
+    assert.match(bridgeSource, /^import AssetTrackerCore$/m);
+    assert.doesNotMatch(bridgeSource, /private final class AssetTrackerBookStore/);
+    assert.match(bridgeSource, /private let bookStore: AssetTrackerBookStore/);
+    assert.match(bridgeSource, /private let storageCoordinator: AssetTrackerStorageCoordinator/);
+    assert.match(bridgeSource, /private let rawIOExecutor: AssetTrackerSerialRawIOExecutor/);
+    assert.doesNotMatch(bridgeSource, /private let writeGate: AssetTrackerLegacyWriteGate/);
+    assert.match(bridgeSource, /@MainActor\s+final class AssetTrackerHostBridge/);
+    assert.match(bridgeSource, /AssetTrackerStorageCoordinator\(\s*store:\s*bookStore,\s*rawIOExecutor:\s*rawIOExecutor/s);
+    assert.match(bridgeSource, /case "storage\.confirmLoad":/);
+    assert.match(bridgeSource, /case "storage\.save":\s*handleStorageSave/);
+    assert.match(bridgeSource, /case "file\.saveRawBook":\s*handleRawBookExport/);
+    assert.match(bridgeSource, /protocolVersion:\s*protocolVersion/);
+    assert.match(bridgeSource, /writeSessionToken:\s*writeSessionToken/);
+    assert.match(bridgeSource, /storageCoordinator\.startLoad/);
+    assert.match(bridgeSource, /storageCoordinator\.startSave/);
+    assert.match(bridgeSource, /storageCoordinator\.startRawExport/);
+    assert.match(bridgeSource, /storageCoordinator\.confirmLoad/);
+    assert.match(bridgeSource, /AssetTrackerBridgeResponsePipeline/);
+    assert.doesNotMatch(bridgeSource, /rawIOExecutor\.execute/);
+    assert.doesNotMatch(bridgeSource, /bookStore\.(?:load|save|exportRawBook)\(/);
+    assert.doesNotMatch(bridgeSource, /JSONSerialization\.data\(withJSONObject:/);
+    assert.match(bridgeSource, /webView\?\.evaluateJavaScript\(javascript\)/);
+
+    assert.match(appSource, /^import AssetTrackerCore$/m);
+    assert.match(appSource, /for:\s*\.applicationSupportDirectory/);
+    assert.match(appSource, /appendingPathComponent\(\s*"com\.qiushan\.AssetTracker",\s*isDirectory:\s*true\s*\)/);
+    assert.match(appSource, /AssetTrackerBookStore\(storageDirectoryURL:\s*storageDirectoryURL\)/);
+    assert.match(appSource, /bookStore:\s*bookStore/);
 });
 
 test('the Web asset manifest is explicit, unique, relative, and complete', () => {
