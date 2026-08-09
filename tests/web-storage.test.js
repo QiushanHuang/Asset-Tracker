@@ -1,95 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
+const { loadAssetTracker } = require('./helpers/asset-tracker-harness');
 
-function createElementStub(initial = {}) {
-    return {
-        value: initial.value || '',
-        checked: Boolean(initial.checked),
-        textContent: initial.textContent || '',
-        innerHTML: initial.innerHTML || '',
-        style: initial.style || {},
-        files: initial.files || [],
-        classList: {
-            add() {},
-            remove() {}
-        },
-        addEventListener() {},
-        removeEventListener() {},
-        appendChild() {},
-        click() {},
-        remove() {}
-    };
-}
-
-function loadAssetTracker() {
-    const scriptPath = path.join(__dirname, '..', 'script.js');
-    const scriptContent = fs.readFileSync(scriptPath, 'utf8');
-    const domEvents = {};
-    const elements = new Map();
-
-    const context = {
-        console,
-        setTimeout,
-        clearTimeout,
-        setInterval,
-        clearInterval,
-        TextDecoder,
-        Blob,
-        queueMicrotask,
-        atob: (value) => Buffer.from(value, 'base64').toString('binary'),
-        btoa: (value) => Buffer.from(value, 'binary').toString('base64'),
-        localStorage: {
-            getItem() { return null; },
-            setItem() {},
-            removeItem() {}
-        },
-        window: {
-            webkit: null
-        },
-        confirm() { return true; },
-        document: {
-            body: { appendChild() {} },
-            createElement() {
-                return createElementStub();
-            },
-            getElementById(id) {
-                if (!elements.has(id)) {
-                    elements.set(id, createElementStub());
-                }
-                return elements.get(id);
-            },
-            querySelectorAll() {
-                return [];
-            },
-            addEventListener(eventName, handler) {
-                domEvents[eventName] = handler;
-            }
-        }
-    };
-
-    context.window.document = context.document;
-    context.window.URL = {
-        createObjectURL() { return 'blob://test'; },
-        revokeObjectURL() {}
-    };
-    context.URL = context.window.URL;
-
-    vm.createContext(context);
-    vm.runInContext(`${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
-
-    return {
-        AssetTracker: context.__AssetTracker,
-        elements,
-        domEvents,
-        context
-    };
-}
-
-test('book payload parsing supports full-book envelope and legacy JSON', () => {
-    const { AssetTracker } = loadAssetTracker();
+test('book payload parsing supports full-book envelope and legacy JSON', (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const { AssetTracker } = app;
     const tracker = new AssetTracker();
 
     const bookEnvelope = JSON.stringify({
@@ -117,8 +33,10 @@ test('book payload parsing supports full-book envelope and legacy JSON', () => {
     assert.equal(parsedLegacy.payload.memo, 'legacy');
 });
 
-test('normalizeLoadedData fills settings, memo, templates, and backup fields', () => {
-    const { AssetTracker, elements } = loadAssetTracker();
+test('normalizeLoadedData fills settings, memo, templates, and backup fields', (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const { AssetTracker, elements } = app;
     const tracker = new AssetTracker();
 
     tracker.data = tracker.normalizeLoadedData({
@@ -143,8 +61,10 @@ test('normalizeLoadedData fills settings, memo, templates, and backup fields', (
     assert.equal(elements.get('backup-interval').value, 24);
 });
 
-test('saveData rejects when storage adapter reports a business failure', async () => {
-    const { AssetTracker } = loadAssetTracker();
+test('saveData rejects when storage adapter reports a business failure', async (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const { AssetTracker } = app;
     const tracker = new AssetTracker();
 
     tracker.storageAdapter = {
@@ -158,8 +78,10 @@ test('saveData rejects when storage adapter reports a business failure', async (
     );
 });
 
-test('initializeApp also primes automation and analytics state', () => {
-    const { AssetTracker } = loadAssetTracker();
+test('initializeApp also primes automation and analytics state', (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const { AssetTracker } = app;
     const tracker = new AssetTracker();
     const calls = [];
 
@@ -183,8 +105,10 @@ test('initializeApp also primes automation and analytics state', () => {
     assert.equal(calls.includes('analytics'), true);
 });
 
-test('DOMContentLoaded marks initialized only after initialize resolves', async () => {
-    const { AssetTracker, domEvents, context } = loadAssetTracker();
+test('DOMContentLoaded marks initialized only after initialize resolves', async (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const { AssetTracker, domEvents, context } = app;
     let resolveInitialize;
 
     AssetTracker.prototype.initialize = function() {
