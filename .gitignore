@@ -3,6 +3,7 @@
 # Local assistant/editor state
 .claude/
 记账/.claude/
+.worktrees/
 
 # Test and browser automation output
 .playwright-cli/
