@@ -31,6 +31,7 @@
 
 - `legacy-safety.js`
 - `tests/helpers/asset-tracker-harness.js`
+- `tests/asset-tracker-harness.test.js`
 - `tests/data-recovery.test.js`
 - `tests/save-queue.test.js`
 - `tests/legacy-feature-gates.test.js`
@@ -46,17 +47,20 @@
 - `package.json`
 - `package-lock.json`
 - `script/serve-web.mjs`
+- `script/web-assets.manifest`
 - `script/verify-phase1.sh`
 - `script/verify_macos_webview_smoke.sh`
 
 ### New Native Files
 
+- `macos-app/Sources/AssetTrackerCore/AssetTrackerCore.swift`
 - `macos-app/Sources/AssetTrackerCore/AssetTrackerBookStore.swift`
 - `macos-app/Sources/AssetTrackerCore/NativeDurableFileWriter.swift`
 - `macos-app/Sources/AssetTrackerCore/CutoverControlStore.swift`
 - `macos-app/Sources/AssetTrackerCore/FreezeCoordinator.swift`
 - `macos-app/Sources/AssetTrackerCore/BridgeRequestPolicy.swift`
 - `macos-app/Sources/AssetTrackerFaultHarness/main.swift`
+- `macos-app/Tests/AssetTrackerCoreTests/AssetTrackerCoreTests.swift`
 - `macos-app/Tests/AssetTrackerCoreTests/AssetTrackerBookStoreTests.swift`
 - `macos-app/Tests/AssetTrackerCoreTests/NativeDurableFileWriterTests.swift`
 - `macos-app/Tests/AssetTrackerCoreTests/CutoverControlStoreTests.swift`
@@ -86,9 +90,14 @@ Tasks are merged strictly in the order above because Tasks 5/8 and Tasks 9/10 ed
 **Files:**
 
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/helpers/asset-tracker-harness.js`
+- Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/asset-tracker-harness.test.js`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/web-storage.test.js`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/macos-scaffold.test.js`
+- Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script/web-assets.manifest`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script/sync_web_assets.sh`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Package.swift`
+- Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerCore/AssetTrackerCore.swift`
+- Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Tests/AssetTrackerCoreTests/AssetTrackerCoreTests.swift`
 
 - [ ] **Step 1: Extract the existing VM harness without changing behavior**
 
@@ -96,6 +105,10 @@ Move `createElementStub()` and `loadAssetTracker()` out of `tests/web-storage.te
 
 ```js
 const app = loadAssetTracker({
+    document: null,       // optional full document override
+    storage: null,        // optional localStorage-compatible override
+    nativeHost: null,     // optional window.webkit-compatible override
+    clock: null,          // optional timer delegate
     localStorageSeed: {},
     nativeHandler: null,
     lockManager: null,
@@ -106,19 +119,27 @@ const app = loadAssetTracker({
 // bridge requests, messages, and a deferred() helper.
 ```
 
+The four environment ports above must be real dependency overrides, not ignored option keys: injected document/storage/nativeHost objects are connected to the VM, and injected timer functions are called through the tracked clock so `dispose()` still clears every outstanding timer. `nativeHandler` remains the convenient observed-handler compatibility form.
+
 The DOM stub must support attributes, focus, children, event dispatch, `querySelector`, `querySelectorAll`, and `classList.contains`, because later accessibility tests must observe real state rather than no-op methods.
 
-- [ ] **Step 2: Record the current canonical-resource baseline**
+- [ ] **Step 2: Establish a safe canonical source manifest and release-only byte gate**
 
 ```js
-test('the existing root Web sources match their staged macOS copies', () => {
-    for (const file of ['index.html', 'styles.css', 'script.js']) {
-        assert.deepEqual(read(staged(file)), read(root(file)));
-    }
+test('the Web asset manifest is explicit, unique, relative, and complete', () => {
+    assert.deepEqual(manifestEntries, [
+        'index.html',
+        'styles.css',
+        'script.js',
+        'vendor/chart.umd.min.js',
+        'vendor/xlsx.full.min.js'
+    ]);
 });
 ```
 
-This is an inventory/baseline assertion and should pass in Task 1. Do not include `legacy-safety.js` before Task 2 creates it, and do not demand the new sync behavior before Task 11 implements it. The final complete canonical-list test is created in Task 11.
+The manifest test runs in every task and verifies: no absolute path, `..`, blank, duplicate, missing source, or symlinked source. The sync script must read only this manifest, resolve its target to the exact worktree-local `macos-app/Resources/Web`, and reject a symlinked or escaped target before any cleanup/copy. A `/bin/bash` black-box fixture must prove compatibility with the macOS system Bash, successful exact copying, and that rejected input leaves a pre-existing staged target byte-for-byte unchanged. Do not include `legacy-safety.js` before Task 2 creates it.
+
+The existing root-vs-staged byte assertion becomes a release-only test skipped unless `ASSET_TRACKER_VERIFY_STAGED=1`. Tasks 2–10 intentionally allow generated staged resources to lag; they are not release evidence and must not be committed merely because a local build generated them. Task 11 runs the sync, enables the environment flag, and enforces exact file-set plus byte equality.
 
 - [ ] **Step 3: Split the Swift package into core, executable, and tests**
 
@@ -137,16 +158,16 @@ Run:
 
 ```bash
 cd /Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账
-node --test tests/web-storage.test.js tests/macos-scaffold.test.js
+node --test tests/asset-tracker-harness.test.js tests/web-storage.test.js tests/macos-scaffold.test.js
 swift test --package-path macos-app
 ```
 
-Expected before the minimal implementation: the new Swift test-target smoke test fails because the core target does not exist. The resource baseline remains green. After the harness/package extraction, all pre-existing six tests and the new smoke tests pass.
+Expected before the minimal implementation: the new Swift test-target smoke test fails because the core target does not exist. The resource baseline remains green. After the harness/package extraction, all harness, storage, scaffold, and Swift smoke tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests macos-app/Package.swift macos-app/Sources/AssetTrackerCore macos-app/Tests
+git add tests script/web-assets.manifest script/sync_web_assets.sh macos-app/Package.swift macos-app/Sources/AssetTrackerCore macos-app/Tests
 git commit -m "test: establish legacy safety seams"
 ```
 
@@ -156,9 +177,11 @@ git commit -m "test: establish legacy safety seams"
 
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/legacy-safety.js`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/index.html`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script/web-assets.manifest`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script.js`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/styles.css`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/data-recovery.test.js`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/macos-scaffold.test.js`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerCore/AssetTrackerBookStore.swift`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Tests/AssetTrackerCoreTests/AssetTrackerBookStoreTests.swift`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift`
@@ -211,6 +234,8 @@ Also test an envelope with a future unsupported schema/capability, invalid top-l
 
 Load it before `script.js` in `index.html`.
 
+Add `legacy-safety.js` to `script/web-assets.manifest` in the same change. Do not sync or commit the staged generated copy in this task.
+
 - [ ] **Step 3: Make parsing return a typed result**
 
 Replace the ambiguous `null` result with:
@@ -245,6 +270,7 @@ Move the inline private store out of `AssetTrackerHostBridge.swift`. Inject a te
 - [ ] **Step 6: Verify**
 
 ```bash
+node --test tests/macos-scaffold.test.js
 node --test tests/data-recovery.test.js
 swift test --package-path macos-app --filter AssetTrackerBookStoreTests
 ```
@@ -254,7 +280,7 @@ The hard assertion is `sourceHashBefore === sourceHashAfter` and zero save calls
 - [ ] **Step 7: Commit**
 
 ```bash
-git add legacy-safety.js index.html script.js styles.css tests/data-recovery.test.js macos-app
+git add legacy-safety.js index.html script/web-assets.manifest script.js styles.css tests/data-recovery.test.js tests/macos-scaffold.test.js macos-app
 git commit -m "fix: protect unreadable legacy books"
 ```
 
@@ -348,6 +374,7 @@ A corrupt current file is never promoted to a valid recovery point and is never 
 - [ ] **Step 6: Verify**
 
 ```bash
+node --test tests/macos-scaffold.test.js
 node --test tests/save-queue.test.js
 swift test --package-path macos-app --filter NativeDurableFileWriterTests
 swift test --package-path macos-app --filter ProcessKillRecoveryTests
@@ -434,6 +461,7 @@ Native `setupAutoBackup()`/`performAutoBackup()` may call bounded `storage.snaps
 - [ ] **Step 6: Verify and commit**
 
 ```bash
+node --test tests/macos-scaffold.test.js
 node --test tests/save-queue.test.js tests/legacy-feature-gates.test.js
 ```
 
@@ -496,6 +524,7 @@ Build and validate the complete candidate first. Commit it once through `runPers
 - [ ] **Step 5: Verify and commit**
 
 ```bash
+node --test tests/macos-scaffold.test.js
 node --test --test-name-pattern="net worth|liability|reporting currency|missing rate" tests/legacy-accounting-safety.test.js
 ```
 
@@ -565,6 +594,7 @@ Replace date-only uses of `toISOString().split('T')[0]` and `new Date('YYYY-MM-D
 Run:
 
 ```bash
+node --test tests/macos-scaffold.test.js
 TZ=Asia/Shanghai node --test --test-name-pattern="date-only" tests/legacy-accounting-safety.test.js
 TZ=America/Los_Angeles node --test --test-name-pattern="date-only" tests/legacy-accounting-safety.test.js
 ```
@@ -693,6 +723,7 @@ Run the existing injected-fault matrix and the subprocess harness. For every nat
 - [ ] **Step 5: Verify and commit**
 
 ```bash
+node --test tests/macos-scaffold.test.js
 node --test tests/cutover-control.test.js
 swift test --package-path macos-app --filter CutoverControlStoreTests
 swift test --package-path macos-app --filter ProcessKillRecoveryTests
@@ -735,6 +766,7 @@ In Settings/Data Exchange, show one compact stop-loss notice. Remove unreachable
 - [ ] **Step 4: Verify and commit**
 
 ```bash
+node --test tests/macos-scaffold.test.js
 node --test tests/legacy-stop-loss-ui.test.js tests/legacy-feature-gates.test.js
 ```
 
@@ -807,6 +839,7 @@ Use `WKNavigationDelegate`/`WKUIDelegate` in `main.swift`. Prefer `callAsyncJava
 - [ ] **Step 5: Verify and commit**
 
 ```bash
+node --test tests/macos-scaffold.test.js
 node --test tests/security-boundary.test.js
 swift test --package-path macos-app --filter BridgeRequestPolicyTests
 ```
@@ -884,7 +917,7 @@ git commit -m "fix: make legacy shell reachable and accessible"
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/web-assets-sync.test.js`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script/verify-phase1.sh`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script/verify_macos_webview_smoke.sh`
-- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script/sync_web_assets.sh`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script/sync_web_assets.sh` only if Task 1's manifest-driven implementation needs final release hardening
 - Generate: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Resources/Web/*`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/docs/evidence/v2/phase1-legacy-risk-isolation.md`
 
@@ -907,7 +940,7 @@ At `320x568`, `375x667`, `768x1024`, `812x375`, `1024x768`, and `1440x900`, plus
 
 - [ ] **Step 3: Update the sync script**
 
-Create the final `tests/web-assets-sync.test.js`, now including `legacy-safety.js` and all vendor files. Its byte-identity assertion runs only when `ASSET_TRACKER_VERIFY_STAGED=1`; the ordinary unit suite tests the source-list/target guards without assuming generation has already happened. Synchronize the explicit list from root. The script may recreate only the resolved staged Web directory after validating that exact target; run it only after root tests pass.
+Create the final `tests/web-assets-sync.test.js`, now requiring the Task 2 manifest entry for `legacy-safety.js` and all vendor files. Its byte-identity assertion runs only when `ASSET_TRACKER_VERIFY_STAGED=1`; the ordinary unit suite tests the source-list/target guards without assuming generation has already happened. Synchronize the explicit list from root. The script may recreate only the resolved staged Web directory after validating that exact target; run it only after root tests pass.
 
 - [ ] **Step 4: Test the packaged WKWebView runtime**
 
