@@ -181,20 +181,64 @@ git commit -m "test: establish legacy safety seams"
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script.js`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/styles.css`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/data-recovery.test.js`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/helpers/asset-tracker-harness.js`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/web-storage.test.js`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/macos-scaffold.test.js`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerCore/AssetTrackerBookStore.swift`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Tests/AssetTrackerCoreTests/AssetTrackerBookStoreTests.swift`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerMac/main.swift`
+
+The cross-reviewed Task 2 contract is:
+
+- Swift has only the raw-read states `missing | readableBytes | invalidUTF8 | ioError`; it owns exact bytes, strict UTF-8, source path, and SHA-256. `legacy-safety.js` is the only JSON/version/domain validator and produces the public `missing | valid | corrupt | unsupported | ioError` result.
+- `missing` means the key/file is physically absent. A present empty string, whitespace-only value, or zero-byte file is corrupt and can never open a writable default book.
+- The normal shell starts `hidden`, `inert`, and `aria-hidden`. It is revealed only after load, validation, normalization, and the complete critical render succeed. A render exception is a separate read-only `renderError`, not evidence that the book itself is corrupt.
+- Raw evidence is separate from normalized `data`. Native recovery export re-reads the fixed canonical source, verifies the expected SHA-256, and copies exact bytes without sending invalid UTF-8 through JavaScript. For Web Storage, a well-formed DOMString uses `SHA-256(UTF-8)`; a DOMString containing unpaired surrogates uses `SHA-256(UTF-16LE code units)` and exports those exact bytes as a lossless recovery file. The UI always displays the matching hash algorithm/domain rather than claiming a disk-file hash.
+- A protocol-v2 native write gate uses a fresh `loadId` and records `neverLoaded | candidateMissing(loadId) | candidateExisting(loadId, rawHash) | retryCandidateExisting(loadId, rawHash) | validatedMissing(loadId, token) | validatedExisting(loadId, rawHash, token) | recoverableLocked(reason) | terminalLocked(reason)`. A successful confirmation generates an opaque `writeSessionToken` returned only in its ACK; Web stores it only after receiving that ACK and clears it on every recovery transition. Native save rejects old clients, a missing/wrong token, stale `loadId`, missing validation confirmation, a newly appeared file after `validatedMissing`, or mismatched `expectedHash`/`validatedSourceHash`.
+- Retry is read-only and available only from a recoverable pre-render lock. It may unlock only after a fresh `valid` result and successful first render; once a session has entered recovery, a retry result of `missing` remains locked. `renderError` or a post-render internal error is terminal for the current process and requires relaunch; never imply that a render failure proves the file needs external correction.
+- Task 2 keeps synchronous Core I/O and the existing non-durable atomic save. Actor/queue ordering, fsync, kill points, snapshots, and durable ACK remain Task 3.
+
+Freeze these public/app-state distinctions:
+
+```text
+LoadResult     = missing | valid | corrupt | unsupported | ioError
+RecoveryReason = corrupt | unsupported | ioError | renderError | internalError
+```
+
+A validator that returns structured issues produces `corrupt`; a validator implementation exception produces `internalError(phase=preRender)` while retaining the original load result/evidence. A critical-render or uncertain-confirm failure produces `internalError(phase=postRender)`/`renderError` and a terminal lock. Unknown but well-formed format or higher `formatVersion`, `schemaVersion`, `domainCapabilityVersion`, or `minimumReaderVersion` produces `unsupported`; an unparseable value or invalid version-field type produces `corrupt`. Phase 1 supports positive-integer version `1` for all four fields.
+
+The gate transition table is normative:
+
+```text
+neverLoaded --load missing(id)--> candidateMissing(id)
+candidateMissing(id) --confirm missing(id,null)--> validatedMissing(id,newToken)
+neverLoaded --load readable(id,h)--> candidateExisting(id,h)
+candidateExisting(id,h) --confirm valid(id,h)--> validatedExisting(id,h,newToken)
+neverLoaded --load invalidUTF8/ioError--> recoverableLocked(reason,preRender)
+candidate*/retryCandidate* --confirm corrupt/unsupported/preRenderInternal(same id)--> recoverableLocked(reason,preRender)
+candidate*/retryCandidate* --confirm renderError/postRenderInternal(same id)--> terminalLocked(reason,postRender)
+recoverableLocked --retry readable(newId,h)--> retryCandidateExisting(newId,h)
+retryCandidateExisting(newId,h) --confirm valid(newId,h)--> validatedExisting(newId,h,newToken)
+recoverableLocked --retry missing/invalidUTF8/ioError--> recoverableLocked(reason,preRender)
+recoverableLocked --Web validate corrupt/unsupported/preRenderInternal--> recoverableLocked(reason,preRender)
+terminalLocked --retry/confirm--> reject without state change
+```
+
+Every confirmation with a stale/wrong `loadId`, wrong hash, or illegal outcome is rejected and cannot unlock writes. A diagnostic `storage.load` may still read bytes while terminal-locked, but it cannot create a confirmable candidate in that process. `validatedMissing` save rechecks that the canonical file is still physically absent; otherwise it fails stale without writing. `validatedExisting` save requires protocol `2`, the matching `loadId`, the exact opaque token, and equal `expectedHash`/`validatedSourceHash`; a successful save advances the gate hash while retaining the session token. If a confirm ACK is lost, Web never learns the token, so every subsequent save is rejected even if native already entered `validated*`. Cross-process atomic exclusion remains Task 7.
 
 - [ ] **Step 1: Write failing load-state tests**
 
-Cover four distinct results:
+Cover five distinct public load results plus app-internal validation/render failures:
 
 ```text
 missing  -> first-run default book, writable
 valid    -> parsed book, writable
 corrupt  -> recovery UI only, never save
+unsupported -> compatibility recovery UI only, never save
 ioError  -> recovery UI only, never save
+renderError -> valid raw book, but recovery UI only and never save
+internalError -> validator/runtime failure, recovery UI only; never label the book corrupt
 ```
 
 Representative test:
@@ -215,7 +259,7 @@ test('non-empty invalid JSON enters recovery and never writes defaults', async (
 });
 ```
 
-Also test an envelope with a future unsupported schema/capability, invalid top-level payload, invalid transaction date/amount shape, native invalid UTF-8, and an I/O error. In every case, compare original bytes/hash before and after initialization.
+Also test an envelope with a future unsupported schema/capability/minimum reader, unknown format, invalid top-level payload, invalid transaction date/amount shape, native invalid UTF-8, an I/O error, an empty-but-present source, and a critical render exception. In every case, compare original bytes/hash before and after initialization, assert zero main/backup writes and zero auto-backup timers, and prove the normal shell never becomes visible. A validator implementation exception maps to `internalError` recovery rather than either corrupt data or a default book.
 
 - [ ] **Step 2: Create a UMD-style safety module**
 
@@ -245,9 +289,12 @@ Replace the ambiguous `null` result with:
 { status: 'valid', payload, source, meta }
 { status: 'corrupt', reason, rawHash, schemaVersion }
 { status: 'unsupported', reason, rawHash, schemaVersion }
+{ status: 'ioError', reason, storagePath, canRevealFolder }
 ```
 
 Validation is strict enough to stop runtime crashes and non-finite monetary values, while retaining unknown fields for export/migration. Unsupported future schema is not corrupt; both are read-only.
+
+Known legacy fields are strict when present, missing fields may receive defaults only after the entire payload validates, and unknown fields remain untouched. Validate recursive category balances, transaction/rule/template/initial-asset amounts, positive finite exchange rates, supported automation frequencies, and real calendar dates. Reject dangerous prototype keys and a non-empty object that contains no known legacy root field. Do not impose the obsolete three-level category limit.
 
 - [ ] **Step 4: Add a persistent app status/recovery surface**
 
@@ -261,26 +308,95 @@ assertWritable()
 renderDataSafetyState()
 ```
 
-Recovery state must show the reason, raw hash/path when available, “导出原始账本” where possible, and “打开数据目录” on macOS. It must not render the default dashboard as a normal empty book.
+Use these stable DOM hooks:
+
+```text
+#normal-app-shell[hidden][inert][aria-hidden="true"]
+#recovery-surface[hidden][aria-labelledby="recovery-title"]
+#recovery-title[tabindex="-1"]
+#app-status[role="status"]
+#data-safety-status[role="status"]
+#export-raw-book-btn
+#reveal-storage-folder-btn
+#retry-book-load-btn
+```
+
+The success order is normative: `load -> validate -> normalize -> critical render while hidden/inert -> await storage.confirmLoad ACK and capture its writeSessionToken (or the Web-local equivalent) -> set writable -> remove hidden/inert/aria-hidden -> start auto-backup`. A confirmation timeout, lost ACK, transport failure, stale `loadId`, or hash mismatch has an unknowable native gate outcome in Task 2: clear any Web token, keep the normal shell isolated, enter post-render `internalError` recovery, hide retry, and require relaunch. Do not add a gate reconciliation query before Task 3. In recovery, show the recovery surface before focusing its heading; hashes and paths stay outside live regions.
+
+For Task 2, every current `initializeApp()` call is critical: `setupNavigation`, `setupEventListeners`, `renderCategories`, `renderTransactions`, `updateDashboard`, `setupCharts`, `renderAutomationRules`, `updateAnalyticsOptions`, `initializeSettings`, `populateInitAssetCategoryOptions`, `renderInitialAssetsList`, `renderMemo`, and `initializeTransactionFilters`. Inject one failure at every step; each must produce terminal `renderError`, keep the shell isolated, focus the recovery heading, preserve source bytes/hash, perform zero canonical/backup writes, and issue no write token.
+
+Recovery state must show the reason, raw hash/path when available, “导出原始账本” where possible, and “打开数据目录” on macOS. It must not render the default dashboard as a normal empty book. Use distinct copy for corrupt (“账本内容无法安全读取”), unsupported (“此版本无法打开该账本；账本不一定损坏”), read I/O (“暂时无法读取账本”), render failure (“账本暂时无法安全显示”), and internal failure (“应用未能完成安全打开；未对账本写入，请重新启动应用”). A render/internal message must not imply that the book itself needs correction. The shared statement is: “只读保护已开启。所有修改功能已停用；本次启动未对原始账本执行写入或替换。” Move focus to the recovery heading; do not put paths or hashes in the live region.
+
+Keep only capability-backed safe actions: exact raw export, native reveal, and the restricted read-only retry described above. Web never shows reveal; I/O without captured bytes never offers raw export. `saveData()`, `persistData()`, `setupAutoBackup()`, `performAutoBackup()`, and `saveBackupSettings()` all fail closed or no-op in recovery.
+
+The action matrix is normative:
+
+| Recovery state | Raw export | Reveal | Retry |
+| --- | --- | --- | --- |
+| corrupt / unsupported | only when raw evidence exists | macOS only | enabled |
+| read ioError before render | only when bytes were captured before the error | macOS only | primary action |
+| renderError / internalError after render began | when raw evidence exists | macOS only | hidden; explain that relaunch is required |
+| any Web build | according to raw evidence | never rendered | according to the state above |
+
+Retry is a fresh load with a fresh `loadId`. Cover retry to `valid`, `corrupt`, `unsupported`, `ioError`, `missing`, and render/internal failure; only `valid -> hidden critical render -> matching confirm ACK` may leave recovery. Do not say that a render failure proves the file needs correction.
 
 - [ ] **Step 5: Extract and test the native book store**
 
-Move the inline private store out of `AssetTrackerHostBridge.swift`. Inject a temporary storage root in tests. `load()` returns the typed status and raw hash without rewriting. Never touch real `Application Support` in XCTest.
+Move the inline private store out of `AssetTrackerHostBridge.swift`. Require an explicit storage root; production constructs the Application Support URL in `main.swift`, while XCTest injects a temporary root. `init` and missing `load()` create no directory. `load()` returns the raw-read status and SHA-256 of original `Data` without rewriting or lossy decoding. Add exact raw export with expected-hash and same-source/symlink rejection. Never touch real `Application Support` in XCTest.
+
+Add and test the protocol-v2 write-gate state machine in Core, then use it from the bridge. `storage.load` returns the raw candidate; `storage.confirmLoad` is the only transition to `validated`/writable after successful Web validation and render; `file.saveRawBook` exports from the fixed source after a fresh hash check. Do not base64 invalid raw files across WKWebView.
+
+Freeze the bridge DTOs:
+
+```js
+// storage.load result
+{
+  protocolVersion: 2,
+  loadId,
+  status: 'missing' | 'readableBytes' | 'invalidUTF8' | 'ioError',
+  reason: null | 'permissionDenied' | 'notRegularFile' | 'readFailed',
+  stateJson: null | '<strict UTF-8 text>',
+  stateHash: '',                 // compatibility alias; readableBytes uses rawHash
+  rawHash: null | '<64 lowercase SHA-256 hex>',
+  hashAlgorithm: 'sha256',
+  storagePath,
+  updatedAt: null | '<ISO8601>',
+  canExportRaw,
+  canRevealFolder
+}
+
+// storage.confirmLoad request and ACK
+{ protocolVersion: 2, loadId, outcome: 'missing' | 'valid' | 'recovery', reason: null | '<stable code>', validatedSourceHash: null | '<sha256>' }
+{ ok: true, writeSessionToken: null | '<opaque random token>' }
+
+// storage.save additions
+{ protocolVersion: 2, loadId, writeSessionToken, expectedHash, validatedSourceHash }
+```
+
+Keep `AssetTrackerBookStore` synchronous and stateless apart from its fixed directory. Keep the write-gate as a Core state-machine type owned only by the main-thread bridge. Run potentially large raw load/hash/export work off the WK/AppKit main thread, but present save panels and perform `NSWorkspace`, gate transitions, and WK responses on the main thread. Do not create a general write queue or permit two store mutations concurrently in Task 2.
+
+Raw export must reject a destination that is the source by standardized path, resolved symlink, or existing filesystem identity/hard link. Hash mismatch or cancellation writes neither the source nor a destination. `storageDirectoryURL` is the final `.../com.qiushan.AssetTracker` directory; the Store must not append the bundle identifier again.
 
 - [ ] **Step 6: Verify**
 
 ```bash
 node --test tests/macos-scaffold.test.js
+node --test tests/asset-tracker-harness.test.js tests/web-storage.test.js
 node --test tests/data-recovery.test.js
 swift test --package-path macos-app --filter AssetTrackerBookStoreTests
+swift test --package-path macos-app
+swift build --package-path macos-app
+git diff --check
 ```
 
-The hard assertion is `sourceHashBefore === sourceHashAfter` and zero save calls for every non-empty invalid input.
+The hard assertion is `sourceHashBefore === sourceHashAfter` and zero canonical save calls for every non-empty invalid input. Recheck canonical source bytes/SHA-256 after initialization, raw-export success/cancel/failure, reveal, every retry result, render/internal error, and `confirmLoad` failure. Assert zero localStorage set/remove, zero native main/backup save, zero auto-backup timers, exact exported bytes/hash when export succeeds, and that any external export is the only written target.
+
+Swift P0 coverage includes the entire write-gate transition table and stale `loadId`; old/missing protocol or token rejection; native-confirm-processed-but-ACK-lost followed by a rejected tokenless save; missing-candidate file appearance; candidate hash mismatch; terminal-lock retry rejection; recovery retry-to-missing; init/missing load with zero directory creation; strict invalid UTF-8 bytes/hash; I/O categories; raw-export hash mismatch; and same path, symlink, and hard-link identity rejection. Web P0 coverage includes a lone-surrogate DOMString whose distinct UTF-16 code-unit hash and exported bytes round-trip exactly.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add legacy-safety.js index.html script/web-assets.manifest script.js styles.css tests/data-recovery.test.js tests/macos-scaffold.test.js macos-app
+git add legacy-safety.js index.html script/web-assets.manifest script.js styles.css tests/data-recovery.test.js tests/helpers/asset-tracker-harness.js tests/web-storage.test.js tests/macos-scaffold.test.js macos-app
 git commit -m "fix: protect unreadable legacy books"
 ```
 
