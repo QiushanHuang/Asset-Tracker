@@ -27,7 +27,11 @@
     const AUTOMATION_FREQUENCIES = new Set(['daily', 'weekly', 'monthly', 'yearly']);
     const IntrinsicPromise = Promise;
     const intrinsicPromiseResolve = Promise.resolve.bind(Promise);
+    const intrinsicPromiseThen = Function.prototype.call.bind(Promise.prototype.then);
+    const intrinsicArrayIsArray = Array.isArray;
+    const intrinsicObjectCreate = Object.create;
     const intrinsicObjectFreeze = Object.freeze;
+    const intrinsicObjectKeys = Object.keys;
     const intrinsicReflectGet = Reflect.get;
     const QUEUE_OPTION_FIELDS = intrinsicObjectFreeze([
         'write',
@@ -71,6 +75,24 @@
         'setTimeout',
         'clearTimeout'
     ]);
+    const SAVE_DESCRIPTOR_FIELDS = intrinsicObjectFreeze([
+        'stateJson',
+        'reason'
+    ]);
+    const SAVE_RECEIPT_FIELDS = intrinsicObjectFreeze([
+        'ok',
+        'clientSaveId',
+        'payloadHash',
+        'sourceHashBefore',
+        'stateHashAfter',
+        'stateHash',
+        'byteCount',
+        'durability',
+        'updatedAt',
+        'storagePath',
+        'recoveryHealth'
+    ]);
+    const saveQueueInternals = new WeakMap();
 
     class AssetTrackerSaveError extends Error {}
     class AssetTrackerSnapshotError extends Error {}
@@ -78,11 +100,15 @@
     class AssetTrackerQueueHaltedError extends Error {}
     class AssetTrackerQueueCallbackError extends Error {}
 
+    function isQueueRecord(value) {
+        return value !== null && typeof value === 'object' && !intrinsicArrayIsArray(value);
+    }
+
     function canonicalDeepFrozenCopy(value) {
         if (value === null || typeof value !== 'object') return value;
 
-        const copy = Array.isArray(value) ? [] : {};
-        for (const key of Object.keys(value)) {
+        const copy = intrinsicArrayIsArray(value) ? [] : {};
+        for (const key of intrinsicObjectKeys(value)) {
             copy[key] = canonicalDeepFrozenCopy(intrinsicReflectGet(value, key));
         }
         return intrinsicObjectFreeze(copy);
@@ -96,9 +122,9 @@
     }
 
     function extractAllowedFields(source, fields, label) {
-        if (!isRecord(source)) throw new TypeError(`Queue ${label} must be an object`);
+        if (!isQueueRecord(source)) throw new TypeError(`Queue ${label} must be an object`);
 
-        const extracted = Object.create(null);
+        const extracted = intrinsicObjectCreate(null);
         for (const field of fields) {
             try {
                 extracted[field] = intrinsicReflectGet(source, field);
@@ -149,7 +175,7 @@
     }
 
     function copySessionContext(value) {
-        if (!isRecord(value)
+        if (!isQueueRecord(value)
             || value.protocolVersion !== 2
             || typeof value.loadId !== 'string'
             || value.loadId.length === 0
@@ -166,7 +192,7 @@
     }
 
     function copyInitialAcknowledged(value) {
-        if (!isRecord(value) || typeof value.stateJson !== 'string') {
+        if (!isQueueRecord(value) || typeof value.stateJson !== 'string') {
             throw new TypeError('Queue initialAcknowledged is invalid');
         }
         if (value.stateHash !== null
@@ -189,7 +215,7 @@
             'maintenancePendingCount',
             'detail'
         ];
-        if (!isRecord(value)
+        if (!isQueueRecord(value)
             || requiredFields.some(field => !Object.prototype.hasOwnProperty.call(value, field))
             || value.domain !== expectedDomain
             || !['healthy', 'degraded', 'not-applicable'].includes(value.status)
@@ -291,11 +317,492 @@
         });
     }
 
+    function createPromiseCapability() {
+        let resolve;
+        let reject;
+        const promise = new IntrinsicPromise((resolvePromise, rejectPromise) => {
+            resolve = resolvePromise;
+            reject = rejectPromise;
+        });
+        return intrinsicObjectFreeze({ promise, resolve, reject });
+    }
+
+    function freezeTypedError(error, properties) {
+        Object.assign(error, properties);
+        return intrinsicObjectFreeze(error);
+    }
+
+    function createCallbackFault(internals, details) {
+        internals.nextCallbackFaultOrdinal += 1;
+        return freezeTypedError(
+            new AssetTrackerQueueCallbackError('Queue callback contract failed'),
+            {
+                queueOutcome: 'callback-failed',
+                callbackFaultId: `${internals.configuration.sessionContext.loadId}:callback:${internals.nextCallbackFaultOrdinal}`,
+                causeKind: details.causeKind,
+                callbackName: details.callbackName,
+                clientItemId: details.clientItemId,
+                completedItemKind: details.completedItemKind,
+                completedClientItemId: details.completedClientItemId,
+                completedOutcome: details.completedOutcome
+            }
+        );
+    }
+
+    function createAbortError(item, cause) {
+        return freezeTypedError(
+            new AssetTrackerQueueAbortError('Accepted queue item was not dispatched'),
+            {
+                queueOutcome: 'not-dispatched',
+                itemKind: item.kind,
+                clientItemId: item.clientSaveId,
+                payloadHash: item.payloadHash,
+                causedByClientItemId: cause.causedByClientItemId,
+                causeKind: cause.causeKind,
+                callbackFaultId: cause.callbackFaultId,
+                completedItemKind: cause.completedItemKind,
+                completedClientItemId: cause.completedClientItemId,
+                completedOutcome: cause.completedOutcome
+            }
+        );
+    }
+
+    function createHaltedError(terminalCause) {
+        return freezeTypedError(
+            new AssetTrackerQueueHaltedError('Save queue is halted'),
+            {
+                queueOutcome: 'queue-halted',
+                terminalCause
+            }
+        );
+    }
+
+    function createMalformedSaveError(item) {
+        return freezeTypedError(
+            new AssetTrackerSaveError('Save receipt or adapter outcome is malformed'),
+            {
+                queueOutcome: 'durability-unknown',
+                clientSaveId: item.clientSaveId,
+                payloadHash: item.payloadHash
+            }
+        );
+    }
+
+    function ignoreDiagnostic() {
+        return undefined;
+    }
+
+    function consumeCallbackDiagnostic(value) {
+        try {
+            const diagnosticPromise = intrinsicPromiseResolve(value);
+            intrinsicPromiseThen(diagnosticPromise, ignoreDiagnostic, ignoreDiagnostic);
+        } catch (_error) {
+            // Diagnostics are deliberately best effort and never alter queue state.
+        }
+    }
+
+    function invokeTotalCallback(callback, argumentsList, callbackName) {
+        let result;
+        try {
+            result = callback(...argumentsList);
+        } catch (_error) {
+            return { ok: false, callbackName };
+        }
+        if (result !== undefined) {
+            consumeCallbackDiagnostic(result);
+            return { ok: false, callbackName };
+        }
+        return { ok: true, callbackName };
+    }
+
+    function invokeTerminalCallback(callback, argumentsList) {
+        let result;
+        try {
+            result = callback(...argumentsList);
+        } catch (_error) {
+            return;
+        }
+        if (result !== undefined) consumeCallbackDiagnostic(result);
+    }
+
+    function replaceQueueState(queue, overrides) {
+        queue.queueState = canonicalDeepFrozenCopy({
+            ...queue.queueState,
+            ...overrides
+        });
+    }
+
+    function selectSavingState(queue) {
+        const internals = saveQueueInternals.get(queue);
+        const nextItem = internals.items[0] || null;
+        replaceQueueState(queue, {
+            lanePhase: nextItem ? 'saving' : 'idle',
+            activeClientSaveId: nextItem ? nextItem.clientSaveId : null,
+            activeClientSnapshotId: null,
+            pendingCount: internals.items.length
+        });
+    }
+
+    function publishTerminalCallbacks(queue, terminalCause) {
+        const internals = saveQueueInternals.get(queue);
+        invokeTerminalCallback(internals.configuration.onTransition, [queue.getState()]);
+        invokeTerminalCallback(internals.configuration.onFault, [terminalCause]);
+    }
+
+    function haltForCallbackFault(queue, fault, triggeringItem = null) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted) return;
+
+        internals.halted = true;
+        internals.terminalCause = fault;
+        internals.activeItem = null;
+        internals.laneRevision += 1;
+        const unsettledItems = internals.items.splice(0);
+        const causedByClientItemId = fault.completedClientItemId || fault.clientItemId;
+        for (const item of unsettledItems) {
+            if (item === triggeringItem) {
+                item.promiseCapability.reject(fault);
+                continue;
+            }
+            item.promiseCapability.reject(createAbortError(item, {
+                causedByClientItemId,
+                causeKind: fault.causeKind,
+                callbackFaultId: fault.callbackFaultId,
+                completedItemKind: fault.completedItemKind,
+                completedClientItemId: fault.completedClientItemId,
+                completedOutcome: fault.completedOutcome
+            }));
+        }
+        replaceQueueState(queue, {
+            lanePhase: 'halted',
+            primaryStatus: 'failed-readonly',
+            activeClientSaveId: null,
+            activeClientSnapshotId: null,
+            pendingCount: 0,
+            accepting: false,
+            halted: true
+        });
+        publishTerminalCallbacks(queue, fault);
+    }
+
+    function haltForMalformedSave(queue, item) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted || internals.activeItem !== item) return;
+
+        const activeError = createMalformedSaveError(item);
+        internals.halted = true;
+        internals.terminalCause = activeError;
+        internals.activeItem = null;
+        internals.laneRevision += 1;
+        const unsettledItems = internals.items.splice(0);
+        for (const pendingItem of unsettledItems) {
+            if (pendingItem === item) {
+                pendingItem.promiseCapability.reject(activeError);
+                continue;
+            }
+            pendingItem.promiseCapability.reject(createAbortError(pendingItem, {
+                causedByClientItemId: item.clientSaveId,
+                causeKind: 'storage-item',
+                callbackFaultId: null,
+                completedItemKind: null,
+                completedClientItemId: null,
+                completedOutcome: null
+            }));
+        }
+        replaceQueueState(queue, {
+            lanePhase: 'halted',
+            primaryStatus: 'durability-unknown',
+            activeClientSaveId: null,
+            activeClientSnapshotId: null,
+            pendingCount: 0,
+            accepting: false,
+            halted: true
+        });
+        publishTerminalCallbacks(queue, activeError);
+    }
+
+    function extractAndValidateSaveReceipt(source, item, expectedHash, configuration) {
+        const receipt = extractAllowedFields(source, SAVE_RECEIPT_FIELDS, 'saveReceipt');
+        const recoveryHealth = extractAllowedFields(
+            receipt.recoveryHealth,
+            RECOVERY_HEALTH_FIELDS,
+            'saveReceipt.recoveryHealth'
+        );
+        const validHash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+        const expectedByteCount = inspectDOMString(item.stateJson).bytes.byteLength;
+
+        if (receipt.ok !== true
+            || receipt.clientSaveId !== item.clientSaveId
+            || receipt.payloadHash !== item.payloadHash
+            || receipt.sourceHashBefore !== expectedHash
+            || receipt.durability !== configuration.expectedDurability
+            || !validHash(receipt.stateHashAfter)
+            || receipt.stateHash !== receipt.stateHashAfter
+            || !Number.isInteger(receipt.byteCount)
+            || receipt.byteCount <= 0
+            || receipt.byteCount !== expectedByteCount
+            || typeof receipt.updatedAt !== 'string'
+            || receipt.updatedAt.length === 0
+            || typeof receipt.storagePath !== 'string'
+            || receipt.storagePath.length === 0) {
+            throw new TypeError('Save receipt is invalid');
+        }
+
+        let canonicalHealth;
+        if (configuration.expectedDurability === 'native-durable') {
+            canonicalHealth = copyRecoveryHealth(recoveryHealth, 'ordinary');
+            if (canonicalHealth.status === 'not-applicable') {
+                throw new TypeError('Native save receipt recovery health is invalid');
+            }
+        } else {
+            canonicalHealth = copyRecoveryHealth(recoveryHealth, 'none');
+            if (canonicalHealth.status !== 'not-applicable'
+                || canonicalHealth.auditComplete !== true
+                || canonicalHealth.code !== null
+                || canonicalHealth.maintenancePendingCount !== 0
+                || canonicalHealth.detail !== null) {
+                throw new TypeError('Browser save receipt recovery health is invalid');
+            }
+        }
+
+        return canonicalDeepFrozenCopy({
+            ok: true,
+            clientSaveId: receipt.clientSaveId,
+            payloadHash: receipt.payloadHash,
+            sourceHashBefore: receipt.sourceHashBefore,
+            stateHashAfter: receipt.stateHashAfter,
+            stateHash: receipt.stateHash,
+            byteCount: receipt.byteCount,
+            durability: receipt.durability,
+            updatedAt: receipt.updatedAt,
+            storagePath: receipt.storagePath,
+            recoveryHealth: canonicalHealth
+        });
+    }
+
+    function dispatchNextSave(queue) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted
+            || internals.fenceDepth !== 0
+            || internals.activeItem !== null
+            || internals.items.length === 0) {
+            return;
+        }
+
+        const item = internals.items[0];
+        internals.activeItem = item;
+        const request = intrinsicObjectFreeze({
+            clientSaveId: item.clientSaveId,
+            stateJson: item.stateJson,
+            payloadHash: item.payloadHash,
+            reason: item.reason,
+            expectedHash: internals.lastAcknowledgedHash,
+            sessionContext: internals.configuration.sessionContext
+        });
+        let adapterResult;
+        try {
+            adapterResult = internals.configuration.write(request);
+        } catch (_error) {
+            haltForMalformedSave(queue, item);
+            return;
+        }
+
+        try {
+            const adoptedResult = intrinsicPromiseResolve(adapterResult);
+            intrinsicPromiseThen(
+                adoptedResult,
+                receipt => {
+                    completeSaveReceipt(queue, item, request.expectedHash, receipt);
+                    return undefined;
+                },
+                () => {
+                    haltForMalformedSave(queue, item);
+                    return undefined;
+                }
+            );
+        } catch (_error) {
+            haltForMalformedSave(queue, item);
+        }
+    }
+
+    function completeSaveReceipt(queue, item, expectedHash, adapterReceipt) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted || internals.activeItem !== item) return;
+
+        let receipt;
+        try {
+            receipt = extractAndValidateSaveReceipt(
+                adapterReceipt,
+                item,
+                expectedHash,
+                internals.configuration
+            );
+        } catch (_error) {
+            haltForMalformedSave(queue, item);
+            return;
+        }
+
+        internals.lastAcknowledgedHash = receipt.stateHashAfter;
+        internals.lastAcknowledgedStateJson = item.stateJson;
+        internals.lastAcknowledgedReceipt = receipt;
+        internals.items.shift();
+        internals.activeItem = null;
+        internals.laneRevision += 1;
+        const healthOverrides = receipt.durability === 'native-durable'
+            ? { ordinaryRecoveryHealth: receipt.recoveryHealth }
+            : {};
+        replaceQueueState(queue, {
+            ...healthOverrides,
+            lanePhase: 'saving',
+            activeClientSaveId: internals.items[0] ? internals.items[0].clientSaveId : null,
+            activeClientSnapshotId: null,
+            pendingCount: internals.items.length,
+            lastAcknowledgedHash: receipt.stateHashAfter
+        });
+
+        const promiseReceipt = canonicalDeepFrozenCopy(receipt);
+        const callbackReceipt = canonicalDeepFrozenCopy(receipt);
+        item.promiseCapability.resolve(promiseReceipt);
+
+        internals.fenceDepth += 1;
+        const acknowledgedResult = invokeTotalCallback(
+            internals.configuration.onAcknowledged,
+            [callbackReceipt],
+            'onAcknowledged'
+        );
+        if (!acknowledgedResult.ok) {
+            internals.fenceDepth -= 1;
+            haltForCallbackFault(queue, createCallbackFault(internals, {
+                causeKind: 'post-operation-callback',
+                callbackName: acknowledgedResult.callbackName,
+                clientItemId: null,
+                completedItemKind: 'save',
+                completedClientItemId: item.clientSaveId,
+                completedOutcome: 'successful-receipt'
+            }));
+            return;
+        }
+        if (internals.halted) {
+            internals.fenceDepth -= 1;
+            return;
+        }
+
+        const nextItem = internals.items[0] || null;
+        replaceQueueState(queue, {
+            lanePhase: nextItem ? 'saving' : 'idle',
+            primaryStatus: nextItem ? queue.queueState.primaryStatus : receipt.durability,
+            activeClientSaveId: nextItem ? nextItem.clientSaveId : null,
+            activeClientSnapshotId: null,
+            pendingCount: internals.items.length
+        });
+        const transitionResult = invokeTotalCallback(
+            internals.configuration.onTransition,
+            [queue.getState()],
+            'onTransition'
+        );
+        if (!transitionResult.ok) {
+            internals.fenceDepth -= 1;
+            haltForCallbackFault(queue, createCallbackFault(internals, {
+                causeKind: 'post-operation-callback',
+                callbackName: transitionResult.callbackName,
+                clientItemId: null,
+                completedItemKind: 'save',
+                completedClientItemId: item.clientSaveId,
+                completedOutcome: 'successful-receipt'
+            }));
+            return;
+        }
+
+        internals.fenceDepth -= 1;
+        if (!internals.halted) dispatchNextSave(queue);
+    }
+
     class AssetTrackerSaveQueue {
         constructor(options) {
             const configuration = validateAndFreezeQueueOptions(options);
             this.queueConfiguration = configuration;
             this.queueState = createInitialQueueState(configuration);
+            saveQueueInternals.set(this, {
+                configuration,
+                items: [],
+                activeItem: null,
+                lastAcknowledgedHash: configuration.initialAcknowledged.stateHash,
+                lastAcknowledgedStateJson: configuration.initialAcknowledged.stateJson,
+                lastAcknowledgedReceipt: null,
+                nextSaveOrdinal: 0,
+                nextAcceptedRevision: 0,
+                nextCallbackFaultOrdinal: 0,
+                laneRevision: 0,
+                fenceDepth: 0,
+                halted: false,
+                terminalCause: null
+            });
+        }
+
+        enqueue(descriptor) {
+            const promiseCapability = createPromiseCapability();
+            const internals = saveQueueInternals.get(this);
+            if (internals.halted) {
+                promiseCapability.reject(createHaltedError(internals.terminalCause));
+                return promiseCapability.promise;
+            }
+
+            let values;
+            try {
+                values = extractAllowedFields(descriptor, SAVE_DESCRIPTOR_FIELDS, 'saveDescriptor');
+                if (typeof values.stateJson !== 'string' || values.stateJson.length === 0) {
+                    throw new TypeError('Save descriptor stateJson must be a non-empty string');
+                }
+                if (typeof values.reason !== 'string' || values.reason.length === 0) {
+                    throw new TypeError('Save descriptor reason must be a non-empty string');
+                }
+            } catch (error) {
+                promiseCapability.reject(error);
+                return promiseCapability.promise;
+            }
+
+            const evidence = inspectDOMString(values.stateJson);
+            if (evidence.encoding !== 'utf-8') {
+                promiseCapability.reject(new TypeError('Save descriptor stateJson must be well-formed UTF-8'));
+                return promiseCapability.promise;
+            }
+
+            internals.nextSaveOrdinal += 1;
+            internals.nextAcceptedRevision += 1;
+            internals.laneRevision += 1;
+            const item = intrinsicObjectFreeze({
+                kind: 'save',
+                clientSaveId: `${internals.configuration.sessionContext.loadId}:save:${internals.nextSaveOrdinal}`,
+                stateJson: values.stateJson,
+                payloadHash: evidence.rawHash,
+                reason: values.reason,
+                promiseCapability,
+                acceptedRevision: internals.nextAcceptedRevision
+            });
+            internals.items.push(item);
+            selectSavingState(this);
+
+            internals.fenceDepth += 1;
+            const transitionResult = invokeTotalCallback(
+                internals.configuration.onTransition,
+                [this.getState()],
+                'onTransition'
+            );
+            internals.fenceDepth -= 1;
+            if (!transitionResult.ok) {
+                haltForCallbackFault(this, createCallbackFault(internals, {
+                    causeKind: 'pre-dispatch-callback',
+                    callbackName: transitionResult.callbackName,
+                    clientItemId: item.clientSaveId,
+                    completedItemKind: null,
+                    completedClientItemId: null,
+                    completedOutcome: null
+                }), item);
+                return promiseCapability.promise;
+            }
+
+            dispatchNextSave(this);
+            return promiseCapability.promise;
         }
 
         getState() {
@@ -446,7 +953,7 @@
         const text = String(value);
         const losslessUTF16 = hasUnpairedSurrogate(text);
         const bytes = losslessUTF16 ? encodeUTF16LECodeUnits(text) : encodeUTF8(text);
-        return Object.freeze({
+        return intrinsicObjectFreeze({
             text,
             bytes,
             rawHash: sha256Hex(bytes),
