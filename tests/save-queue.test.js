@@ -96,6 +96,130 @@ function browserReceipt(item, sourceHashBefore, stateHashAfter, overrides = {}) 
     });
 }
 
+function structuredSaveError(item, overrides = {}) {
+    const error = new LegacySafety.AssetTrackerSaveError('disk full');
+    Object.assign(error, {
+        code: 'write-failed',
+        writeOutcome: 'not-committed',
+        conflict: false,
+        clientSaveId: item.clientSaveId,
+        payloadHash: item.payloadHash,
+        sourceHashAfter: item.expectedHash,
+        sourceReverified: true,
+        coordinatorReleased: true,
+        healthPersisted: false,
+        recoveryHealthEvidence: null,
+        ...overrides
+    });
+    return error;
+}
+
+function oneReadTypedSaveError(item, overrides = {}) {
+    const values = {
+        code: 'write-failed',
+        message: 'disk full',
+        writeOutcome: 'not-committed',
+        conflict: false,
+        clientSaveId: item.clientSaveId,
+        payloadHash: item.payloadHash,
+        sourceHashAfter: item.expectedHash,
+        sourceReverified: true,
+        coordinatorReleased: true,
+        healthPersisted: false,
+        recoveryHealthEvidence: null,
+        ...overrides
+    };
+    const reads = Object.create(null);
+    const target = new LegacySafety.AssetTrackerSaveError(values.message);
+    const source = new Proxy(target, {
+        get(object, key, receiver) {
+            if (Object.prototype.hasOwnProperty.call(values, key)) {
+                reads[key] = (reads[key] || 0) + 1;
+                if (reads[key] !== 1) throw new Error(`saveError.${key} was read more than once`);
+                return values[key];
+            }
+            return Reflect.get(object, key, receiver);
+        },
+        ownKeys() {
+            throw new Error('saveError source was enumerated');
+        },
+        getOwnPropertyDescriptor() {
+            throw new Error('saveError source descriptor was inspected');
+        }
+    });
+    return {
+        source,
+        values,
+        assertEachReadOnce() {
+            for (const key of Object.keys(values)) {
+                assert.equal(reads[key], 1, `saveError.${key} read count`);
+            }
+        }
+    };
+}
+
+function terminalReceipt(request, overrides = {}) {
+    return Object.freeze({
+        ok: true,
+        protocolVersion: 2,
+        loadId: request.sessionContext.loadId,
+        reason: request.reason,
+        gateState: 'terminal-locked',
+        ...overrides
+    });
+}
+
+function manualClock() {
+    let nextHandle = 0;
+    const scheduled = new Map();
+    return {
+        clock: {
+            setTimeout(callback, delay) {
+                nextHandle += 1;
+                scheduled.set(nextHandle, { callback, delay });
+                return nextHandle;
+            },
+            clearTimeout(handle) {
+                scheduled.delete(handle);
+            }
+        },
+        count(delay) {
+            return Array.from(scheduled.values()).filter(entry => entry.delay === delay).length;
+        },
+        runDelay(delay) {
+            const due = Array.from(scheduled.entries()).filter(([, entry]) => entry.delay === delay);
+            for (const [handle, entry] of due) {
+                scheduled.delete(handle);
+                entry.callback();
+            }
+        }
+    };
+}
+
+function reentrantClearClock() {
+    let durabilityCallback = null;
+    let durabilityClearCount = 0;
+    return {
+        clock: {
+            setTimeout(callback, delay) {
+                if (delay === 29_000) {
+                    durabilityCallback = callback;
+                    return 'durability-handle';
+                }
+                return 'terminal-handle';
+            },
+            clearTimeout(handle) {
+                if (handle !== 'durability-handle' || durabilityCallback === null) return;
+                durabilityClearCount += 1;
+                const callback = durabilityCallback;
+                durabilityCallback = null;
+                callback();
+            }
+        },
+        durabilityClearCount: () => durabilityClearCount
+    };
+}
+
 function oneReadRecord(label, values) {
     const keys = Object.keys(values);
     const reads = Object.create(null);
@@ -1235,4 +1359,1793 @@ test('first caller reaction observes the completed callback fence and terminal s
     assert.equal(observed.state.lastAcknowledgedHash, H1);
     assert.equal(observed.state.halted, true);
     assert.deepEqual(events, ['onAcknowledged', 'onFault', 'first caller']);
+});
+
+test('not-committed rollback rejects active, aborts pending, halts future, and terminalizes once', async () => {
+    const activeResult = deferred();
+    const terminalResult = deferred();
+    const writeCalls = [];
+    const terminalCalls = [];
+    const faults = [];
+    let queue;
+    queue = makeQueue({
+        write: request => {
+            writeCalls.push(request);
+            return activeResult.promise;
+        },
+        terminalize: request => {
+            assert.equal(queue.getState().halted, true, 'Web state is terminal before native call');
+            terminalCalls.push(request);
+            return terminalResult.promise;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"attempted-H1"}', reason: 'H1' });
+    const secondPromise = queue.enqueue({ stateJson: '{"memo":"pending-H2"}', reason: 'H2' });
+    const firstObserved = firstPromise.then(
+        () => assert.fail('active H1 must reject'),
+        error => error
+    );
+    const secondObserved = secondPromise.then(
+        () => assert.fail('pending H2 must reject'),
+        error => error
+    );
+
+    activeResult.reject(structuredSaveError(writeCalls[0]));
+    const activeError = await firstObserved;
+    const pendingError = await secondObserved;
+
+    assert.equal(activeError instanceof LegacySafety.AssetTrackerSaveError, true);
+    assert.equal(activeError.queueOutcome, 'not-committed');
+    assert.equal(activeError.terminalReason, 'save-not-committed');
+    assert.equal(activeError.lastAcknowledgedStateJson, '{"memo":"H0"}');
+    assert.equal(activeError.lastAcknowledgedHash, H0);
+    assert.equal(activeError.attemptedStateJson, '{"memo":"attempted-H1"}');
+    assert.equal(activeError.activeClientItemId, writeCalls[0].clientSaveId);
+    assert.equal(activeError.callbackFaultId, null);
+    assert.equal(Object.isFrozen(activeError), true);
+    assert.strictEqual(faults[0], activeError);
+    assert.equal(faults.length, 1);
+
+    assert.equal(pendingError instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+    assert.equal(pendingError.queueOutcome, 'not-dispatched');
+    assert.equal(pendingError.itemKind, 'save');
+    assert.equal(pendingError.clientItemId, writeCalls[0].clientSaveId.replace(':save:1', ':save:2'));
+    assert.equal(pendingError.causedByClientItemId, writeCalls[0].clientSaveId);
+    assert.equal(pendingError.causeKind, 'storage-item');
+    assert.equal(pendingError.callbackFaultId, null);
+
+    const state = queue.getState();
+    assert.equal(state.primaryStatus, 'failed-readonly');
+    assert.equal(state.lastAcknowledgedHash, H0);
+    assert.equal(state.accepting, false);
+    assert.equal(state.halted, true);
+    assert.equal(terminalCalls.length, 1);
+    assert.deepEqual(terminalCalls[0], {
+        reason: 'save-not-committed',
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'load-1',
+            writeSessionToken: 'token-1'
+        }
+    });
+    assert.equal(Object.isFrozen(terminalCalls[0]), true);
+    assert.equal(Object.isFrozen(terminalCalls[0].sessionContext), true);
+    assert.equal(writeCalls.length, 1, 'pending H2 never dispatches');
+
+    const futureError = await queue.enqueue({ stateJson: '{"memo":"future"}', reason: 'future' }).then(
+        () => assert.fail('future save must reject'),
+        error => error
+    );
+    assert.equal(futureError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+    assert.strictEqual(futureError.terminalCause, activeError);
+    assert.throws(() => { activeError.lastAcknowledgedHash = H2; }, TypeError);
+
+    terminalResult.resolve(terminalReceipt(terminalCalls[0]));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(queue.getState().halted, true);
+    assert.equal(faults.length, 1);
+    assert.equal(terminalCalls.length, 1);
+});
+
+test('not-committed rollback after H1 ACK restores H1 and accepts strict persisted health evidence', async () => {
+    const first = deferred();
+    const second = deferred();
+    const writeCalls = [];
+    const faults = [];
+    const queue = makeQueue({
+        write: request => {
+            writeCalls.push(request);
+            return writeCalls.length === 1 ? first.promise : second.promise;
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request)),
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"durable-H1"}', reason: 'H1' });
+    const secondPromise = queue.enqueue({ stateJson: '{"memo":"attempted-H2"}', reason: 'H2' });
+    const secondObserved = secondPromise.then(
+        () => assert.fail('H2 must reject'),
+        error => error
+    );
+
+    first.resolve(nativeReceipt(writeCalls[0], H0, H1));
+    await firstPromise;
+    const degraded = health('ordinary', 'degraded', {
+        auditComplete: false,
+        code: 'audit-incomplete',
+        maintenancePendingCount: 0,
+        detail: 'audit could not complete'
+    });
+    second.reject(structuredSaveError(writeCalls[1], {
+        healthPersisted: true,
+        recoveryHealthEvidence: degraded
+    }));
+    const error = await secondObserved;
+
+    assert.equal(error.queueOutcome, 'not-committed');
+    assert.equal(error.lastAcknowledgedStateJson, '{"memo":"durable-H1"}');
+    assert.equal(error.lastAcknowledgedHash, H1);
+    assert.equal(error.attemptedStateJson, '{"memo":"attempted-H2"}');
+    assert.deepEqual(queue.getState().ordinaryRecoveryHealth, degraded);
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    assert.strictEqual(faults[0], error);
+});
+
+test('structured save error and nested health use one-read Proxy extraction and produce a detached frozen fault', async () => {
+    const result = deferred();
+    const writeCalls = [];
+    const faults = [];
+    const queue = makeQueue({
+        write: request => {
+            writeCalls.push(request);
+            return result.promise;
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request)),
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const savePromise = queue.enqueue({ stateJson: '{"memo":"one-read-error"}', reason: 'one-read' });
+    const healthValues = {
+        domain: 'ordinary',
+        status: 'degraded',
+        auditComplete: false,
+        code: 'audit-incomplete',
+        maintenancePendingCount: 0,
+        detail: 'audit incomplete'
+    };
+    const healthSource = oneReadRecord('saveError.recoveryHealthEvidence', healthValues);
+    const errorSource = oneReadTypedSaveError(writeCalls[0], {
+        healthPersisted: true,
+        recoveryHealthEvidence: healthSource.record
+    });
+
+    result.reject(errorSource.source);
+    const error = await savePromise.then(
+        () => assert.fail('known failure must reject'),
+        reason => reason
+    );
+
+    errorSource.assertEachReadOnce();
+    healthSource.assertEachReadOnce();
+    assert.notStrictEqual(error, errorSource.source);
+    assert.strictEqual(faults[0], error);
+    assert.equal(Object.isFrozen(error), true);
+    assert.equal(Object.isFrozen(error.recoveryHealthEvidence), true);
+    assert.deepEqual(error.recoveryHealthEvidence, healthValues);
+
+    errorSource.values.code = 'mutated-after-completion';
+    healthValues.code = 'mutated-after-completion';
+    assert.equal(error.code, 'write-failed');
+    assert.equal(error.recoveryHealthEvidence.code, 'audit-incomplete');
+    assert.equal(queue.getState().ordinaryRecoveryHealth.code, 'audit-incomplete');
+});
+
+test('throwing structured-error Proxy trap is malformed unknown and cannot escape the queue', async () => {
+    const result = deferred();
+    const writeCalls = [];
+    const queue = makeQueue({
+        write: request => {
+            writeCalls.push(request);
+            return result.promise;
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request))
+    });
+    const savePromise = queue.enqueue({ stateJson: '{"memo":"proxy-trap"}', reason: 'proxy' });
+    const typed = structuredSaveError(writeCalls[0]);
+    const hostile = new Proxy(typed, {
+        get(target, key, receiver) {
+            if (key === 'payloadHash') throw new Error('payloadHash trap');
+            return Reflect.get(target, key, receiver);
+        }
+    });
+
+    result.reject(hostile);
+    const error = await savePromise.then(
+        () => assert.fail('malformed error must reject'),
+        reason => reason
+    );
+
+    assert.equal(error instanceof LegacySafety.AssetTrackerSaveError, true);
+    assert.equal(error.queueOutcome, 'durability-unknown');
+    assert.equal(error.terminalReason, 'save-outcome-unknown');
+    assert.equal(queue.getState().primaryStatus, 'durability-unknown');
+});
+
+test('not-committed null baseline remains a proven missing-source rollback', async () => {
+    const result = deferred();
+    const writeCalls = [];
+    const queue = makeQueue({
+        initialAcknowledged: { stateJson: '{"memo":"default"}', stateHash: null },
+        write: request => {
+            writeCalls.push(request);
+            return result.promise;
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request))
+    });
+    const savePromise = queue.enqueue({ stateJson: '{"memo":"first-save"}', reason: 'first' });
+    const observed = savePromise.then(
+        () => assert.fail('first save must reject'),
+        error => error
+    );
+
+    assert.equal(writeCalls[0].expectedHash, null);
+    result.reject(structuredSaveError(writeCalls[0], { sourceHashAfter: null }));
+    const error = await observed;
+
+    assert.equal(error.queueOutcome, 'not-committed');
+    assert.equal(error.lastAcknowledgedHash, null);
+    assert.equal(error.lastAcknowledgedStateJson, '{"memo":"default"}');
+    assert.equal(queue.getState().lastAcknowledgedHash, null);
+});
+
+test('unknown proof and strict persisted-health tuple inversions preserve the active attempted snapshot', async t => {
+    const variants = [
+        ['plain transport error', item => new Error(`transport lost for ${item.clientSaveId}`), 'reject'],
+        ['wrong source', item => structuredSaveError(item, { sourceHashAfter: H2 }), 'reject'],
+        ['wrong null source', item => structuredSaveError(item, { sourceHashAfter: null }), 'reject'],
+        ['wrong client ID', item => structuredSaveError(item, { clientSaveId: 'wrong-id' }), 'reject'],
+        ['wrong payload hash', item => structuredSaveError(item, { payloadHash: H2 }), 'reject'],
+        ['false with non-null health', item => structuredSaveError(item, {
+            healthPersisted: false,
+            recoveryHealthEvidence: health('ordinary', 'degraded')
+        }), 'reject'],
+        ['true with null health', item => structuredSaveError(item, {
+            healthPersisted: true,
+            recoveryHealthEvidence: null
+        }), 'reject'],
+        ['wrong health domain', item => structuredSaveError(item, {
+            healthPersisted: true,
+            recoveryHealthEvidence: health('snapshot', 'degraded')
+        }), 'reject'],
+        ['incomplete health evidence', item => structuredSaveError(item, {
+            healthPersisted: true,
+            recoveryHealthEvidence: {
+                domain: 'ordinary',
+                status: 'degraded',
+                auditComplete: false,
+                code: 'audit-incomplete',
+                maintenancePendingCount: 0
+            }
+        }), 'reject'],
+        ['resolved failure union', () => ({ ok: false, error: { code: 'write-failed' } }), 'resolve']
+    ];
+
+    for (const [label, makeOutcome, settlement] of variants) {
+        await t.test(label, async () => {
+            const result = deferred();
+            const terminalCalls = [];
+            const writeCalls = [];
+            const faults = [];
+            const queue = makeQueue({
+                write: request => {
+                    writeCalls.push(request);
+                    return result.promise;
+                },
+                terminalize: request => {
+                    terminalCalls.push(request);
+                    return Promise.reject(new Error('terminal ACK lost'));
+                },
+                onFault: fault => {
+                    faults.push(fault);
+                    return undefined;
+                }
+            });
+            const savePromise = queue.enqueue({
+                stateJson: `{"memo":"attempted-${label}"}`,
+                reason: label
+            });
+            const observed = savePromise.then(
+                () => assert.fail('unknown save must reject'),
+                error => error
+            );
+            const outcome = makeOutcome(writeCalls[0]);
+
+            result[settlement](outcome);
+            const error = await observed;
+            await new Promise(resolve => setImmediate(resolve));
+
+            assert.equal(error instanceof LegacySafety.AssetTrackerSaveError, true);
+            assert.equal(error.queueOutcome, 'durability-unknown');
+            assert.equal(error.terminalReason, 'save-outcome-unknown');
+            assert.equal(error.lastAcknowledgedStateJson, '{"memo":"H0"}');
+            assert.equal(error.lastAcknowledgedHash, H0);
+            assert.equal(error.attemptedStateJson, `{"memo":"attempted-${label}"}`);
+            assert.equal(error.activeClientItemId, writeCalls[0].clientSaveId);
+            assert.equal(error.callbackFaultId, null);
+            assert.strictEqual(faults[0], error);
+            assert.equal(faults.length, 1);
+            assert.equal(queue.getState().primaryStatus, 'durability-unknown');
+            assert.equal(queue.getState().lastAcknowledgedHash, H0);
+            assert.deepEqual(queue.getState().ordinaryRecoveryHealth, health('ordinary'));
+            assert.deepEqual(terminalCalls.map(call => call.reason), ['save-outcome-unknown']);
+            assert.equal(queue.getState().halted, true, 'terminal rejection cannot revive queue');
+        });
+    }
+});
+
+test('conflict rejects without a disk-equality rollback claim and terminalizes save-conflict', async () => {
+    const result = deferred();
+    const writeCalls = [];
+    const faults = [];
+    const terminalCalls = [];
+    const queue = makeQueue({
+        write: request => {
+            writeCalls.push(request);
+            return result.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const savePromise = queue.enqueue({ stateJson: '{"memo":"conflicted-H1"}', reason: 'conflict' });
+    const observed = savePromise.then(
+        () => assert.fail('conflicted save must reject'),
+        error => error
+    );
+
+    result.reject(structuredSaveError(writeCalls[0], {
+        conflict: 'source-changed',
+        sourceHashAfter: H2
+    }));
+    const error = await observed;
+
+    assert.equal(error.queueOutcome, 'conflict');
+    assert.equal(error.terminalReason, 'save-conflict');
+    assert.equal(error.lastAcknowledgedStateJson, '{"memo":"H0"}');
+    assert.equal(error.attemptedStateJson, '{"memo":"conflicted-H1"}');
+    assert.equal(queue.getState().primaryStatus, 'failed-readonly');
+    assert.equal(queue.getState().lastAcknowledgedHash, H0);
+    assert.strictEqual(faults[0], error);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['save-conflict']);
+});
+
+test('unknown timeout preserves attempted H1, aborts H2, terminalizes, and ignores a late ACK', async () => {
+    const clock = manualClock();
+    const activeResult = deferred();
+    const terminalResult = deferred();
+    const writeCalls = [];
+    const terminalCalls = [];
+    const faults = [];
+    const queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return activeResult.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return terminalResult.promise;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"timeout-H1"}', reason: 'timeout-H1' });
+    const secondPromise = queue.enqueue({ stateJson: '{"memo":"pending-H2"}', reason: 'pending-H2' });
+    const firstObserved = firstPromise.then(
+        () => assert.fail('timed out H1 must reject'),
+        error => error
+    );
+    const secondObserved = secondPromise.then(
+        () => assert.fail('pending H2 must reject'),
+        error => error
+    );
+
+    assert.equal(clock.count(29_000), 1, 'one queue-owned durability deadline');
+    clock.runDelay(29_000);
+    const activeError = await firstObserved;
+    const pendingError = await secondObserved;
+
+    assert.equal(activeError.queueOutcome, 'durability-unknown');
+    assert.equal(activeError.terminalReason, 'save-outcome-unknown');
+    assert.equal(activeError.attemptedStateJson, '{"memo":"timeout-H1"}');
+    assert.equal(pendingError instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+    assert.equal(pendingError.causedByClientItemId, writeCalls[0].clientSaveId);
+    assert.equal(queue.getState().primaryStatus, 'durability-unknown');
+    assert.equal(queue.getState().lastAcknowledgedHash, H0);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['save-outcome-unknown']);
+    assert.equal(writeCalls.length, 1);
+
+    activeResult.resolve(nativeReceipt(writeCalls[0], H0, H1));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(queue.getState().lastAcknowledgedHash, H0, 'late receipt cannot advance ledger');
+    assert.strictEqual(faults[0], activeError);
+    assert.equal(faults.length, 1);
+    assert.equal(terminalCalls.length, 1);
+    assert.equal(writeCalls.length, 1, 'late receipt cannot dispatch H2');
+
+    assert.equal(clock.count(30_000), 1, 'terminalization has one bounded observation deadline');
+    clock.runDelay(30_000);
+    terminalResult.resolve(terminalReceipt(terminalCalls[0]));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(queue.getState().halted, true);
+    assert.equal(queue.getState().lastAcknowledgedHash, H0);
+});
+
+test('valid ACK cannot outrun a durability fault reentered by clearTimeout cleanup', async () => {
+    const clock = reentrantClearClock();
+    const result = deferred();
+    const writeCalls = [];
+    const acknowledged = [];
+    const faults = [];
+    const terminalCalls = [];
+    const queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return result.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onAcknowledged: receipt => {
+            acknowledged.push(receipt);
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const savePromise = queue.enqueue({ stateJson: '{"memo":"ACK-race"}', reason: 'H1' });
+    const observed = savePromise.then(
+        () => assert.fail('reentrant durability fault must win before ACK commit'),
+        error => error
+    );
+
+    result.resolve(nativeReceipt(writeCalls[0], H0, H1));
+    const error = await observed;
+    const futureError = await queue.enqueue({ stateJson: '{"memo":"future"}', reason: 'future' }).then(
+        () => assert.fail('future save must halt'),
+        reason => reason
+    );
+
+    assert.equal(clock.durabilityClearCount(), 1);
+    assert.equal(error instanceof LegacySafety.AssetTrackerSaveError, true);
+    assert.equal(error.queueOutcome, 'durability-unknown');
+    assert.equal(error.terminalReason, 'save-outcome-unknown');
+    assert.equal(acknowledged.length, 0);
+    assert.equal(faults.length, 1);
+    assert.strictEqual(faults[0], error);
+    assert.strictEqual(futureError.terminalCause, error);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['save-outcome-unknown']);
+    assert.deepEqual(queue.getState(), {
+        generationToken: 'generation-1',
+        lanePhase: 'halted',
+        primaryStatus: 'durability-unknown',
+        barrierState: 'none',
+        activeClientSaveId: null,
+        activeClientSnapshotId: null,
+        pendingCount: 0,
+        lastAcknowledgedHash: H0,
+        ordinaryRecoveryHealth: health('ordinary'),
+        snapshotRecoveryHealth: health('snapshot'),
+        accepting: false,
+        halted: true
+    });
+});
+
+test('structured rejection cannot replace a durability fault reentered by clearTimeout cleanup', async () => {
+    const clock = reentrantClearClock();
+    const result = deferred();
+    const writeCalls = [];
+    const acknowledged = [];
+    const faults = [];
+    const terminalCalls = [];
+    const queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return result.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onAcknowledged: receipt => {
+            acknowledged.push(receipt);
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const savePromise = queue.enqueue({ stateJson: '{"memo":"reject-race"}', reason: 'H1' });
+    const observed = savePromise.then(
+        () => assert.fail('save must reject'),
+        error => error
+    );
+
+    result.reject(structuredSaveError(writeCalls[0]));
+    const error = await observed;
+    const futureError = await queue.enqueue({ stateJson: '{"memo":"future"}', reason: 'future' }).then(
+        () => assert.fail('future save must halt'),
+        reason => reason
+    );
+
+    assert.equal(clock.durabilityClearCount(), 1);
+    assert.equal(error instanceof LegacySafety.AssetTrackerSaveError, true);
+    assert.equal(error.queueOutcome, 'durability-unknown');
+    assert.equal(error.terminalReason, 'save-outcome-unknown');
+    assert.equal(acknowledged.length, 0);
+    assert.equal(faults.length, 1);
+    assert.strictEqual(faults[0], error);
+    assert.strictEqual(futureError.terminalCause, error);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['save-outcome-unknown']);
+    assert.equal(queue.getState().lanePhase, 'halted');
+    assert.equal(queue.getState().primaryStatus, 'durability-unknown');
+    assert.equal(queue.getState().lastAcknowledgedHash, H0);
+    assert.equal(queue.getState().accepting, false);
+    assert.equal(queue.getState().halted, true);
+});
+
+test('synchronous durability deadline callback halts before adapter I/O and cannot leave a late write', async t => {
+    for (const throwsAfterCallback of [false, true]) {
+        await t.test(throwsAfterCallback ? 'callback then registration throws' : 'callback then returns handle', async () => {
+            const writeCalls = [];
+            const terminalCalls = [];
+            const cleared = [];
+            let nextHandle = 0;
+            const clock = {
+                setTimeout(callback, delay) {
+                    nextHandle += 1;
+                    const handle = nextHandle;
+                    if (delay === 29_000) {
+                        callback();
+                        if (throwsAfterCallback) throw new Error('registration failed after firing');
+                    }
+                    return handle;
+                },
+                clearTimeout(handle) {
+                    cleared.push(handle);
+                }
+            };
+            const queue = makeQueue({
+                clock,
+                write: request => {
+                    writeCalls.push(request);
+                    return Promise.resolve(nativeReceipt(request, H0, H1));
+                },
+                terminalize: request => {
+                    terminalCalls.push(request);
+                    return Promise.resolve(terminalReceipt(request));
+                }
+            });
+
+            const error = await queue.enqueue({
+                stateJson: `{"memo":"sync-timeout-${throwsAfterCallback}"}`,
+                reason: 'timeout'
+            }).then(
+                () => assert.fail('synchronous deadline must reject'),
+                reason => reason
+            );
+
+            assert.equal(error instanceof LegacySafety.AssetTrackerSaveError, true);
+            assert.equal(error.queueOutcome, 'durability-unknown');
+            assert.equal(writeCalls.length, 0, 'terminal timeout cannot fall through to adapter I/O');
+            assert.deepEqual(terminalCalls.map(call => call.reason), ['save-outcome-unknown']);
+            assert.equal(cleared.includes(1), !throwsAfterCallback);
+            assert.equal(queue.getState().halted, true);
+            assert.equal(queue.getState().lastAcknowledgedHash, H0);
+        });
+    }
+});
+
+test('timer handle zero is cleared for save ACK and synchronous terminal timeout cannot revive its handle', async t => {
+    await t.test('save ACK clears handle zero', async () => {
+        const result = deferred();
+        const writeCalls = [];
+        const cleared = [];
+        const queue = makeQueue({
+            clock: {
+                setTimeout: () => 0,
+                clearTimeout: handle => cleared.push(handle)
+            },
+            write: request => {
+                writeCalls.push(request);
+                return result.promise;
+            }
+        });
+        const savePromise = queue.enqueue({ stateJson: '{"memo":"handle-zero"}', reason: 'H1' });
+
+        result.resolve(nativeReceipt(writeCalls[0], H0, H1));
+        await savePromise;
+
+        assert.deepEqual(cleared, [0]);
+        assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    });
+
+    await t.test('synchronous terminal timeout clears returned handle zero and consumes late rejection', async () => {
+        const result = deferred();
+        const terminalResult = deferred();
+        const writeCalls = [];
+        const terminalCalls = [];
+        const cleared = [];
+        const queue = makeQueue({
+            clock: {
+                setTimeout(callback, delay) {
+                    if (delay === 30_000) {
+                        callback();
+                        return 0;
+                    }
+                    return 1;
+                },
+                clearTimeout: handle => cleared.push(handle)
+            },
+            write: request => {
+                writeCalls.push(request);
+                return result.promise;
+            },
+            terminalize: request => {
+                terminalCalls.push(request);
+                return terminalResult.promise;
+            }
+        });
+        const savePromise = queue.enqueue({ stateJson: '{"memo":"terminal-sync"}', reason: 'H1' });
+        const observed = savePromise.then(
+            () => assert.fail('save must reject'),
+            error => error
+        );
+
+        result.reject(structuredSaveError(writeCalls[0]));
+        const error = await observed;
+        terminalResult.reject(new Error('late terminal transport loss'));
+        await new Promise(resolve => setImmediate(resolve));
+
+        assert.equal(error.terminalReason, 'save-not-committed');
+        assert.deepEqual(terminalCalls.map(call => call.reason), ['save-not-committed']);
+        assert.deepEqual(cleared, [1, 0]);
+        assert.equal(queue.getState().halted, true);
+        assert.equal(queue.getState().lastAcknowledgedHash, H0);
+    });
+});
+
+test('terminal receipt uses exact one-read extraction while malformed and lost ACKs leave Web terminal', async t => {
+    for (const settlement of ['malformed', 'lost']) {
+        await t.test(settlement, async () => {
+            const result = deferred();
+            const terminalResult = deferred();
+            const writeCalls = [];
+            const terminalCalls = [];
+            const queue = makeQueue({
+                write: request => {
+                    writeCalls.push(request);
+                    return result.promise;
+                },
+                terminalize: request => {
+                    terminalCalls.push(request);
+                    return terminalResult.promise;
+                }
+            });
+            const savePromise = queue.enqueue({
+                stateJson: `{"memo":"terminal-${settlement}"}`,
+                reason: settlement
+            });
+            const observed = savePromise.then(
+                () => assert.fail('save must reject'),
+                error => error
+            );
+
+            result.reject(structuredSaveError(writeCalls[0]));
+            const error = await observed;
+            if (settlement === 'lost') {
+                terminalResult.reject(new Error('terminal ACK lost'));
+            } else {
+                const receiptSource = oneReadRecord('terminalReceipt', {
+                    ok: true,
+                    protocolVersion: 2,
+                    loadId: terminalCalls[0].sessionContext.loadId,
+                    reason: 'wrong-reason',
+                    gateState: 'terminal-locked'
+                });
+                terminalResult.resolve(receiptSource.record);
+                await new Promise(resolve => setImmediate(resolve));
+                receiptSource.assertEachReadOnce();
+            }
+            await new Promise(resolve => setImmediate(resolve));
+
+            assert.equal(error.terminalReason, 'save-not-committed');
+            assert.equal(queue.getState().halted, true);
+            assert.equal(queue.getState().lastAcknowledgedHash, H0);
+            assert.equal(terminalCalls.length, 1);
+        });
+    }
+});
+
+test('preparation message getter reentrant enqueue stays future-halted for candidate terminalization', async t => {
+    for (const getterOutcome of ['return', 'throw']) {
+        await t.test(getterOutcome, async () => {
+            const clock = manualClock();
+            const writeCalls = [];
+            const transitions = [];
+            const faults = [];
+            let reentrantPromise = null;
+            let queue;
+            queue = makeQueue({
+                clock: clock.clock,
+                write: request => {
+                    writeCalls.push(request);
+                    return Promise.reject(new Error('reentrant candidate must not write'));
+                },
+                terminalize: request => Promise.resolve(terminalReceipt(request)),
+                onTransition: state => {
+                    transitions.push(state);
+                    return undefined;
+                },
+                onFault: fault => {
+                    faults.push(fault);
+                    return undefined;
+                }
+            });
+            const candidateError = Object.defineProperty({}, 'message', {
+                get() {
+                    reentrantPromise = queue.enqueue({
+                        stateJson: `{"memo":"getter-${getterOutcome}"}`,
+                        reason: 'getter-reentrant'
+                    });
+                    if (getterOutcome === 'throw') throw new Error('hostile message getter');
+                    return 'candidate getter message';
+                }
+            });
+
+            const preparationPromise = queue.failPreparation(candidateError);
+            const reentrantObserved = reentrantPromise.then(
+                () => assert.fail('getter reentrant enqueue must halt'),
+                error => error
+            );
+            const preparationError = await preparationPromise.then(
+                () => assert.fail('preparation must reject'),
+                error => error
+            );
+
+            assert.equal(writeCalls.length, 0, 'getter reentrant enqueue is never accepted or dispatched');
+            const transition = transitions.find(state => state.transitionKind === 'preparation-rejected');
+            assert.equal(transition.visibleStateJson, '{"memo":"H0"}');
+            assert.equal(transition.pendingCount, 1, 'only the no-I/O preparation marker is pending');
+            assert.equal(preparationError.message, getterOutcome === 'throw'
+                ? 'Candidate preparation failed'
+                : 'candidate getter message');
+            const reentrantError = await reentrantObserved;
+            assert.equal(reentrantError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+            assert.equal(faults.length, 1);
+            assert.equal(faults[0].terminalReason, 'candidate-invalid');
+            assert.strictEqual(reentrantError.terminalCause, faults[0]);
+        });
+    }
+});
+
+test('preparation message getter reentrant enqueue binds the replacement callback terminal cause', async () => {
+    const clock = manualClock();
+    const writeCalls = [];
+    const transitions = [];
+    const faults = [];
+    let reentrantPromise = null;
+    let queue;
+    queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return Promise.reject(new Error('reentrant candidate must not write'));
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request)),
+        onTransition: state => {
+            transitions.push(state);
+            if (state.transitionKind === 'preparation-rejected') {
+                throw new Error('preparation transition failed');
+            }
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const candidateError = Object.defineProperty({}, 'message', {
+        get() {
+            reentrantPromise = queue.enqueue({
+                stateJson: '{"memo":"getter-callback"}',
+                reason: 'getter-reentrant'
+            });
+            return 'candidate getter message';
+        }
+    });
+
+    const preparationPromise = queue.failPreparation(candidateError);
+    const reentrantObserved = reentrantPromise.then(
+        () => assert.fail('getter reentrant enqueue must halt'),
+        error => error
+    );
+    const preparationError = await preparationPromise.then(
+        () => assert.fail('callback marker must reject'),
+        error => error
+    );
+
+    assert.equal(writeCalls.length, 0, 'getter reentrant enqueue is never accepted or dispatched');
+    const transition = transitions.find(state => state.transitionKind === 'preparation-rejected');
+    assert.equal(transition.visibleStateJson, '{"memo":"H0"}');
+    assert.equal(transition.pendingCount, 1);
+    const reentrantError = await reentrantObserved;
+    assert.equal(preparationError instanceof LegacySafety.AssetTrackerQueueCallbackError, true);
+    assert.equal(faults.length, 1);
+    assert.strictEqual(faults[0], preparationError);
+    assert.equal(reentrantError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+    assert.strictEqual(reentrantError.terminalCause, preparationError);
+});
+
+test('preparation message getter reentrant enqueue waits for an earlier H1 terminal cause', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const writeCalls = [];
+    const transitions = [];
+    const faults = [];
+    let reentrantPromise = null;
+    let queue;
+    queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return first.promise;
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request)),
+        onTransition: state => {
+            transitions.push(state);
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"accepted-H1"}', reason: 'H1' });
+    const firstObserved = firstPromise.then(
+        () => assert.fail('H1 must reject'),
+        error => error
+    );
+    const candidateError = Object.defineProperty({}, 'message', {
+        get() {
+            reentrantPromise = queue.enqueue({
+                stateJson: '{"memo":"unaccepted-H2"}',
+                reason: 'getter-reentrant'
+            });
+            return 'candidate getter message';
+        }
+    });
+    const preparationObserved = queue.failPreparation(candidateError).then(
+        () => assert.fail('preparation must reject'),
+        error => error
+    );
+    let reentrantSettled = false;
+    const reentrantObserved = reentrantPromise.then(
+        () => assert.fail('getter reentrant enqueue must halt'),
+        error => {
+            reentrantSettled = true;
+            return error;
+        }
+    );
+    await Promise.resolve();
+
+    assert.equal(reentrantSettled, false, 'future capability waits for the FIFO winner');
+    assert.equal(writeCalls.length, 1, 'only previously accepted H1 performs I/O');
+    const transition = transitions.find(state => state.transitionKind === 'preparation-rejected');
+    assert.equal(transition.visibleStateJson, '{"memo":"accepted-H1"}');
+    assert.equal(transition.pendingCount, 2, 'H1 plus preparation marker; getter item was not accepted');
+
+    first.reject(structuredSaveError(writeCalls[0]));
+    const firstError = await firstObserved;
+    await preparationObserved;
+    const reentrantError = await reentrantObserved;
+
+    assert.equal(firstError.terminalReason, 'save-not-committed');
+    assert.equal(reentrantError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+    assert.strictEqual(reentrantError.terminalCause, firstError);
+    assert.strictEqual(faults[0], firstError);
+    assert.equal(faults.length, 1);
+    assert.equal(writeCalls.length, 1);
+});
+
+test('preparation message getter cannot append after an active H1 deadline becomes authoritative', async t => {
+    for (const getterOutcome of ['return', 'throw']) {
+        await t.test(getterOutcome, async () => {
+            const first = deferred();
+            const writeCalls = [];
+            const transitions = [];
+            const faults = [];
+            const terminalCalls = [];
+            let durabilityCallback = null;
+            const queue = makeQueue({
+                clock: {
+                    setTimeout(callback, delay) {
+                        if (delay === 29_000) {
+                            durabilityCallback = callback;
+                            return 'durability-deadline';
+                        }
+                        return 'terminalization-deadline';
+                    },
+                    clearTimeout: () => undefined
+                },
+                write: request => {
+                    writeCalls.push(request);
+                    return first.promise;
+                },
+                terminalize: request => {
+                    terminalCalls.push(request);
+                    return Promise.resolve(terminalReceipt(request));
+                },
+                onTransition: state => {
+                    transitions.push(state);
+                    return undefined;
+                },
+                onFault: fault => {
+                    faults.push(fault);
+                    return undefined;
+                }
+            });
+            const firstPromise = queue.enqueue({
+                stateJson: `{"memo":"active-H1-${getterOutcome}"}`,
+                reason: 'H1'
+            });
+            const firstObserved = firstPromise.then(
+                () => assert.fail('H1 deadline must reject'),
+                error => error
+            );
+            assert.equal(typeof durabilityCallback, 'function');
+            const candidateError = Object.defineProperty({}, 'message', {
+                get() {
+                    durabilityCallback();
+                    if (getterOutcome === 'throw') throw new Error('hostile message getter');
+                    return 'candidate getter message';
+                }
+            });
+
+            const preparationObserved = queue.failPreparation(candidateError).then(
+                () => assert.fail('preparation after terminal H1 must reject'),
+                error => error
+            );
+            const firstError = await firstObserved;
+            const preparationError = await preparationObserved;
+            const terminalTransitionIndex = transitions.findIndex(state =>
+                state.halted === true && state.lanePhase === 'halted'
+            );
+            const state = queue.getState();
+
+            assert.notEqual(terminalTransitionIndex, -1, 'H1 publishes its terminal transition');
+            assert.equal(
+                transitions.some(transition => transition.transitionKind === 'preparation-rejected'),
+                false,
+                'the losing preparation never publishes a transition'
+            );
+            assert.equal(
+                transitions.length,
+                terminalTransitionIndex + 1,
+                'nothing republishes queue state after the terminal transition'
+            );
+            assert.equal(state.halted, true);
+            assert.equal(state.lanePhase, 'halted');
+            assert.equal(state.pendingCount, 0, 'the losing preparation appends no marker');
+            assert.equal(state.primaryStatus, 'durability-unknown');
+            assert.equal(firstError instanceof LegacySafety.AssetTrackerSaveError, true);
+            assert.equal(firstError.terminalReason, 'save-outcome-unknown');
+            assert.equal(preparationError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+            assert.strictEqual(preparationError.terminalCause, firstError);
+            assert.equal(faults.length, 1);
+            assert.strictEqual(faults[0], firstError);
+            assert.deepEqual(terminalCalls.map(call => call.reason), ['save-outcome-unknown']);
+            assert.equal(writeCalls.length, 1);
+
+            first.resolve(nativeReceipt(writeCalls[0], H0, H1));
+            await new Promise(resolve => setImmediate(resolve));
+            assert.equal(queue.getState().lastAcknowledgedHash, H0, 'late H1 ACK stays inert');
+            assert.equal(faults.length, 1);
+            assert.equal(terminalCalls.length, 1);
+        });
+    }
+});
+
+test('preparation marker publishes the accepted H1 tail synchronously and terminalizes only after H1 ACK', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const writeCalls = [];
+    const transitions = [];
+    const faults = [];
+    const terminalCalls = [];
+    let failPreparationReturned = false;
+    const queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return first.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onTransition: state => {
+            transitions.push({ state, beforeReturn: !failPreparationReturned });
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"accepted-H1"}', reason: 'H1' });
+    const preparationPromise = queue.failPreparation(new Error('candidate H2 invalid'));
+    failPreparationReturned = true;
+    const preparationObserved = preparationPromise.then(
+        () => assert.fail('invalid candidate must reject'),
+        error => error
+    );
+    const preparationTransition = transitions.find(entry =>
+        entry.state.transitionKind === 'preparation-rejected'
+    );
+
+    assert.ok(preparationTransition, 'preparation transition is emitted before return');
+    assert.equal(preparationTransition.beforeReturn, true);
+    assert.equal(preparationTransition.state.visibleStateJson, '{"memo":"accepted-H1"}');
+    assert.equal(preparationTransition.state.accepting, false);
+    assert.equal(preparationTransition.state.pendingCount, 2, 'H1 plus no-I/O marker');
+    assert.equal(preparationTransition.state.lanePhase, 'saving');
+    assert.equal(Object.isFrozen(preparationTransition.state), true);
+    assert.equal(writeCalls.length, 1);
+    assert.equal(faults.length, 0, 'marker waits behind H1');
+    assert.equal(terminalCalls.length, 0);
+
+    let futureSettled = false;
+    const futureObserved = queue.enqueue({ stateJson: '{"memo":"future"}', reason: 'future' }).then(
+        () => assert.fail('accepting stopped in preparation turn'),
+        error => {
+            futureSettled = true;
+            return error;
+        }
+    );
+    await Promise.resolve();
+    assert.equal(futureSettled, false, 'future halted cause waits for the FIFO winner');
+
+    first.resolve(nativeReceipt(writeCalls[0], H0, H1));
+    const firstReceipt = await firstPromise;
+    const preparationError = await preparationObserved;
+    const futureError = await futureObserved;
+
+    assert.equal(firstReceipt.stateHashAfter, H1);
+    assert.equal(preparationError instanceof LegacySafety.AssetTrackerSaveError, true);
+    assert.equal(preparationError.terminalReason, 'candidate-invalid');
+    assert.equal(futureError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+    assert.strictEqual(futureError.terminalCause, faults[0]);
+    assert.equal(faults.length, 1);
+    assert.equal(faults[0].terminalReason, 'candidate-invalid');
+    assert.equal(faults[0].queueOutcome, 'preparation-rejected');
+    assert.equal(faults[0].lastAcknowledgedStateJson, '{"memo":"accepted-H1"}');
+    assert.equal(faults[0].lastAcknowledgedHash, H1);
+    assert.equal(faults[0].attemptedStateJson, null);
+    assert.equal(faults[0].activeClientItemId, null);
+    assert.equal(faults[0].callbackFaultId, null);
+    assert.equal(Object.isFrozen(faults[0]), true);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['candidate-invalid']);
+    assert.equal(writeCalls.length, 1, 'marker creates no save ID or adapter call');
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    assert.equal(queue.getState().primaryStatus, 'failed-readonly');
+    assert.equal(
+        transitions.some(entry => entry.state.primaryStatus === 'native-durable'
+            && entry.state.lanePhase === 'idle'),
+        false,
+        'marker suppresses intermediate stable H1 success'
+    );
+});
+
+test('preparation marker restores the most recent accepted H2 tail and performs zero invalid H3 I/O', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const second = deferred();
+    const writeCalls = [];
+    const transitions = [];
+    const faults = [];
+    const queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return writeCalls.length === 1 ? first.promise : second.promise;
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request)),
+        onTransition: state => {
+            transitions.push(state);
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"accepted-H1"}', reason: 'H1' });
+    const secondPromise = queue.enqueue({ stateJson: '{"memo":"accepted-H2"}', reason: 'H2' });
+    const preparationPromise = queue.failPreparation(new Error('rendered H3 invalid'));
+    const preparationObserved = preparationPromise.then(
+        () => assert.fail('invalid H3 must reject'),
+        error => error
+    );
+    const transition = transitions.find(state => state.transitionKind === 'preparation-rejected');
+
+    assert.equal(transition.visibleStateJson, '{"memo":"accepted-H2"}');
+    assert.equal(transition.pendingCount, 3, 'H1, H2, and marker are ordered');
+    assert.equal(writeCalls.length, 1);
+
+    first.resolve(nativeReceipt(writeCalls[0], H0, H1));
+    await firstPromise;
+    assert.equal(writeCalls.length, 2);
+    second.resolve(nativeReceipt(writeCalls[1], H1, H2));
+    await secondPromise;
+    const preparationError = await preparationObserved;
+
+    assert.equal(preparationError.terminalReason, 'candidate-invalid');
+    assert.equal(writeCalls.length, 2, 'invalid H3 has no adapter request');
+    assert.equal(faults[0].lastAcknowledgedStateJson, '{"memo":"accepted-H2"}');
+    assert.equal(faults[0].lastAcknowledgedHash, H2);
+    assert.equal(queue.getState().lastAcknowledgedHash, H2);
+    assert.equal(
+        transitions.some(state => state.primaryStatus === 'native-durable'
+            && state.lanePhase === 'idle'),
+        false,
+        'tail marker suppresses H1/H2 stable success'
+    );
+});
+
+test('onAcknowledged reentrant failPreparation suppresses stable success before the first caller reaction', async () => {
+    const result = deferred();
+    const writeCalls = [];
+    const transitions = [];
+    const faults = [];
+    let preparationPromise = null;
+    let queue;
+    queue = makeQueue({
+        write: request => {
+            writeCalls.push(request);
+            return result.promise;
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request)),
+        onAcknowledged: () => {
+            preparationPromise = queue.failPreparation(new Error('reentrant candidate invalid'));
+            return undefined;
+        },
+        onTransition: state => {
+            transitions.push(state);
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const savePromise = queue.enqueue({ stateJson: '{"memo":"ack-then-invalid"}', reason: 'H1' });
+    let callerObservedState = null;
+    const callerObserved = savePromise.then(receipt => {
+        callerObservedState = queue.getState();
+        return receipt;
+    });
+
+    result.resolve(nativeReceipt(writeCalls[0], H0, H1));
+    const receipt = await callerObserved;
+    const preparationError = await preparationPromise.then(
+        () => assert.fail('reentrant preparation must reject'),
+        error => error
+    );
+
+    assert.equal(receipt.stateHashAfter, H1);
+    assert.equal(preparationError.terminalReason, 'candidate-invalid');
+    assert.equal(callerObservedState.halted, true, 'caller observes the completed marker fence');
+    assert.equal(callerObservedState.lastAcknowledgedHash, H1);
+    const futureError = await queue.enqueue({ stateJson: '{"memo":"future"}', reason: 'future' }).then(
+        () => assert.fail('future must halt'),
+        error => error
+    );
+    assert.strictEqual(futureError.terminalCause, faults[0]);
+    assert.equal(
+        transitions.some(state => state.primaryStatus === 'native-durable'
+            && state.lanePhase === 'idle'),
+        false,
+        'reentrant marker suppresses stable H1 success'
+    );
+    assert.equal(writeCalls.length, 1);
+});
+
+test('preparation marker uses the acknowledged baseline when no save was accepted', async () => {
+    const writeCalls = [];
+    const transitions = [];
+    const faults = [];
+    const terminalCalls = [];
+    const queue = makeQueue({
+        write: request => {
+            writeCalls.push(request);
+            return Promise.reject(new Error('must not write'));
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onTransition: state => {
+            transitions.push(state);
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+
+    const error = await queue.failPreparation(new Error('initial candidate invalid')).then(
+        () => assert.fail('preparation must reject'),
+        reason => reason
+    );
+    const transition = transitions.find(state => state.transitionKind === 'preparation-rejected');
+
+    assert.equal(transition.visibleStateJson, '{"memo":"H0"}');
+    assert.equal(transition.pendingCount, 1);
+    assert.equal(error.terminalReason, 'candidate-invalid');
+    assert.equal(faults.length, 1);
+    assert.equal(faults[0].lastAcknowledgedStateJson, '{"memo":"H0"}');
+    assert.equal(writeCalls.length, 0);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['candidate-invalid']);
+});
+
+for (const earlierOutcome of ['not-committed', 'unknown', 'conflict']) {
+    test(`earlier H1 ${earlierOutcome} wins over and cancels a preparation marker`, async () => {
+        const clock = manualClock();
+        const first = deferred();
+        const writeCalls = [];
+        const faults = [];
+        const terminalCalls = [];
+        const queue = makeQueue({
+            clock: clock.clock,
+            write: request => {
+                writeCalls.push(request);
+                return first.promise;
+            },
+            terminalize: request => {
+                terminalCalls.push(request);
+                return Promise.resolve(terminalReceipt(request));
+            },
+            onFault: fault => {
+                faults.push(fault);
+                return undefined;
+            }
+        });
+        const firstPromise = queue.enqueue({ stateJson: '{"memo":"active-H1"}', reason: 'H1' });
+        const firstObserved = firstPromise.then(
+            () => assert.fail('H1 must reject'),
+            error => error
+        );
+        const preparationObserved = queue.failPreparation(new Error('H2 invalid')).then(
+            () => assert.fail('preparation must reject'),
+            error => error
+        );
+        let futureSettled = false;
+        const futureObserved = queue.enqueue({ stateJson: '{"memo":"future"}', reason: 'future' }).then(
+            () => assert.fail('future save must halt'),
+            error => {
+                futureSettled = true;
+                return error;
+            }
+        );
+        await Promise.resolve();
+        assert.equal(futureSettled, false, 'future terminal cause is not provisional');
+
+        if (earlierOutcome === 'not-committed') {
+            first.reject(structuredSaveError(writeCalls[0]));
+        } else if (earlierOutcome === 'conflict') {
+            first.reject(structuredSaveError(writeCalls[0], {
+                conflict: 'source-changed',
+                sourceHashAfter: H2
+            }));
+        } else {
+            first.reject(new Error('transport lost'));
+        }
+        const firstError = await firstObserved;
+        const preparationError = await preparationObserved;
+        const futureError = await futureObserved;
+
+        assert.equal(preparationError instanceof LegacySafety.AssetTrackerSaveError, true);
+        assert.equal(preparationError.terminalReason, 'candidate-invalid');
+        assert.equal(futureError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+        assert.strictEqual(futureError.terminalCause, firstError);
+        assert.strictEqual(faults[0], firstError, 'H1 is the sole onFault cause');
+        assert.equal(faults.length, 1);
+        assert.deepEqual(terminalCalls.map(call => call.reason), [
+            earlierOutcome === 'not-committed'
+                ? 'save-not-committed'
+                : earlierOutcome === 'conflict'
+                    ? 'save-conflict'
+                    : 'save-outcome-unknown'
+        ]);
+        assert.equal(writeCalls.length, 1);
+    });
+}
+
+test('preparation transition callback failure replaces the candidate marker with one callback marker', async () => {
+    const writeCalls = [];
+    const faults = [];
+    const terminalCalls = [];
+    const queue = makeQueue({
+        write: request => {
+            writeCalls.push(request);
+            return Promise.reject(new Error('must not write'));
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onTransition: state => {
+            if (state.transitionKind === 'preparation-rejected') {
+                throw new Error('visible rollback callback failed');
+            }
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+
+    const error = await queue.failPreparation(new Error('candidate invalid')).then(
+        () => assert.fail('replacement callback marker must reject'),
+        reason => reason
+    );
+
+    assert.equal(error instanceof LegacySafety.AssetTrackerQueueCallbackError, true);
+    assert.equal(error.terminalReason, 'queue-callback-failed');
+    assert.equal(error.causeKind, 'pre-dispatch-callback');
+    assert.equal(error.callbackName, 'onTransition');
+    assert.match(error.callbackFaultId, /\S/);
+    assert.strictEqual(faults[0], error);
+    assert.equal(faults.length, 1);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['queue-callback-failed']);
+    assert.equal(writeCalls.length, 0);
+});
+
+for (const callbackOutcome of ['throw', 'non-undefined']) {
+    test(`preparation callback ${callbackOutcome} keeps reentrant enqueue behind the replacement marker`, async () => {
+        const writeCalls = [];
+        const faults = [];
+        const terminalCalls = [];
+        let reentrantPromise = null;
+        let insidePreparation = false;
+        let queue;
+        queue = makeQueue({
+            write: request => {
+                writeCalls.push(request);
+                return Promise.reject(new Error('must not write'));
+            },
+            terminalize: request => {
+                terminalCalls.push(request);
+                return Promise.resolve(terminalReceipt(request));
+            },
+            onTransition: state => {
+                if (state.transitionKind === 'preparation-rejected' && !insidePreparation) {
+                    insidePreparation = true;
+                    reentrantPromise = queue.enqueue({
+                        stateJson: '{"memo":"reentrant-after-preparation"}',
+                        reason: 'reentrant'
+                    });
+                    insidePreparation = false;
+                    if (callbackOutcome === 'throw') throw new Error('preparation callback failed');
+                    return { callbackProtocol: 'invalid' };
+                }
+                return undefined;
+            },
+            onFault: fault => {
+                faults.push(fault);
+                return undefined;
+            }
+        });
+
+        const preparationPromise = queue.failPreparation(new Error('candidate invalid'));
+        const preparationObserved = preparationPromise.then(
+            () => assert.fail('replacement marker must reject'),
+            error => error
+        );
+        const reentrantObserved = reentrantPromise.then(
+            () => assert.fail('reentrant future enqueue must halt'),
+            error => error
+        );
+        const preparationError = await preparationObserved;
+        const reentrantError = await reentrantObserved;
+
+        assert.equal(preparationError instanceof LegacySafety.AssetTrackerQueueCallbackError, true);
+        assert.equal(preparationError.terminalReason, 'queue-callback-failed');
+        assert.equal(reentrantError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+        assert.strictEqual(reentrantError.terminalCause, preparationError);
+        assert.strictEqual(faults[0], preparationError);
+        assert.equal(faults.length, 1);
+        assert.deepEqual(terminalCalls.map(call => call.reason), ['queue-callback-failed']);
+        assert.equal(writeCalls.length, 0);
+    });
+}
+
+test('active H1 storage fault wins over a preparation callback marker and its reentrant item', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const writeCalls = [];
+    const faults = [];
+    const terminalCalls = [];
+    let reentrantPromise = null;
+    let insidePreparation = false;
+    let queue;
+    queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return first.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onTransition: state => {
+            if (state.transitionKind === 'preparation-rejected' && !insidePreparation) {
+                insidePreparation = true;
+                reentrantPromise = queue.enqueue({
+                    stateJson: '{"memo":"reentrant-H3"}',
+                    reason: 'H3'
+                });
+                insidePreparation = false;
+                throw new Error('preparation callback failed');
+            }
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"active-H1"}', reason: 'H1' });
+    const firstObserved = firstPromise.then(
+        () => assert.fail('H1 must reject'),
+        error => error
+    );
+    const preparationPromise = queue.failPreparation(new Error('candidate H2 invalid'));
+    const preparationObserved = preparationPromise.then(
+        () => assert.fail('callback marker must be cancelled'),
+        error => error
+    );
+    const reentrantObserved = reentrantPromise.then(
+        () => assert.fail('reentrant future enqueue must halt'),
+        error => error
+    );
+
+    first.reject(structuredSaveError(writeCalls[0]));
+    const firstError = await firstObserved;
+    const preparationError = await preparationObserved;
+    const reentrantError = await reentrantObserved;
+
+    assert.equal(preparationError instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+    assert.equal(preparationError.causedByClientItemId, writeCalls[0].clientSaveId);
+    assert.equal(preparationError.causeKind, 'storage-item');
+    assert.equal(preparationError.callbackFaultId, null);
+    assert.equal(reentrantError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+    assert.strictEqual(reentrantError.terminalCause, firstError);
+    assert.strictEqual(faults[0], firstError);
+    assert.equal(faults.length, 1);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['save-not-committed']);
+    assert.equal(writeCalls.length, 1);
+});
+
+test('active H1 ACK lets a preparation callback marker become the exact future halted cause', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const writeCalls = [];
+    const faults = [];
+    let futurePromise = null;
+    let queue;
+    queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return first.promise;
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request)),
+        onTransition: state => {
+            if (state.transitionKind === 'preparation-rejected' && futurePromise === null) {
+                futurePromise = queue.enqueue({ stateJson: '{"memo":"future"}', reason: 'future' });
+                throw new Error('preparation transition failed');
+            }
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"active-H1"}', reason: 'H1' });
+    const preparationObserved = queue.failPreparation(new Error('candidate H2 invalid')).then(
+        () => assert.fail('callback marker must reject'),
+        error => error
+    );
+    let futureSettled = false;
+    const futureObserved = futurePromise.then(
+        () => assert.fail('future must halt'),
+        error => {
+            futureSettled = true;
+            return error;
+        }
+    );
+    await Promise.resolve();
+    assert.equal(futureSettled, false, 'H1 remains the earlier possible winner');
+
+    first.resolve(nativeReceipt(writeCalls[0], H0, H1));
+    await firstPromise;
+    const preparationError = await preparationObserved;
+    const futureError = await futureObserved;
+
+    assert.equal(preparationError instanceof LegacySafety.AssetTrackerQueueCallbackError, true);
+    assert.equal(preparationError.lastAcknowledgedHash, H1);
+    assert.equal(futureError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+    assert.strictEqual(futureError.terminalCause, preparationError);
+    assert.strictEqual(faults[0], preparationError);
+    assert.equal(writeCalls.length, 1);
+});
+
+test('callback marker waits behind active H1 ACK, then faults H2 and aborts reentrant H3 in place', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const writeCalls = [];
+    const transitions = [];
+    const faults = [];
+    const terminalCalls = [];
+    let shouldFailH2 = false;
+    let thirdPromise = null;
+    let queue;
+    queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            writeCalls.push(request);
+            return first.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onTransition: state => {
+            transitions.push(state);
+            if (shouldFailH2 && state.pendingCount === 2) {
+                shouldFailH2 = false;
+                thirdPromise = queue.enqueue({ stateJson: '{"memo":"reentrant-H3"}', reason: 'H3' });
+                throw new Error('H2 transition failed');
+            }
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const firstPromise = queue.enqueue({ stateJson: '{"memo":"active-H1"}', reason: 'H1' });
+    const firstObserved = firstPromise.then(
+        receipt => ({ receipt }),
+        error => ({ error })
+    );
+    shouldFailH2 = true;
+    const secondPromise = queue.enqueue({ stateJson: '{"memo":"failed-H2"}', reason: 'H2' });
+    const secondObserved = secondPromise.then(
+        () => assert.fail('H2 callback marker must reject'),
+        error => error
+    );
+    const thirdObserved = thirdPromise.then(
+        () => assert.fail('reentrant H3 must abort'),
+        error => error
+    );
+
+    assert.equal(writeCalls.length, 1, 'H2/H3 remain undispatched behind H1');
+    assert.equal(queue.getState().accepting, false);
+    assert.equal(queue.getState().pendingCount, 3);
+    assert.equal(faults.length, 0, 'callback marker has not reached head');
+    assert.equal(terminalCalls.length, 0);
+
+    first.resolve(nativeReceipt(writeCalls[0], H0, H1));
+    const firstOutcome = await firstObserved;
+    const secondError = await secondObserved;
+    const thirdError = await thirdObserved;
+
+    assert.equal(firstOutcome.error, undefined);
+    assert.equal(firstOutcome.receipt.stateHashAfter, H1);
+    assert.equal(secondError instanceof LegacySafety.AssetTrackerQueueCallbackError, true);
+    assert.equal(secondError.queueOutcome, 'callback-failed');
+    assert.equal(secondError.terminalReason, 'queue-callback-failed');
+    assert.equal(secondError.causeKind, 'pre-dispatch-callback');
+    assert.equal(secondError.callbackName, 'onTransition');
+    assert.equal(secondError.activeClientItemId, 'load-1:save:2');
+    assert.equal(secondError.attemptedStateJson, '{"memo":"failed-H2"}');
+    assert.equal(secondError.lastAcknowledgedStateJson, '{"memo":"active-H1"}');
+    assert.equal(secondError.lastAcknowledgedHash, H1);
+    assert.match(secondError.callbackFaultId, /\S/);
+    assert.strictEqual(faults[0], secondError);
+
+    assert.equal(thirdError instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+    assert.equal(thirdError.causedByClientItemId, 'load-1:save:2');
+    assert.equal(thirdError.causeKind, 'pre-dispatch-callback');
+    assert.equal(thirdError.callbackFaultId, secondError.callbackFaultId);
+    assert.equal(thirdError.completedItemKind, null);
+    assert.equal(thirdError.completedClientItemId, null);
+    assert.equal(thirdError.completedOutcome, null);
+    assert.equal(Object.isFrozen(thirdError), true);
+    assert.equal(writeCalls.length, 1, 'marker and H3 perform zero adapter I/O');
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    assert.equal(queue.getState().primaryStatus, 'failed-readonly');
+    assert.equal(faults.length, 1);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['queue-callback-failed']);
+    assert.equal(
+        transitions.some(state => state.primaryStatus === 'native-durable'
+            && state.lanePhase === 'idle'),
+        false,
+        'callback marker suppresses intermediate H1 stable success'
+    );
+
+    const futureError = await queue.enqueue({ stateJson: '{"memo":"future"}', reason: 'future' }).then(
+        () => assert.fail('future save must halt'),
+        error => error
+    );
+    assert.equal(futureError instanceof LegacySafety.AssetTrackerQueueHaltedError, true);
+    assert.strictEqual(futureError.terminalCause, secondError);
+});
+
+for (const earlierOutcome of ['not-committed', 'unknown']) {
+    test(`active H1 ${earlierOutcome} cancels the H2 callback marker and reentrant H3 with H1 as sole cause`, async () => {
+        const clock = manualClock();
+        const first = deferred();
+        const writeCalls = [];
+        const faults = [];
+        const terminalCalls = [];
+        let shouldFailH2 = false;
+        let thirdPromise = null;
+        let queue;
+        queue = makeQueue({
+            clock: clock.clock,
+            write: request => {
+                writeCalls.push(request);
+                return first.promise;
+            },
+            terminalize: request => {
+                terminalCalls.push(request);
+                return Promise.resolve(terminalReceipt(request));
+            },
+            onTransition: state => {
+                if (shouldFailH2 && state.pendingCount === 2) {
+                    shouldFailH2 = false;
+                    thirdPromise = queue.enqueue({ stateJson: '{"memo":"reentrant-H3"}', reason: 'H3' });
+                    throw new Error('H2 transition failed');
+                }
+                return undefined;
+            },
+            onFault: fault => {
+                faults.push(fault);
+                return undefined;
+            }
+        });
+        const firstPromise = queue.enqueue({ stateJson: '{"memo":"active-H1"}', reason: 'H1' });
+        const firstObserved = firstPromise.then(
+            () => assert.fail('H1 must reject'),
+            error => error
+        );
+        shouldFailH2 = true;
+        const secondPromise = queue.enqueue({ stateJson: '{"memo":"failed-H2"}', reason: 'H2' });
+        const secondObserved = secondPromise.then(
+            () => assert.fail('H2 marker must be cancelled'),
+            error => error
+        );
+        const thirdObserved = thirdPromise.then(
+            () => assert.fail('H3 must be cancelled'),
+            error => error
+        );
+
+        if (earlierOutcome === 'not-committed') {
+            first.reject(structuredSaveError(writeCalls[0]));
+        } else {
+            first.reject(new Error('transport lost'));
+        }
+        const firstError = await firstObserved;
+        const secondError = await secondObserved;
+        const thirdError = await thirdObserved;
+
+        assert.equal(firstError instanceof LegacySafety.AssetTrackerSaveError, true);
+        for (const pendingError of [secondError, thirdError]) {
+            assert.equal(pendingError instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+            assert.equal(pendingError.causedByClientItemId, writeCalls[0].clientSaveId);
+            assert.equal(pendingError.causeKind, 'storage-item');
+            assert.equal(pendingError.callbackFaultId, null);
+        }
+        assert.strictEqual(faults[0], firstError);
+        assert.equal(faults.length, 1, 'H2 callback draft never emits onFault');
+        assert.deepEqual(terminalCalls.map(call => call.reason), [
+            earlierOutcome === 'not-committed' ? 'save-not-committed' : 'save-outcome-unknown'
+        ]);
+        assert.equal(writeCalls.length, 1);
+    });
+}
+
+test('terminal onFault throw and hostile thenable returns cannot create a second fault or rejection', async t => {
+    const variants = [
+        ['throw', () => { throw new Error('onFault failed'); }],
+        ['resolved thenable', () => Promise.resolve('invalid callback return')],
+        ['rejected thenable', () => Promise.reject(new Error('diagnostic reject'))],
+        ['never thenable', () => new Promise(() => {})],
+        ['throwing then getter', () => Object.defineProperty({}, 'then', {
+            get() { throw new Error('then getter failed'); }
+        })],
+        ['settle then throw', () => ({
+            then(resolve) {
+                resolve('done');
+                throw new Error('after settle');
+            }
+        })],
+        ['double settlement', () => ({
+            then(resolve, reject) {
+                resolve('first');
+                reject(new Error('second'));
+            }
+        })]
+    ];
+
+    for (const [label, onFault] of variants) {
+        await t.test(label, async () => {
+            const result = deferred();
+            const writeCalls = [];
+            const terminalCalls = [];
+            const queue = makeQueue({
+                write: request => {
+                    writeCalls.push(request);
+                    return result.promise;
+                },
+                terminalize: request => {
+                    terminalCalls.push(request);
+                    return Promise.resolve(terminalReceipt(request));
+                },
+                onFault
+            });
+            const savePromise = queue.enqueue({ stateJson: `{"memo":"${label}"}`, reason: label });
+            const observed = savePromise.then(
+                () => assert.fail('save must reject'),
+                error => error
+            );
+
+            result.reject(structuredSaveError(writeCalls[0]));
+            const error = await observed;
+            await new Promise(resolve => setImmediate(resolve));
+
+            assert.equal(error.terminalReason, 'save-not-committed');
+            assert.equal(queue.getState().halted, true);
+            assert.deepEqual(terminalCalls.map(call => call.reason), ['save-not-committed']);
+        });
+    }
 });

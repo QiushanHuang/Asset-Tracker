@@ -92,6 +92,26 @@
         'storagePath',
         'recoveryHealth'
     ]);
+    const SAVE_ERROR_FIELDS = intrinsicObjectFreeze([
+        'code',
+        'message',
+        'writeOutcome',
+        'conflict',
+        'clientSaveId',
+        'payloadHash',
+        'sourceHashAfter',
+        'sourceReverified',
+        'coordinatorReleased',
+        'healthPersisted',
+        'recoveryHealthEvidence'
+    ]);
+    const TERMINAL_RECEIPT_FIELDS = intrinsicObjectFreeze([
+        'ok',
+        'protocolVersion',
+        'loadId',
+        'reason',
+        'gateState'
+    ]);
     const saveQueueInternals = new WeakMap();
 
     class AssetTrackerSaveError extends Error {}
@@ -333,12 +353,21 @@
     }
 
     function createCallbackFault(internals, details) {
-        internals.nextCallbackFaultOrdinal += 1;
+        let callbackFaultId = details.callbackFaultId;
+        if (!callbackFaultId) {
+            internals.nextCallbackFaultOrdinal += 1;
+            callbackFaultId = `${internals.configuration.sessionContext.loadId}:callback:${internals.nextCallbackFaultOrdinal}`;
+        }
         return freezeTypedError(
             new AssetTrackerQueueCallbackError('Queue callback contract failed'),
             {
                 queueOutcome: 'callback-failed',
-                callbackFaultId: `${internals.configuration.sessionContext.loadId}:callback:${internals.nextCallbackFaultOrdinal}`,
+                terminalReason: 'queue-callback-failed',
+                lastAcknowledgedStateJson: internals.lastAcknowledgedStateJson,
+                lastAcknowledgedHash: internals.lastAcknowledgedHash,
+                attemptedStateJson: details.attemptedStateJson || null,
+                activeClientItemId: details.clientItemId,
+                callbackFaultId,
                 causeKind: details.causeKind,
                 callbackName: details.callbackName,
                 clientItemId: details.clientItemId,
@@ -354,7 +383,7 @@
             new AssetTrackerQueueAbortError('Accepted queue item was not dispatched'),
             {
                 queueOutcome: 'not-dispatched',
-                itemKind: item.kind,
+                itemKind: item.itemKind || item.kind,
                 clientItemId: item.clientSaveId,
                 payloadHash: item.payloadHash,
                 causedByClientItemId: cause.causedByClientItemId,
@@ -375,6 +404,50 @@
                 terminalCause
             }
         );
+    }
+
+    function deferHaltedCapability(internals, promiseCapability) {
+        internals.pendingHaltedCapabilities.push(promiseCapability);
+    }
+
+    function rejectDeferredHaltedCapabilities(internals, terminalCause) {
+        const capabilities = internals.pendingHaltedCapabilities.splice(0);
+        for (const capability of capabilities) {
+            capability.reject(createHaltedError(terminalCause));
+        }
+    }
+
+    function createPreparationError(internals, message) {
+        return freezeTypedError(
+            new AssetTrackerSaveError(message),
+            {
+                code: 'candidate-invalid',
+                writeOutcome: 'not-committed',
+                conflict: false,
+                clientSaveId: null,
+                payloadHash: null,
+                sourceHashAfter: internals.lastAcknowledgedHash,
+                sourceReverified: true,
+                coordinatorReleased: true,
+                healthPersisted: false,
+                recoveryHealthEvidence: null,
+                queueOutcome: 'preparation-rejected',
+                terminalReason: 'candidate-invalid',
+                lastAcknowledgedStateJson: internals.lastAcknowledgedStateJson,
+                lastAcknowledgedHash: internals.lastAcknowledgedHash,
+                attemptedStateJson: null,
+                activeClientItemId: null,
+                callbackFaultId: null
+            }
+        );
+    }
+
+    function observeRejectedPromise(promise) {
+        try {
+            intrinsicPromiseThen(promise, ignoreDiagnostic, ignoreDiagnostic);
+        } catch (_error) {
+            // An intrinsic queue promise and captured then normally make this unreachable.
+        }
     }
 
     function createMalformedSaveError(item) {
@@ -437,7 +510,7 @@
         const nextItem = internals.items[0] || null;
         replaceQueueState(queue, {
             lanePhase: nextItem ? 'saving' : 'idle',
-            activeClientSaveId: nextItem ? nextItem.clientSaveId : null,
+            activeClientSaveId: nextItem && nextItem.kind === 'save' ? nextItem.clientSaveId : null,
             activeClientSnapshotId: null,
             pendingCount: internals.items.length
         });
@@ -449,12 +522,269 @@
         invokeTerminalCallback(internals.configuration.onFault, [terminalCause]);
     }
 
+    function isValidHash(value) {
+        return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+    }
+
+    function clearActiveDeadline(internals, item) {
+        if (!internals.activeDeadline || internals.activeDeadline.item !== item) return;
+        const deadline = internals.activeDeadline;
+        internals.activeDeadline = null;
+        try {
+            internals.configuration.clock.clearTimeout(deadline.handle);
+        } catch (_error) {
+            // Clearing a host timer is best effort after the operation has completed.
+        }
+    }
+
+    function validateTerminalReceipt(source, request) {
+        const receipt = extractAllowedFields(source, TERMINAL_RECEIPT_FIELDS, 'terminalReceipt');
+        if (receipt.ok !== true
+            || receipt.protocolVersion !== 2
+            || receipt.loadId !== request.sessionContext.loadId
+            || receipt.reason !== request.reason
+            || receipt.gateState !== 'terminal-locked') {
+            throw new TypeError('Terminalization receipt is invalid');
+        }
+    }
+
+    function attemptTerminalization(queue, reason) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.configuration.expectedDurability !== 'native-durable'
+            || internals.terminalizationStarted) {
+            return;
+        }
+        internals.terminalizationStarted = true;
+        const request = canonicalDeepFrozenCopy({
+            reason,
+            sessionContext: internals.configuration.sessionContext
+        });
+
+        let result;
+        try {
+            result = internals.configuration.terminalize(request);
+        } catch (_error) {
+            internals.terminalizationDone = true;
+            return;
+        }
+
+        try {
+            const handle = internals.configuration.clock.setTimeout(() => {
+                if (internals.terminalizationDone) return;
+                internals.terminalizationDone = true;
+                internals.terminalizationDeadline = null;
+            }, internals.configuration.transportDeadlineMs);
+            if (internals.terminalizationDone) {
+                try {
+                    internals.configuration.clock.clearTimeout(handle);
+                } catch (_error) {
+                    // A synchronously fired terminal deadline is already authoritative.
+                }
+            } else {
+                internals.terminalizationDeadline = handle;
+            }
+        } catch (_error) {
+            internals.terminalizationDone = true;
+        }
+
+        const finish = receipt => {
+            if (internals.terminalizationDone) return undefined;
+            try {
+                validateTerminalReceipt(receipt, request);
+            } catch (_error) {
+                // A malformed terminal ACK cannot change the already-terminal Web lane.
+            }
+            internals.terminalizationDone = true;
+            if (internals.terminalizationDeadline !== null) {
+                try {
+                    internals.configuration.clock.clearTimeout(internals.terminalizationDeadline);
+                } catch (_error) {
+                    // The lane is already terminal; timeout cleanup is best effort.
+                }
+                internals.terminalizationDeadline = null;
+            }
+            return undefined;
+        };
+        const reject = () => finish(null);
+        try {
+            const adopted = intrinsicPromiseResolve(result);
+            intrinsicPromiseThen(adopted, finish, reject);
+        } catch (_error) {
+            reject();
+        }
+    }
+
+    function extractStructuredSaveError(source, item, expectedHash) {
+        if (!(source instanceof AssetTrackerSaveError)) {
+            throw new TypeError('Save error is not typed');
+        }
+        const error = extractAllowedFields(source, SAVE_ERROR_FIELDS, 'saveError');
+        if (typeof error.code !== 'string'
+            || error.code.length === 0
+            || typeof error.message !== 'string'
+            || error.message.length === 0
+            || !['not-committed', 'unknown'].includes(error.writeOutcome)
+            || ![false, 'source-changed', 'session-invalid'].includes(error.conflict)
+            || error.clientSaveId !== item.clientSaveId
+            || error.payloadHash !== item.payloadHash
+            || (error.sourceHashAfter !== null && !isValidHash(error.sourceHashAfter))
+            || typeof error.sourceReverified !== 'boolean'
+            || typeof error.coordinatorReleased !== 'boolean'
+            || typeof error.healthPersisted !== 'boolean') {
+            throw new TypeError('Save error is malformed');
+        }
+
+        let recoveryHealthEvidence = null;
+        if (error.healthPersisted) {
+            if (error.recoveryHealthEvidence === null) {
+                throw new TypeError('Persisted health evidence is missing');
+            }
+            recoveryHealthEvidence = copyRecoveryHealth(
+                extractAllowedFields(
+                    error.recoveryHealthEvidence,
+                    RECOVERY_HEALTH_FIELDS,
+                    'saveError.recoveryHealthEvidence'
+                ),
+                'ordinary'
+            );
+            if (recoveryHealthEvidence.status === 'not-applicable') {
+                throw new TypeError('Persisted health evidence is inapplicable');
+            }
+        } else if (error.recoveryHealthEvidence !== null) {
+            throw new TypeError('Unpersisted health evidence must be null');
+        }
+
+        let classification = 'unknown';
+        if (error.conflict !== false) {
+            classification = 'conflict';
+        } else if (error.writeOutcome === 'not-committed'
+            && error.sourceHashAfter === expectedHash
+            && error.sourceReverified === true
+            && error.coordinatorReleased === true) {
+            classification = 'not-committed';
+        }
+
+        return {
+            classification,
+            values: error,
+            recoveryHealthEvidence
+        };
+    }
+
+    function createTerminalSaveError(internals, item, classification, structured = null) {
+        const queueOutcome = classification === 'not-committed'
+            ? 'not-committed'
+            : classification === 'conflict'
+                ? 'conflict'
+                : 'durability-unknown';
+        const terminalReason = classification === 'not-committed'
+            ? 'save-not-committed'
+            : classification === 'conflict'
+                ? 'save-conflict'
+                : 'save-outcome-unknown';
+        const message = structured ? structured.values.message : 'Save outcome is unknown';
+        const wireProperties = structured
+            ? {
+                code: structured.values.code,
+                writeOutcome: structured.values.writeOutcome,
+                conflict: structured.values.conflict,
+                clientSaveId: structured.values.clientSaveId,
+                payloadHash: structured.values.payloadHash,
+                sourceHashAfter: structured.values.sourceHashAfter,
+                sourceReverified: structured.values.sourceReverified,
+                coordinatorReleased: structured.values.coordinatorReleased,
+                healthPersisted: structured.values.healthPersisted,
+                recoveryHealthEvidence: structured.recoveryHealthEvidence
+            }
+            : {
+                code: 'save-outcome-unknown',
+                writeOutcome: 'unknown',
+                conflict: false,
+                clientSaveId: item.clientSaveId,
+                payloadHash: item.payloadHash,
+                sourceHashAfter: null,
+                sourceReverified: false,
+                coordinatorReleased: false,
+                healthPersisted: false,
+                recoveryHealthEvidence: null
+            };
+        return freezeTypedError(
+            new AssetTrackerSaveError(message),
+            {
+                ...wireProperties,
+                queueOutcome,
+                terminalReason,
+                lastAcknowledgedStateJson: internals.lastAcknowledgedStateJson,
+                lastAcknowledgedHash: internals.lastAcknowledgedHash,
+                attemptedStateJson: item.stateJson,
+                activeClientItemId: item.clientSaveId,
+                callbackFaultId: null
+            }
+        );
+    }
+
+    function haltForSaveFailure(queue, item, adapterError, expectedHash) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted || internals.activeItem !== item) return;
+        clearActiveDeadline(internals, item);
+        if (internals.halted || internals.activeItem !== item) return;
+
+        let structured = null;
+        let classification = 'unknown';
+        try {
+            structured = extractStructuredSaveError(adapterError, item, expectedHash);
+            classification = structured.classification;
+        } catch (_error) {
+            structured = null;
+        }
+        const activeError = createTerminalSaveError(internals, item, classification, structured);
+        internals.halted = true;
+        internals.accepting = false;
+        internals.terminalCause = activeError;
+        internals.pendingTerminalCause = null;
+        internals.activeItem = null;
+        internals.laneRevision += 1;
+        const unsettledItems = internals.items.splice(0);
+        for (const pendingItem of unsettledItems) {
+            if (pendingItem === item) {
+                pendingItem.promiseCapability.reject(activeError);
+                continue;
+            }
+            pendingItem.promiseCapability.reject(createAbortError(pendingItem, {
+                causedByClientItemId: item.clientSaveId,
+                causeKind: 'storage-item',
+                callbackFaultId: null,
+                completedItemKind: null,
+                completedClientItemId: null,
+                completedOutcome: null
+            }));
+        }
+        const healthOverrides = structured && structured.recoveryHealthEvidence
+            ? { ordinaryRecoveryHealth: structured.recoveryHealthEvidence }
+            : {};
+        replaceQueueState(queue, {
+            ...healthOverrides,
+            lanePhase: 'halted',
+            primaryStatus: classification === 'unknown' ? 'durability-unknown' : 'failed-readonly',
+            activeClientSaveId: null,
+            activeClientSnapshotId: null,
+            pendingCount: 0,
+            accepting: false,
+            halted: true
+        });
+        rejectDeferredHaltedCapabilities(internals, activeError);
+        publishTerminalCallbacks(queue, activeError);
+        attemptTerminalization(queue, activeError.terminalReason);
+    }
+
     function haltForCallbackFault(queue, fault, triggeringItem = null) {
         const internals = saveQueueInternals.get(queue);
         if (internals.halted) return;
 
         internals.halted = true;
+        internals.accepting = false;
         internals.terminalCause = fault;
+        internals.pendingTerminalCause = null;
         internals.activeItem = null;
         internals.laneRevision += 1;
         const unsettledItems = internals.items.splice(0);
@@ -482,43 +812,13 @@
             accepting: false,
             halted: true
         });
+        rejectDeferredHaltedCapabilities(internals, fault);
         publishTerminalCallbacks(queue, fault);
+        attemptTerminalization(queue, 'queue-callback-failed');
     }
 
-    function haltForMalformedSave(queue, item) {
-        const internals = saveQueueInternals.get(queue);
-        if (internals.halted || internals.activeItem !== item) return;
-
-        const activeError = createMalformedSaveError(item);
-        internals.halted = true;
-        internals.terminalCause = activeError;
-        internals.activeItem = null;
-        internals.laneRevision += 1;
-        const unsettledItems = internals.items.splice(0);
-        for (const pendingItem of unsettledItems) {
-            if (pendingItem === item) {
-                pendingItem.promiseCapability.reject(activeError);
-                continue;
-            }
-            pendingItem.promiseCapability.reject(createAbortError(pendingItem, {
-                causedByClientItemId: item.clientSaveId,
-                causeKind: 'storage-item',
-                callbackFaultId: null,
-                completedItemKind: null,
-                completedClientItemId: null,
-                completedOutcome: null
-            }));
-        }
-        replaceQueueState(queue, {
-            lanePhase: 'halted',
-            primaryStatus: 'durability-unknown',
-            activeClientSaveId: null,
-            activeClientSnapshotId: null,
-            pendingCount: 0,
-            accepting: false,
-            halted: true
-        });
-        publishTerminalCallbacks(queue, activeError);
+    function haltForMalformedSave(queue, item, expectedHash) {
+        haltForSaveFailure(queue, item, null, expectedHash);
     }
 
     function extractAndValidateSaveReceipt(source, item, expectedHash, configuration) {
@@ -580,6 +880,40 @@
         });
     }
 
+    function completePreparationMarker(queue, marker) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted || internals.activeItem !== null || internals.items[0] !== marker) return;
+        const fault = createPreparationError(internals, marker.message);
+        internals.halted = true;
+        internals.accepting = false;
+        internals.terminalCause = fault;
+        internals.pendingTerminalCause = null;
+        internals.laneRevision += 1;
+        internals.items.shift();
+        replaceQueueState(queue, {
+            lanePhase: 'halted',
+            primaryStatus: 'failed-readonly',
+            activeClientSaveId: null,
+            activeClientSnapshotId: null,
+            pendingCount: 0,
+            accepting: false,
+            halted: true
+        });
+        rejectDeferredHaltedCapabilities(internals, fault);
+        publishTerminalCallbacks(queue, fault);
+        attemptTerminalization(queue, 'candidate-invalid');
+    }
+
+    function completeCallbackMarker(queue, marker) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted || internals.activeItem !== null || internals.items[0] !== marker) return;
+        const fault = createCallbackFault(internals, {
+            ...marker.faultDetails,
+            callbackFaultId: marker.callbackFaultId
+        });
+        haltForCallbackFault(queue, fault, marker);
+    }
+
     function dispatchNextSave(queue) {
         const internals = saveQueueInternals.get(queue);
         if (internals.halted
@@ -590,6 +924,14 @@
         }
 
         const item = internals.items[0];
+        if (item.kind === 'preparation-marker') {
+            completePreparationMarker(queue, item);
+            return;
+        }
+        if (item.kind === 'callback-marker') {
+            completeCallbackMarker(queue, item);
+            return;
+        }
         internals.activeItem = item;
         const request = intrinsicObjectFreeze({
             clientSaveId: item.clientSaveId,
@@ -599,11 +941,29 @@
             expectedHash: internals.lastAcknowledgedHash,
             sessionContext: internals.configuration.sessionContext
         });
+        try {
+            const handle = internals.configuration.clock.setTimeout(() => {
+                haltForSaveFailure(queue, item, null, request.expectedHash);
+            }, internals.configuration.durabilityDeadlineMs);
+            if (internals.halted || internals.activeItem !== item) {
+                try {
+                    internals.configuration.clock.clearTimeout(handle);
+                } catch (_error) {
+                    // A synchronously fired durability deadline is already authoritative.
+                }
+                return;
+            }
+            internals.activeDeadline = { item, handle };
+        } catch (_error) {
+            haltForSaveFailure(queue, item, null, request.expectedHash);
+            return;
+        }
+        if (internals.halted || internals.activeItem !== item) return;
         let adapterResult;
         try {
             adapterResult = internals.configuration.write(request);
-        } catch (_error) {
-            haltForMalformedSave(queue, item);
+        } catch (error) {
+            haltForSaveFailure(queue, item, error, request.expectedHash);
             return;
         }
 
@@ -615,18 +975,20 @@
                     completeSaveReceipt(queue, item, request.expectedHash, receipt);
                     return undefined;
                 },
-                () => {
-                    haltForMalformedSave(queue, item);
+                error => {
+                    haltForSaveFailure(queue, item, error, request.expectedHash);
                     return undefined;
                 }
             );
         } catch (_error) {
-            haltForMalformedSave(queue, item);
+            haltForMalformedSave(queue, item, request.expectedHash);
         }
     }
 
     function completeSaveReceipt(queue, item, expectedHash, adapterReceipt) {
         const internals = saveQueueInternals.get(queue);
+        if (internals.halted || internals.activeItem !== item) return;
+        clearActiveDeadline(internals, item);
         if (internals.halted || internals.activeItem !== item) return;
 
         let receipt;
@@ -638,7 +1000,7 @@
                 internals.configuration
             );
         } catch (_error) {
-            haltForMalformedSave(queue, item);
+            haltForMalformedSave(queue, item, expectedHash);
             return;
         }
 
@@ -654,7 +1016,9 @@
         replaceQueueState(queue, {
             ...healthOverrides,
             lanePhase: 'saving',
-            activeClientSaveId: internals.items[0] ? internals.items[0].clientSaveId : null,
+            activeClientSaveId: internals.items[0] && internals.items[0].kind === 'save'
+                ? internals.items[0].clientSaveId
+                : null,
             activeClientSnapshotId: null,
             pendingCount: internals.items.length,
             lastAcknowledgedHash: receipt.stateHashAfter
@@ -691,7 +1055,7 @@
         replaceQueueState(queue, {
             lanePhase: nextItem ? 'saving' : 'idle',
             primaryStatus: nextItem ? queue.queueState.primaryStatus : receipt.durability,
-            activeClientSaveId: nextItem ? nextItem.clientSaveId : null,
+            activeClientSaveId: nextItem && nextItem.kind === 'save' ? nextItem.clientSaveId : null,
             activeClientSnapshotId: null,
             pendingCount: internals.items.length
         });
@@ -734,8 +1098,15 @@
                 nextCallbackFaultOrdinal: 0,
                 laneRevision: 0,
                 fenceDepth: 0,
+                activeDeadline: null,
                 halted: false,
-                terminalCause: null
+                accepting: true,
+                terminalCause: null,
+                pendingTerminalCause: null,
+                pendingHaltedCapabilities: [],
+                terminalizationStarted: false,
+                terminalizationDone: false,
+                terminalizationDeadline: null
             });
         }
 
@@ -744,6 +1115,10 @@
             const internals = saveQueueInternals.get(this);
             if (internals.halted) {
                 promiseCapability.reject(createHaltedError(internals.terminalCause));
+                return promiseCapability.promise;
+            }
+            if (!internals.accepting) {
+                deferHaltedCapability(internals, promiseCapability);
                 return promiseCapability.promise;
             }
 
@@ -790,17 +1165,148 @@
             );
             internals.fenceDepth -= 1;
             if (!transitionResult.ok) {
-                haltForCallbackFault(this, createCallbackFault(internals, {
+                const faultDetails = intrinsicObjectFreeze({
                     causeKind: 'pre-dispatch-callback',
                     callbackName: transitionResult.callbackName,
                     clientItemId: item.clientSaveId,
                     completedItemKind: null,
                     completedClientItemId: null,
-                    completedOutcome: null
-                }), item);
+                    completedOutcome: null,
+                    attemptedStateJson: item.stateJson
+                });
+                const pendingFault = createCallbackFault(internals, faultDetails);
+                const itemIndex = internals.items.indexOf(item);
+                internals.items[itemIndex] = intrinsicObjectFreeze({
+                    kind: 'callback-marker',
+                    itemKind: 'save',
+                    clientSaveId: item.clientSaveId,
+                    stateJson: item.stateJson,
+                    payloadHash: item.payloadHash,
+                    promiseCapability: item.promiseCapability,
+                    acceptedRevision: item.acceptedRevision,
+                    callbackFaultId: pendingFault.callbackFaultId,
+                    faultDetails
+                });
+                internals.accepting = false;
+                internals.pendingTerminalCause = pendingFault;
+                replaceQueueState(this, {
+                    lanePhase: 'saving',
+                    activeClientSaveId: internals.items[0].kind === 'save'
+                        ? internals.items[0].clientSaveId
+                        : null,
+                    activeClientSnapshotId: null,
+                    pendingCount: internals.items.length,
+                    accepting: false
+                });
+                dispatchNextSave(this);
                 return promiseCapability.promise;
             }
 
+            dispatchNextSave(this);
+            return promiseCapability.promise;
+        }
+
+        failPreparation(error) {
+            const promiseCapability = createPromiseCapability();
+            observeRejectedPromise(promiseCapability.promise);
+            const internals = saveQueueInternals.get(this);
+            if (internals.halted) {
+                promiseCapability.reject(createHaltedError(internals.terminalCause));
+                return promiseCapability.promise;
+            }
+            if (!internals.accepting) {
+                deferHaltedCapability(internals, promiseCapability);
+                return promiseCapability.promise;
+            }
+            internals.accepting = false;
+
+            let message = 'Candidate preparation failed';
+            try {
+                const candidateMessage = intrinsicReflectGet(error, 'message');
+                if (typeof candidateMessage === 'string' && candidateMessage.length > 0) {
+                    message = candidateMessage;
+                }
+            } catch (_error) {
+                // Candidate diagnostics are optional and never retain the source error.
+            }
+            if (internals.halted) {
+                promiseCapability.reject(createHaltedError(internals.terminalCause));
+                return promiseCapability.promise;
+            }
+
+            let visibleStateJson = internals.lastAcknowledgedStateJson;
+            for (let index = internals.items.length - 1; index >= 0; index -= 1) {
+                if (internals.items[index].kind === 'save') {
+                    visibleStateJson = internals.items[index].stateJson;
+                    break;
+                }
+            }
+
+            internals.nextAcceptedRevision += 1;
+            internals.laneRevision += 1;
+            const marker = intrinsicObjectFreeze({
+                kind: 'preparation-marker',
+                clientSaveId: null,
+                stateJson: null,
+                payloadHash: null,
+                message,
+                promiseCapability,
+                acceptedRevision: internals.nextAcceptedRevision
+            });
+            const provisionalFault = createPreparationError(internals, message);
+            internals.pendingTerminalCause = provisionalFault;
+            internals.items.push(marker);
+            replaceQueueState(this, {
+                lanePhase: 'saving',
+                activeClientSaveId: internals.items[0].kind === 'save'
+                    ? internals.items[0].clientSaveId
+                    : null,
+                activeClientSnapshotId: null,
+                pendingCount: internals.items.length,
+                accepting: false
+            });
+            const transition = canonicalDeepFrozenCopy({
+                ...this.queueState,
+                transitionKind: 'preparation-rejected',
+                visibleStateJson
+            });
+
+            internals.fenceDepth += 1;
+            const transitionResult = invokeTotalCallback(
+                internals.configuration.onTransition,
+                [transition],
+                'onTransition'
+            );
+            internals.fenceDepth -= 1;
+            if (!transitionResult.ok) {
+                const faultDetails = intrinsicObjectFreeze({
+                    causeKind: 'pre-dispatch-callback',
+                    callbackName: transitionResult.callbackName,
+                    clientItemId: null,
+                    completedItemKind: null,
+                    completedClientItemId: null,
+                    completedOutcome: null,
+                    attemptedStateJson: null
+                });
+                const pendingFault = createCallbackFault(internals, faultDetails);
+                internals.pendingTerminalCause = pendingFault;
+                const markerIndex = internals.items.indexOf(marker);
+                internals.items[markerIndex] = intrinsicObjectFreeze({
+                    kind: 'callback-marker',
+                    itemKind: 'save',
+                    clientSaveId: null,
+                    stateJson: null,
+                    payloadHash: null,
+                    promiseCapability,
+                    acceptedRevision: marker.acceptedRevision,
+                    callbackFaultId: pendingFault.callbackFaultId,
+                    faultDetails
+                });
+                dispatchNextSave(this);
+                return promiseCapability.promise;
+            }
+
+            promiseCapability.reject(provisionalFault);
             dispatchNextSave(this);
             return promiseCapability.promise;
         }
