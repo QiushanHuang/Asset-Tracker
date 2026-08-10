@@ -25,6 +25,283 @@
         'minimumReaderVersion'
     ];
     const AUTOMATION_FREQUENCIES = new Set(['daily', 'weekly', 'monthly', 'yearly']);
+    const IntrinsicPromise = Promise;
+    const intrinsicPromiseResolve = Promise.resolve.bind(Promise);
+    const intrinsicObjectFreeze = Object.freeze;
+    const intrinsicReflectGet = Reflect.get;
+    const QUEUE_OPTION_FIELDS = intrinsicObjectFreeze([
+        'write',
+        'snapshot',
+        'terminalize',
+        'sessionContext',
+        'initialAcknowledged',
+        'initialRecoveryHealth',
+        'expectedDurability',
+        'durabilityDeadlineMs',
+        'barrierDeadlineMs',
+        'transportDeadlineMs',
+        'generationToken',
+        'clock',
+        'onTransition',
+        'onAcknowledged',
+        'onFault'
+    ]);
+    const SESSION_CONTEXT_FIELDS = intrinsicObjectFreeze([
+        'protocolVersion',
+        'loadId',
+        'writeSessionToken'
+    ]);
+    const INITIAL_ACKNOWLEDGED_FIELDS = intrinsicObjectFreeze([
+        'stateJson',
+        'stateHash'
+    ]);
+    const INITIAL_RECOVERY_HEALTH_FIELDS = intrinsicObjectFreeze([
+        'ordinary',
+        'snapshot'
+    ]);
+    const RECOVERY_HEALTH_FIELDS = intrinsicObjectFreeze([
+        'domain',
+        'status',
+        'auditComplete',
+        'code',
+        'maintenancePendingCount',
+        'detail'
+    ]);
+    const CLOCK_FIELDS = intrinsicObjectFreeze([
+        'setTimeout',
+        'clearTimeout'
+    ]);
+
+    class AssetTrackerSaveError extends Error {}
+    class AssetTrackerSnapshotError extends Error {}
+    class AssetTrackerQueueAbortError extends Error {}
+    class AssetTrackerQueueHaltedError extends Error {}
+    class AssetTrackerQueueCallbackError extends Error {}
+
+    function canonicalDeepFrozenCopy(value) {
+        if (value === null || typeof value !== 'object') return value;
+
+        const copy = Array.isArray(value) ? [] : {};
+        for (const key of Object.keys(value)) {
+            copy[key] = canonicalDeepFrozenCopy(intrinsicReflectGet(value, key));
+        }
+        return intrinsicObjectFreeze(copy);
+    }
+
+    function requireFunction(value, field) {
+        if (typeof value !== 'function') {
+            throw new TypeError(`Queue ${field} must be a function`);
+        }
+        return value;
+    }
+
+    function extractAllowedFields(source, fields, label) {
+        if (!isRecord(source)) throw new TypeError(`Queue ${label} must be an object`);
+
+        const extracted = Object.create(null);
+        for (const field of fields) {
+            try {
+                extracted[field] = intrinsicReflectGet(source, field);
+            } catch (error) {
+                throw new TypeError(`Queue ${label}.${field} could not be read`, { cause: error });
+            }
+        }
+        return intrinsicObjectFreeze(extracted);
+    }
+
+    function extractQueueOptionGraph(options) {
+        const values = extractAllowedFields(options, QUEUE_OPTION_FIELDS, 'options');
+        const sessionContext = extractAllowedFields(
+            values.sessionContext,
+            SESSION_CONTEXT_FIELDS,
+            'sessionContext'
+        );
+        const initialAcknowledged = extractAllowedFields(
+            values.initialAcknowledged,
+            INITIAL_ACKNOWLEDGED_FIELDS,
+            'initialAcknowledged'
+        );
+        const initialRecoveryHealth = extractAllowedFields(
+            values.initialRecoveryHealth,
+            INITIAL_RECOVERY_HEALTH_FIELDS,
+            'initialRecoveryHealth'
+        );
+        const ordinaryRecoveryHealth = extractAllowedFields(
+            initialRecoveryHealth.ordinary,
+            RECOVERY_HEALTH_FIELDS,
+            'initialRecoveryHealth.ordinary'
+        );
+        const snapshotRecoveryHealth = extractAllowedFields(
+            initialRecoveryHealth.snapshot,
+            RECOVERY_HEALTH_FIELDS,
+            'initialRecoveryHealth.snapshot'
+        );
+        const clock = extractAllowedFields(values.clock, CLOCK_FIELDS, 'clock');
+
+        return {
+            values,
+            sessionContext,
+            initialAcknowledged,
+            ordinaryRecoveryHealth,
+            snapshotRecoveryHealth,
+            clock
+        };
+    }
+
+    function copySessionContext(value) {
+        if (!isRecord(value)
+            || value.protocolVersion !== 2
+            || typeof value.loadId !== 'string'
+            || value.loadId.length === 0
+            || typeof value.writeSessionToken !== 'string'
+            || value.writeSessionToken.length === 0) {
+            throw new TypeError('Queue sessionContext is invalid');
+        }
+
+        return intrinsicObjectFreeze({
+            protocolVersion: 2,
+            loadId: value.loadId,
+            writeSessionToken: value.writeSessionToken
+        });
+    }
+
+    function copyInitialAcknowledged(value) {
+        if (!isRecord(value) || typeof value.stateJson !== 'string') {
+            throw new TypeError('Queue initialAcknowledged is invalid');
+        }
+        if (value.stateHash !== null
+            && (typeof value.stateHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.stateHash))) {
+            throw new TypeError('Queue initialAcknowledged stateHash is invalid');
+        }
+
+        return intrinsicObjectFreeze({
+            stateJson: value.stateJson,
+            stateHash: value.stateHash
+        });
+    }
+
+    function copyRecoveryHealth(value, expectedDomain) {
+        const requiredFields = [
+            'domain',
+            'status',
+            'auditComplete',
+            'code',
+            'maintenancePendingCount',
+            'detail'
+        ];
+        if (!isRecord(value)
+            || requiredFields.some(field => !Object.prototype.hasOwnProperty.call(value, field))
+            || value.domain !== expectedDomain
+            || !['healthy', 'degraded', 'not-applicable'].includes(value.status)
+            || typeof value.auditComplete !== 'boolean'
+            || !Number.isInteger(value.maintenancePendingCount)
+            || value.maintenancePendingCount < 0
+            || (value.detail !== null && typeof value.detail !== 'string')) {
+            throw new TypeError(`Queue ${expectedDomain} recovery health is invalid`);
+        }
+
+        const isDegraded = value.status === 'degraded';
+        if ((isDegraded && (typeof value.code !== 'string' || value.code.length === 0))
+            || (!isDegraded && value.code !== null)
+            || (!isDegraded && value.auditComplete !== true)
+            || (!isDegraded && value.maintenancePendingCount !== 0)) {
+            throw new TypeError(`Queue ${expectedDomain} recovery health is contradictory`);
+        }
+
+        return intrinsicObjectFreeze({
+            domain: value.domain,
+            status: value.status,
+            auditComplete: value.auditComplete,
+            code: value.code,
+            maintenancePendingCount: value.maintenancePendingCount,
+            detail: value.detail
+        });
+    }
+
+    function validateDeadline(value, field) {
+        if (!Number.isFinite(value) || value <= 0) {
+            throw new TypeError(`Queue ${field} deadline must be positive`);
+        }
+        return value;
+    }
+
+    function validateAndFreezeQueueOptions(options) {
+        const extraction = extractQueueOptionGraph(options);
+        const values = extraction.values;
+        const transportDeadlineMs = validateDeadline(values.transportDeadlineMs, 'transport');
+        const durabilityDeadlineMs = validateDeadline(values.durabilityDeadlineMs, 'durability');
+        const barrierDeadlineMs = validateDeadline(values.barrierDeadlineMs, 'barrier');
+        if (durabilityDeadlineMs >= transportDeadlineMs) {
+            throw new TypeError('Queue durability deadline must be shorter than transport deadline');
+        }
+        if (barrierDeadlineMs >= transportDeadlineMs) {
+            throw new TypeError('Queue barrier deadline must be shorter than transport deadline');
+        }
+        if (!['browser-local-committed', 'native-durable'].includes(values.expectedDurability)) {
+            throw new TypeError('Queue expectedDurability is invalid');
+        }
+        if (values.generationToken === undefined) {
+            throw new TypeError('Queue generationToken is required');
+        }
+
+        const sessionContext = copySessionContext(extraction.sessionContext);
+        const initialAcknowledged = copyInitialAcknowledged(extraction.initialAcknowledged);
+        const initialRecoveryHealth = intrinsicObjectFreeze({
+            ordinary: copyRecoveryHealth(extraction.ordinaryRecoveryHealth, 'ordinary'),
+            snapshot: copyRecoveryHealth(extraction.snapshotRecoveryHealth, 'snapshot')
+        });
+        const clock = intrinsicObjectFreeze({
+            setTimeout: requireFunction(extraction.clock.setTimeout, 'clock.setTimeout'),
+            clearTimeout: requireFunction(extraction.clock.clearTimeout, 'clock.clearTimeout')
+        });
+
+        return intrinsicObjectFreeze({
+            write: requireFunction(values.write, 'write'),
+            snapshot: requireFunction(values.snapshot, 'snapshot'),
+            terminalize: requireFunction(values.terminalize, 'terminalize'),
+            sessionContext,
+            initialAcknowledged,
+            initialRecoveryHealth,
+            expectedDurability: values.expectedDurability,
+            durabilityDeadlineMs,
+            barrierDeadlineMs,
+            transportDeadlineMs,
+            generationToken: values.generationToken,
+            clock,
+            onTransition: requireFunction(values.onTransition, 'onTransition'),
+            onAcknowledged: requireFunction(values.onAcknowledged, 'onAcknowledged'),
+            onFault: requireFunction(values.onFault, 'onFault')
+        });
+    }
+
+    function createInitialQueueState(configuration) {
+        return canonicalDeepFrozenCopy({
+            generationToken: configuration.generationToken,
+            lanePhase: 'idle',
+            primaryStatus: 'none',
+            barrierState: 'none',
+            activeClientSaveId: null,
+            activeClientSnapshotId: null,
+            pendingCount: 0,
+            lastAcknowledgedHash: configuration.initialAcknowledged.stateHash,
+            ordinaryRecoveryHealth: configuration.initialRecoveryHealth.ordinary,
+            snapshotRecoveryHealth: configuration.initialRecoveryHealth.snapshot,
+            accepting: true,
+            halted: false
+        });
+    }
+
+    class AssetTrackerSaveQueue {
+        constructor(options) {
+            const configuration = validateAndFreezeQueueOptions(options);
+            this.queueConfiguration = configuration;
+            this.queueState = createInitialQueueState(configuration);
+        }
+
+        getState() {
+            return canonicalDeepFrozenCopy(this.queueState);
+        }
+    }
 
     function rotateRight(value, amount) {
         return (value >>> amount) | (value << (32 - amount));
@@ -563,6 +840,12 @@
     }
 
     return Object.freeze({
+        AssetTrackerQueueAbortError,
+        AssetTrackerQueueCallbackError,
+        AssetTrackerQueueHaltedError,
+        AssetTrackerSaveError,
+        AssetTrackerSaveQueue,
+        AssetTrackerSnapshotError,
         inspectDOMString,
         sha256Hex,
         validateBookText
