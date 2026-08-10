@@ -30,9 +30,51 @@
     const intrinsicPromiseThen = Function.prototype.call.bind(Promise.prototype.then);
     const intrinsicArrayIsArray = Array.isArray;
     const intrinsicObjectCreate = Object.create;
+    const intrinsicObjectDefineProperty = Object.defineProperty;
     const intrinsicObjectFreeze = Object.freeze;
     const intrinsicObjectKeys = Object.keys;
     const intrinsicReflectGet = Reflect.get;
+    const intrinsicReflectApply = Reflect.apply;
+    const intrinsicString = String;
+    const intrinsicStringCharCodeAt = String.prototype.charCodeAt;
+    const intrinsicNumberIsSafeInteger = Number.isSafeInteger;
+    const intrinsicNumberIsFinite = Number.isFinite;
+    const intrinsicWeakMapGet = WeakMap.prototype.get;
+    const intrinsicWeakMapSet = WeakMap.prototype.set;
+    const intrinsicMathCeil = Math.ceil;
+    const IntrinsicUint8Array = Uint8Array;
+    const IntrinsicUint32Array = Uint32Array;
+    const intrinsicTypedArrayPrototype = Object.getPrototypeOf(IntrinsicUint8Array.prototype);
+    const intrinsicTypedArrayLengthGetter = Object.getOwnPropertyDescriptor(
+        intrinsicTypedArrayPrototype,
+        'length'
+    ).get;
+    const intrinsicTypedArrayByteLengthGetter = Object.getOwnPropertyDescriptor(
+        intrinsicTypedArrayPrototype,
+        'byteLength'
+    ).get;
+    const SHA256_CONSTANTS = intrinsicObjectFreeze([
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ]);
+    const SHA256_INITIAL_STATE = intrinsicObjectFreeze([
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    ]);
     const QUEUE_OPTION_FIELDS = intrinsicObjectFreeze([
         'write',
         'snapshot',
@@ -141,6 +183,14 @@
     ]);
     const saveQueueInternals = new WeakMap();
 
+    function getSaveQueueInternals(queue) {
+        return intrinsicReflectApply(intrinsicWeakMapGet, saveQueueInternals, [queue]);
+    }
+
+    function setSaveQueueInternals(queue, internals) {
+        intrinsicReflectApply(intrinsicWeakMapSet, saveQueueInternals, [queue, internals]);
+    }
+
     class AssetTrackerSaveError extends Error {}
     class AssetTrackerSnapshotError extends Error {}
     class AssetTrackerQueueAbortError extends Error {}
@@ -151,12 +201,46 @@
         return value !== null && typeof value === 'object' && !intrinsicArrayIsArray(value);
     }
 
+    function appendPrivateArrayItem(items, item) {
+        intrinsicObjectDefineProperty(items, items.length, {
+            value: item,
+            writable: true,
+            enumerable: true,
+            configurable: true
+        });
+    }
+
+    function removeFirstPrivateArrayItem(items) {
+        const length = items.length;
+        if (length === 0) return undefined;
+        const first = items[0];
+        for (let index = 1; index < length; index += 1) {
+            items[index - 1] = items[index];
+        }
+        items.length = length - 1;
+        return first;
+    }
+
+    function findPrivateArrayItem(items, sought) {
+        for (let index = 0; index < items.length; index += 1) {
+            if (items[index] === sought) return index;
+        }
+        return -1;
+    }
+
     function canonicalDeepFrozenCopy(value) {
         if (value === null || typeof value !== 'object') return value;
 
         const copy = intrinsicArrayIsArray(value) ? [] : {};
-        for (const key of intrinsicObjectKeys(value)) {
-            copy[key] = canonicalDeepFrozenCopy(intrinsicReflectGet(value, key));
+        const keys = intrinsicObjectKeys(value);
+        for (let index = 0; index < keys.length; index += 1) {
+            const key = keys[index];
+            intrinsicObjectDefineProperty(copy, key, {
+                value: canonicalDeepFrozenCopy(intrinsicReflectGet(value, key)),
+                writable: true,
+                enumerable: true,
+                configurable: true
+            });
         }
         return intrinsicObjectFreeze(copy);
     }
@@ -172,7 +256,8 @@
         if (!isQueueRecord(source)) throw new TypeError(`Queue ${label} must be an object`);
 
         const extracted = intrinsicObjectCreate(null);
-        for (const field of fields) {
+        for (let index = 0; index < fields.length; index += 1) {
+            const field = fields[index];
             try {
                 extracted[field] = intrinsicReflectGet(source, field);
             } catch (error) {
@@ -243,7 +328,7 @@
             throw new TypeError('Queue initialAcknowledged is invalid');
         }
         if (value.stateHash !== null
-            && (typeof value.stateHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.stateHash))) {
+            && !isValidHash(value.stateHash)) {
             throw new TypeError('Queue initialAcknowledged stateHash is invalid');
         }
 
@@ -254,20 +339,13 @@
     }
 
     function copyRecoveryHealth(value, expectedDomain) {
-        const requiredFields = [
-            'domain',
-            'status',
-            'auditComplete',
-            'code',
-            'maintenancePendingCount',
-            'detail'
-        ];
         if (!isQueueRecord(value)
-            || requiredFields.some(field => !Object.prototype.hasOwnProperty.call(value, field))
             || value.domain !== expectedDomain
-            || !['healthy', 'degraded', 'not-applicable'].includes(value.status)
+            || (value.status !== 'healthy'
+                && value.status !== 'degraded'
+                && value.status !== 'not-applicable')
             || typeof value.auditComplete !== 'boolean'
-            || !Number.isInteger(value.maintenancePendingCount)
+            || !intrinsicNumberIsSafeInteger(value.maintenancePendingCount)
             || value.maintenancePendingCount < 0
             || (value.detail !== null && typeof value.detail !== 'string')) {
             throw new TypeError(`Queue ${expectedDomain} recovery health is invalid`);
@@ -292,7 +370,7 @@
     }
 
     function validateDeadline(value, field) {
-        if (!Number.isFinite(value) || value <= 0) {
+        if (!intrinsicNumberIsFinite(value) || value <= 0) {
             throw new TypeError(`Queue ${field} deadline must be positive`);
         }
         return value;
@@ -310,7 +388,8 @@
         if (barrierDeadlineMs >= transportDeadlineMs) {
             throw new TypeError('Queue barrier deadline must be shorter than transport deadline');
         }
-        if (!['browser-local-committed', 'native-durable'].includes(values.expectedDurability)) {
+        if (values.expectedDurability !== 'browser-local-committed'
+            && values.expectedDurability !== 'native-durable') {
             throw new TypeError('Queue expectedDurability is invalid');
         }
         if (values.generationToken === undefined) {
@@ -375,7 +454,16 @@
     }
 
     function freezeTypedError(error, properties) {
-        Object.assign(error, properties);
+        const keys = intrinsicObjectKeys(properties);
+        for (let index = 0; index < keys.length; index += 1) {
+            const key = keys[index];
+            intrinsicObjectDefineProperty(error, key, {
+                value: intrinsicReflectGet(properties, key),
+                writable: true,
+                enumerable: true,
+                configurable: true
+            });
+        }
         return intrinsicObjectFreeze(error);
     }
 
@@ -435,13 +523,14 @@
     }
 
     function deferHaltedCapability(internals, promiseCapability) {
-        internals.pendingHaltedCapabilities.push(promiseCapability);
+        appendPrivateArrayItem(internals.pendingHaltedCapabilities, promiseCapability);
     }
 
     function rejectDeferredHaltedCapabilities(internals, terminalCause) {
-        const capabilities = internals.pendingHaltedCapabilities.splice(0);
-        for (const capability of capabilities) {
-            capability.reject(createHaltedError(terminalCause));
+        const capabilities = internals.pendingHaltedCapabilities;
+        internals.pendingHaltedCapabilities = [];
+        for (let index = 0; index < capabilities.length; index += 1) {
+            capabilities[index].reject(createHaltedError(terminalCause));
         }
     }
 
@@ -505,7 +594,7 @@
     function invokeTotalCallback(callback, argumentsList, callbackName) {
         let result;
         try {
-            result = callback(...argumentsList);
+            result = intrinsicReflectApply(callback, undefined, argumentsList);
         } catch (_error) {
             return { ok: false, callbackName };
         }
@@ -519,7 +608,7 @@
     function invokeTerminalCallback(callback, argumentsList) {
         let result;
         try {
-            result = callback(...argumentsList);
+            result = intrinsicReflectApply(callback, undefined, argumentsList);
         } catch (_error) {
             return;
         }
@@ -531,6 +620,10 @@
             ...queue.queueState,
             ...overrides
         });
+    }
+
+    function copyQueueState(queue) {
+        return canonicalDeepFrozenCopy(queue.queueState);
     }
 
     function itemLaneKind(item) {
@@ -547,8 +640,8 @@
     }
 
     function selectLaneState(queue, { drainedPrimaryStatus } = {}) {
-        const internals = saveQueueInternals.get(queue);
-        const nextItem = internals.items[0] || null;
+        const internals = getSaveQueueInternals(queue);
+        const nextItem = internals.items.length === 0 ? null : internals.items[0];
         const nextKind = itemLaneKind(nextItem);
         replaceQueueState(queue, {
             lanePhase: nextKind === 'snapshot'
@@ -569,13 +662,28 @@
     }
 
     function publishTerminalCallbacks(queue, terminalCause) {
-        const internals = saveQueueInternals.get(queue);
-        invokeTerminalCallback(internals.configuration.onTransition, [queue.getState()]);
+        const internals = getSaveQueueInternals(queue);
+        invokeTerminalCallback(internals.configuration.onTransition, [copyQueueState(queue)]);
         invokeTerminalCallback(internals.configuration.onFault, [terminalCause]);
     }
 
     function isValidHash(value) {
-        return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+        if (typeof value !== 'string' || value.length !== 64) return false;
+        for (let index = 0; index < value.length; index += 1) {
+            const code = intrinsicReflectApply(intrinsicStringCharCodeAt, value, [index]);
+            if (!((code >= 48 && code <= 57) || (code >= 97 && code <= 102))) return false;
+        }
+        return true;
+    }
+
+    function isStableTerminalReason(value) {
+        return value === 'save-not-committed'
+            || value === 'save-outcome-unknown'
+            || value === 'save-conflict'
+            || value === 'snapshot-outcome-unknown'
+            || value === 'snapshot-conflict'
+            || value === 'candidate-invalid'
+            || value === 'queue-callback-failed';
     }
 
     function clearActiveDeadline(internals, item) {
@@ -594,14 +702,14 @@
         if (receipt.ok !== true
             || receipt.protocolVersion !== 2
             || receipt.loadId !== request.sessionContext.loadId
-            || receipt.reason !== request.reason
+            || !isStableTerminalReason(receipt.reason)
             || receipt.gateState !== 'terminal-locked') {
             throw new TypeError('Terminalization receipt is invalid');
         }
     }
 
     function attemptTerminalization(queue, reason) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.configuration.expectedDurability !== 'native-durable'
             || internals.terminalizationStarted) {
             return;
@@ -675,8 +783,10 @@
             || error.code.length === 0
             || typeof error.message !== 'string'
             || error.message.length === 0
-            || !['not-committed', 'unknown'].includes(error.writeOutcome)
-            || ![false, 'source-changed', 'session-invalid'].includes(error.conflict)
+            || (error.writeOutcome !== 'not-committed' && error.writeOutcome !== 'unknown')
+            || (error.conflict !== false
+                && error.conflict !== 'source-changed'
+                && error.conflict !== 'session-invalid')
             || error.clientSaveId !== item.clientSaveId
             || error.payloadHash !== item.payloadHash
             || (error.sourceHashAfter !== null && !isValidHash(error.sourceHashAfter))
@@ -784,8 +894,10 @@
             || error.code.length === 0
             || typeof error.message !== 'string'
             || error.message.length === 0
-            || !['not-created', 'unknown'].includes(error.snapshotOutcome)
-            || ![false, 'source-changed', 'session-invalid'].includes(error.conflict)
+            || (error.snapshotOutcome !== 'not-created' && error.snapshotOutcome !== 'unknown')
+            || (error.conflict !== false
+                && error.conflict !== 'source-changed'
+                && error.conflict !== 'session-invalid')
             || error.clientSnapshotId !== item.clientSnapshotId
             || (error.sourceHashAfter !== null && !isValidHash(error.sourceHashAfter))
             || typeof error.sourceReverified !== 'boolean'
@@ -874,9 +986,9 @@
     }
 
     function continueAfterKnownNotCreated(queue, item, structured) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         const barrierError = createSnapshotError(internals, item, 'not-created', structured);
-        internals.items.shift();
+        removeFirstPrivateArrayItem(internals.items);
         internals.activeItem = null;
         internals.laneRevision += 1;
         const healthOverrides = structured.recoveryHealthEvidence
@@ -892,7 +1004,7 @@
         internals.fenceDepth += 1;
         const transitionResult = invokeTotalCallback(
             internals.configuration.onTransition,
-            [queue.getState()],
+            [copyQueueState(queue)],
             'onTransition'
         );
         internals.fenceDepth -= 1;
@@ -912,7 +1024,7 @@
     }
 
     function haltForSnapshotFailure(queue, item, adapterError, expectedHash) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.halted || internals.activeItem !== item) return;
         clearActiveDeadline(internals, item);
         if (internals.halted || internals.activeItem !== item) return;
@@ -937,8 +1049,10 @@
         internals.pendingTerminalCause = null;
         internals.activeItem = null;
         internals.laneRevision += 1;
-        const unsettledItems = internals.items.splice(0);
-        for (const pendingItem of unsettledItems) {
+        const unsettledItems = internals.items;
+        internals.items = [];
+        for (let index = 0; index < unsettledItems.length; index += 1) {
+            const pendingItem = unsettledItems[index];
             if (pendingItem === item) {
                 pendingItem.promiseCapability.reject(activeError);
                 continue;
@@ -974,7 +1088,7 @@
     }
 
     function haltForSaveFailure(queue, item, adapterError, expectedHash) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.halted || internals.activeItem !== item) return;
         clearActiveDeadline(internals, item);
         if (internals.halted || internals.activeItem !== item) return;
@@ -994,8 +1108,10 @@
         internals.pendingTerminalCause = null;
         internals.activeItem = null;
         internals.laneRevision += 1;
-        const unsettledItems = internals.items.splice(0);
-        for (const pendingItem of unsettledItems) {
+        const unsettledItems = internals.items;
+        internals.items = [];
+        for (let index = 0; index < unsettledItems.length; index += 1) {
+            const pendingItem = unsettledItems[index];
             if (pendingItem === item) {
                 pendingItem.promiseCapability.reject(activeError);
                 continue;
@@ -1033,7 +1149,7 @@
         triggeringItem = null,
         completedBarrierState = undefined
     ) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.halted) return;
 
         internals.halted = true;
@@ -1042,9 +1158,11 @@
         internals.pendingTerminalCause = null;
         internals.activeItem = null;
         internals.laneRevision += 1;
-        const unsettledItems = internals.items.splice(0);
+        const unsettledItems = internals.items;
+        internals.items = [];
         const causedByClientItemId = fault.completedClientItemId || fault.clientItemId;
-        for (const item of unsettledItems) {
+        for (let index = 0; index < unsettledItems.length; index += 1) {
+            const item = unsettledItems[index];
             if (item === triggeringItem) {
                 item.promiseCapability.reject(fault);
                 continue;
@@ -1086,19 +1204,19 @@
             RECOVERY_HEALTH_FIELDS,
             'saveReceipt.recoveryHealth'
         );
-        const validHash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-        const expectedByteCount = inspectDOMString(item.stateJson).bytes.byteLength;
+        const expectedByteCount = item.payloadByteCount;
 
         if (receipt.ok !== true
             || receipt.clientSaveId !== item.clientSaveId
             || receipt.payloadHash !== item.payloadHash
             || receipt.sourceHashBefore !== expectedHash
             || receipt.durability !== configuration.expectedDurability
-            || !validHash(receipt.stateHashAfter)
+            || !isValidHash(receipt.stateHashAfter)
             || receipt.stateHash !== receipt.stateHashAfter
-            || !Number.isInteger(receipt.byteCount)
+            || !intrinsicNumberIsSafeInteger(receipt.byteCount)
             || receipt.byteCount <= 0
-            || receipt.byteCount !== expectedByteCount
+            || (configuration.expectedDurability === 'browser-local-committed'
+                && receipt.byteCount !== expectedByteCount)
             || typeof receipt.updatedAt !== 'string'
             || receipt.updatedAt.length === 0
             || typeof receipt.storagePath !== 'string'
@@ -1153,11 +1271,11 @@
             || !isValidHash(receipt.sourceHash)
             || receipt.sourceHash !== expectedHash
             || receipt.snapshotHash !== receipt.sourceHash
-            || !Number.isSafeInteger(receipt.ordinal)
+            || !intrinsicNumberIsSafeInteger(receipt.ordinal)
             || receipt.ordinal < 0
-            || !['created', 'deduplicated'].includes(receipt.snapshotStatus)
+            || (receipt.snapshotStatus !== 'created' && receipt.snapshotStatus !== 'deduplicated')
             || receipt.durability !== 'native-durable'
-            || !Number.isSafeInteger(receipt.retainedCount)
+            || !intrinsicNumberIsSafeInteger(receipt.retainedCount)
             || receipt.retainedCount < 1
             || receipt.retainedCount > 24
             || recoveryHealth.status === 'not-applicable') {
@@ -1178,7 +1296,7 @@
     }
 
     function completePreparationMarker(queue, marker) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.halted || internals.activeItem !== null || internals.items[0] !== marker) return;
         const fault = createPreparationError(internals, marker.message);
         internals.halted = true;
@@ -1186,7 +1304,7 @@
         internals.terminalCause = fault;
         internals.pendingTerminalCause = null;
         internals.laneRevision += 1;
-        internals.items.shift();
+        removeFirstPrivateArrayItem(internals.items);
         replaceQueueState(queue, {
             lanePhase: 'halted',
             primaryStatus: 'failed-readonly',
@@ -1202,7 +1320,7 @@
     }
 
     function completeCallbackMarker(queue, marker) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.halted || internals.activeItem !== null || internals.items[0] !== marker) return;
         const fault = createCallbackFault(internals, {
             ...marker.faultDetails,
@@ -1212,7 +1330,7 @@
     }
 
     function dispatchNextLaneItem(queue) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.halted
             || internals.fenceDepth !== 0
             || internals.activeItem !== null
@@ -1287,7 +1405,7 @@
     }
 
     function dispatchSnapshot(queue, item) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         internals.activeItem = item;
         const request = intrinsicObjectFreeze({
             clientSnapshotId: item.clientSnapshotId,
@@ -1340,7 +1458,7 @@
     }
 
     function completeSnapshotReceipt(queue, item, expectedHash, adapterReceipt) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.halted || internals.activeItem !== item) return;
         clearActiveDeadline(internals, item);
         if (internals.halted || internals.activeItem !== item) return;
@@ -1353,7 +1471,7 @@
             return;
         }
 
-        internals.items.shift();
+        removeFirstPrivateArrayItem(internals.items);
         internals.activeItem = null;
         internals.laneRevision += 1;
         const barrierState = receipt.recoveryHealth.status === 'degraded'
@@ -1392,7 +1510,7 @@
         selectLaneState(queue);
         const transitionResult = invokeTotalCallback(
             internals.configuration.onTransition,
-            [queue.getState()],
+            [copyQueueState(queue)],
             'onTransition'
         );
         if (!transitionResult.ok) {
@@ -1413,7 +1531,7 @@
     }
 
     function completeSaveReceipt(queue, item, expectedHash, adapterReceipt) {
-        const internals = saveQueueInternals.get(queue);
+        const internals = getSaveQueueInternals(queue);
         if (internals.halted || internals.activeItem !== item) return;
         clearActiveDeadline(internals, item);
         if (internals.halted || internals.activeItem !== item) return;
@@ -1434,7 +1552,7 @@
         internals.lastAcknowledgedHash = receipt.stateHashAfter;
         internals.lastAcknowledgedStateJson = item.stateJson;
         internals.lastAcknowledgedReceipt = receipt;
-        internals.items.shift();
+        removeFirstPrivateArrayItem(internals.items);
         internals.activeItem = null;
         internals.laneRevision += 1;
         const healthOverrides = receipt.durability === 'native-durable'
@@ -1478,7 +1596,7 @@
         selectLaneState(queue, { drainedPrimaryStatus: receipt.durability });
         const transitionResult = invokeTotalCallback(
             internals.configuration.onTransition,
-            [queue.getState()],
+            [copyQueueState(queue)],
             'onTransition'
         );
         if (!transitionResult.ok) {
@@ -1503,7 +1621,7 @@
             const configuration = validateAndFreezeQueueOptions(options);
             this.queueConfiguration = configuration;
             this.queueState = createInitialQueueState(configuration);
-            saveQueueInternals.set(this, {
+            setSaveQueueInternals(this, {
                 configuration,
                 items: [],
                 activeItem: null,
@@ -1529,7 +1647,7 @@
 
         enqueue(descriptor) {
             const promiseCapability = createPromiseCapability();
-            const internals = saveQueueInternals.get(this);
+            const internals = getSaveQueueInternals(this);
             if (internals.halted) {
                 promiseCapability.reject(createHaltedError(internals.terminalCause));
                 return promiseCapability.promise;
@@ -1567,17 +1685,18 @@
                 clientSaveId: `${internals.configuration.sessionContext.loadId}:save:${internals.nextSaveOrdinal}`,
                 stateJson: values.stateJson,
                 payloadHash: evidence.rawHash,
+                payloadByteCount: stableTypedArrayByteLength(evidence.bytes),
                 reason: values.reason,
                 promiseCapability,
                 acceptedRevision: internals.nextAcceptedRevision
             });
-            internals.items.push(item);
+            appendPrivateArrayItem(internals.items, item);
             selectLaneState(this);
 
             internals.fenceDepth += 1;
             const transitionResult = invokeTotalCallback(
                 internals.configuration.onTransition,
-                [this.getState()],
+                [copyQueueState(this)],
                 'onTransition'
             );
             internals.fenceDepth -= 1;
@@ -1592,7 +1711,7 @@
                     attemptedStateJson: item.stateJson
                 });
                 const pendingFault = createCallbackFault(internals, faultDetails);
-                const itemIndex = internals.items.indexOf(item);
+                const itemIndex = findPrivateArrayItem(internals.items, item);
                 internals.items[itemIndex] = intrinsicObjectFreeze({
                     kind: 'callback-marker',
                     itemKind: 'save',
@@ -1625,7 +1744,7 @@
 
         runBarrier(descriptor) {
             const promiseCapability = createPromiseCapability();
-            const internals = saveQueueInternals.get(this);
+            const internals = getSaveQueueInternals(this);
             if (internals.halted) {
                 promiseCapability.reject(createHaltedError(internals.terminalCause));
                 return promiseCapability.promise;
@@ -1646,7 +1765,7 @@
                     || values.clientSnapshotId.length === 0) {
                     throw new TypeError('Snapshot descriptor clientSnapshotId must be non-empty');
                 }
-                if (!['manual', 'scheduled'].includes(values.reason)) {
+                if (values.reason !== 'manual' && values.reason !== 'scheduled') {
                     throw new TypeError('Snapshot descriptor reason is invalid');
                 }
             } catch (error) {
@@ -1664,13 +1783,13 @@
                 promiseCapability,
                 acceptedRevision: internals.nextAcceptedRevision
             });
-            internals.items.push(item);
+            appendPrivateArrayItem(internals.items, item);
             selectLaneState(this);
 
             internals.fenceDepth += 1;
             const transitionResult = invokeTotalCallback(
                 internals.configuration.onTransition,
-                [this.getState()],
+                [copyQueueState(this)],
                 'onTransition'
             );
             internals.fenceDepth -= 1;
@@ -1685,7 +1804,7 @@
                     attemptedStateJson: null
                 });
                 const pendingFault = createCallbackFault(internals, faultDetails);
-                const itemIndex = internals.items.indexOf(item);
+                const itemIndex = findPrivateArrayItem(internals.items, item);
                 internals.items[itemIndex] = intrinsicObjectFreeze({
                     kind: 'callback-marker',
                     itemKind: 'snapshot',
@@ -1715,7 +1834,7 @@
         failPreparation(error) {
             const promiseCapability = createPromiseCapability();
             observeRejectedPromise(promiseCapability.promise);
-            const internals = saveQueueInternals.get(this);
+            const internals = getSaveQueueInternals(this);
             if (internals.halted) {
                 promiseCapability.reject(createHaltedError(internals.terminalCause));
                 return promiseCapability.promise;
@@ -1761,7 +1880,7 @@
             });
             const provisionalFault = createPreparationError(internals, message);
             internals.pendingTerminalCause = provisionalFault;
-            internals.items.push(marker);
+            appendPrivateArrayItem(internals.items, marker);
             replaceQueueState(this, {
                 lanePhase: 'saving',
                 activeClientSaveId: internals.items[0].kind === 'save'
@@ -1796,7 +1915,7 @@
                 });
                 const pendingFault = createCallbackFault(internals, faultDetails);
                 internals.pendingTerminalCause = pendingFault;
-                const markerIndex = internals.items.indexOf(marker);
+                const markerIndex = findPrivateArrayItem(internals.items, marker);
                 internals.items[markerIndex] = intrinsicObjectFreeze({
                     kind: 'callback-marker',
                     itemKind: 'save',
@@ -1818,7 +1937,7 @@
         }
 
         getState() {
-            return canonicalDeepFrozenCopy(this.queueState);
+            return copyQueueState(this);
         }
     }
 
@@ -1826,47 +1945,48 @@
         return (value >>> amount) | (value << (32 - amount));
     }
 
+    function stableTypedArrayLength(value) {
+        return intrinsicReflectApply(intrinsicTypedArrayLengthGetter, value, []);
+    }
+
+    function stableTypedArrayByteLength(value) {
+        return intrinsicReflectApply(intrinsicTypedArrayByteLengthGetter, value, []);
+    }
+
     function sha256Hex(inputBytes) {
-        const bytes = inputBytes instanceof Uint8Array ? inputBytes : new Uint8Array(inputBytes);
-        const bitLength = bytes.length * 8;
-        const paddedLength = Math.ceil((bytes.length + 9) / 64) * 64;
-        const padded = new Uint8Array(paddedLength);
-        padded.set(bytes);
-        padded[bytes.length] = 0x80;
+        const bytes = inputBytes;
+        const byteLength = stableTypedArrayLength(bytes);
+        const bitLength = byteLength * 8;
+        const paddedLength = intrinsicMathCeil((byteLength + 9) / 64) * 64;
+        const padded = new IntrinsicUint8Array(paddedLength);
+        for (let index = 0; index < byteLength; index += 1) {
+            padded[index] = bytes[index];
+        }
+        padded[byteLength] = 0x80;
 
-        const highBits = Math.floor(bitLength / 0x100000000);
+        const highBits = (bitLength / 0x100000000) >>> 0;
         const lowBits = bitLength >>> 0;
-        const view = new DataView(padded.buffer);
-        view.setUint32(paddedLength - 8, highBits, false);
-        view.setUint32(paddedLength - 4, lowBits, false);
+        for (let index = 0; index < 4; index += 1) {
+            const shift = 24 - index * 8;
+            padded[paddedLength - 8 + index] = (highBits >>> shift) & 0xff;
+            padded[paddedLength - 4 + index] = (lowBits >>> shift) & 0xff;
+        }
 
-        const constants = new Uint32Array([
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-            0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-            0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-            0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-            0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-        ]);
-        const state = new Uint32Array([
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-        ]);
-        const words = new Uint32Array(64);
+        const state = new IntrinsicUint32Array(8);
+        for (let index = 0; index < SHA256_INITIAL_STATE.length; index += 1) {
+            state[index] = SHA256_INITIAL_STATE[index];
+        }
+        const words = new IntrinsicUint32Array(64);
 
-        for (let offset = 0; offset < padded.length; offset += 64) {
+        for (let offset = 0; offset < paddedLength; offset += 64) {
             for (let index = 0; index < 16; index += 1) {
-                words[index] = view.getUint32(offset + index * 4, false);
+                const wordOffset = offset + index * 4;
+                words[index] = (
+                    (padded[wordOffset] << 24)
+                    | (padded[wordOffset + 1] << 16)
+                    | (padded[wordOffset + 2] << 8)
+                    | padded[wordOffset + 3]
+                ) >>> 0;
             }
             for (let index = 16; index < 64; index += 1) {
                 const word15 = words[index - 15];
@@ -1888,7 +2008,7 @@
             for (let index = 0; index < 64; index += 1) {
                 const sum1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
                 const choose = (e & f) ^ (~e & g);
-                const temp1 = (h + sum1 + choose + constants[index] + words[index]) >>> 0;
+                const temp1 = (h + sum1 + choose + SHA256_CONSTANTS[index] + words[index]) >>> 0;
                 const sum0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
                 const majority = (a & b) ^ (a & c) ^ (b & c);
                 const temp2 = (sum0 + majority) >>> 0;
@@ -1912,14 +2032,26 @@
             state[7] = (state[7] + h) >>> 0;
         }
 
-        return Array.from(state, word => word.toString(16).padStart(8, '0')).join('');
+        const hex = '0123456789abcdef';
+        let output = '';
+        for (let index = 0; index < SHA256_INITIAL_STATE.length; index += 1) {
+            const word = state[index];
+            for (let shift = 28; shift >= 0; shift -= 4) {
+                output += hex[(word >>> shift) & 0x0f];
+            }
+        }
+        return output;
+    }
+
+    function stableCharCodeAt(text, index) {
+        return intrinsicReflectApply(intrinsicStringCharCodeAt, text, [index]);
     }
 
     function hasUnpairedSurrogate(text) {
         for (let index = 0; index < text.length; index += 1) {
-            const codeUnit = text.charCodeAt(index);
+            const codeUnit = stableCharCodeAt(text, index);
             if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-                const next = text.charCodeAt(index + 1);
+                const next = stableCharCodeAt(text, index + 1);
                 if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
                 index += 1;
             } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
@@ -1930,31 +2062,45 @@
     }
 
     function encodeUTF8(text) {
-        const bytes = [];
-        for (const symbol of text) {
-            const point = symbol.codePointAt(0);
+        const scratch = new IntrinsicUint8Array(text.length * 3);
+        let offset = 0;
+        for (let index = 0; index < text.length; index += 1) {
+            const codeUnit = stableCharCodeAt(text, index);
+            let point = codeUnit;
+            if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+                const next = stableCharCodeAt(text, index + 1);
+                point = 0x10000 + ((codeUnit - 0xd800) << 10) + (next - 0xdc00);
+                index += 1;
+            }
             if (point <= 0x7f) {
-                bytes.push(point);
+                scratch[offset] = point;
+                offset += 1;
             } else if (point <= 0x7ff) {
-                bytes.push(0xc0 | (point >>> 6), 0x80 | (point & 0x3f));
+                scratch[offset] = 0xc0 | (point >>> 6);
+                scratch[offset + 1] = 0x80 | (point & 0x3f);
+                offset += 2;
             } else if (point <= 0xffff) {
-                bytes.push(0xe0 | (point >>> 12), 0x80 | ((point >>> 6) & 0x3f), 0x80 | (point & 0x3f));
+                scratch[offset] = 0xe0 | (point >>> 12);
+                scratch[offset + 1] = 0x80 | ((point >>> 6) & 0x3f);
+                scratch[offset + 2] = 0x80 | (point & 0x3f);
+                offset += 3;
             } else {
-                bytes.push(
-                    0xf0 | (point >>> 18),
-                    0x80 | ((point >>> 12) & 0x3f),
-                    0x80 | ((point >>> 6) & 0x3f),
-                    0x80 | (point & 0x3f)
-                );
+                scratch[offset] = 0xf0 | (point >>> 18);
+                scratch[offset + 1] = 0x80 | ((point >>> 12) & 0x3f);
+                scratch[offset + 2] = 0x80 | ((point >>> 6) & 0x3f);
+                scratch[offset + 3] = 0x80 | (point & 0x3f);
+                offset += 4;
             }
         }
-        return new Uint8Array(bytes);
+        const bytes = new IntrinsicUint8Array(offset);
+        for (let index = 0; index < offset; index += 1) bytes[index] = scratch[index];
+        return bytes;
     }
 
     function encodeUTF16LECodeUnits(text) {
-        const bytes = new Uint8Array(text.length * 2);
+        const bytes = new IntrinsicUint8Array(text.length * 2);
         for (let index = 0; index < text.length; index += 1) {
-            const codeUnit = text.charCodeAt(index);
+            const codeUnit = stableCharCodeAt(text, index);
             bytes[index * 2] = codeUnit & 0xff;
             bytes[index * 2 + 1] = codeUnit >>> 8;
         }
@@ -1962,7 +2108,7 @@
     }
 
     function inspectDOMString(value) {
-        const text = String(value);
+        const text = intrinsicString(value);
         const losslessUTF16 = hasUnpairedSurrogate(text);
         const bytes = losslessUTF16 ? encodeUTF16LECodeUnits(text) : encodeUTF8(text);
         return intrinsicObjectFreeze({

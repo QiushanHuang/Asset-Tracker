@@ -70,7 +70,7 @@ function nativeReceipt(item, sourceHashBefore, stateHashAfter, overrides = {}) {
         sourceHashBefore,
         stateHashAfter,
         stateHash: stateHashAfter,
-        byteCount: new TextEncoder().encode(item.stateJson).byteLength,
+        byteCount: new TextEncoder().encode(item.stateJson).byteLength + 200,
         durability: 'native-durable',
         updatedAt: '2026-08-10T00:00:00.000Z',
         storagePath: '/tmp/AssetTrackerBook.json',
@@ -357,6 +357,442 @@ test('constructor boundary exports the five typed queue error classes', () => {
     });
 
     assert.equal(new Set(errorTypes).size, errorTypes.length, 'error types are pairwise distinct');
+});
+
+test('queue constructor validation cannot be forged by option getters poisoning live intrinsics', async (t) => {
+    const variants = [
+        ['initial hash via RegExp.test', {
+            overrides: {
+                initialAcknowledged: { stateJson: '{"memo":"H0"}', stateHash: 'not-a-hash' }
+            },
+            poison() {
+                RegExp.prototype.test = () => true;
+            },
+            restore(native) {
+                RegExp.prototype.test = native.regExpTest;
+            }
+        }],
+        ['durability via Array.includes', {
+            overrides: { expectedDurability: 'forged-durability' },
+            poison() {
+                Array.prototype.includes = () => true;
+            },
+            restore(native) {
+                Array.prototype.includes = native.arrayIncludes;
+            }
+        }],
+        ['fractional health via Number.isInteger', {
+            overrides: {
+                initialRecoveryHealth: {
+                    ordinary: health('ordinary', 'degraded', { maintenancePendingCount: 0.5 }),
+                    snapshot: health('snapshot')
+                }
+            },
+            poison() {
+                Number.isInteger = () => true;
+            },
+            restore(native) {
+                Number.isInteger = native.numberIsInteger;
+            }
+        }],
+        ['NaN deadline via Number.isFinite', {
+            overrides: { durabilityDeadlineMs: Number.NaN },
+            poison() {
+                Number.isFinite = () => true;
+            },
+            restore(native) {
+                Number.isFinite = native.numberIsFinite;
+            }
+        }]
+    ];
+
+    for (const [label, variant] of variants) {
+        await t.test(label, () => {
+            const native = {
+                regExpTest: RegExp.prototype.test,
+                arrayIncludes: Array.prototype.includes,
+                numberIsInteger: Number.isInteger,
+                numberIsFinite: Number.isFinite
+            };
+            const values = makeOptions(variant.overrides);
+            let poisoned = false;
+            const source = new Proxy(values, {
+                get(target, key, receiver) {
+                    if (!poisoned && key === 'write') {
+                        poisoned = true;
+                        variant.poison();
+                    }
+                    return Reflect.get(target, key, receiver);
+                }
+            });
+            try {
+                assert.throws(
+                    () => new LegacySafety.AssetTrackerSaveQueue(source),
+                    TypeError
+                );
+            } finally {
+                variant.restore(native);
+            }
+        });
+    }
+});
+
+test('queue internals use load-time WeakMap dispatch after constructor and receipt getters', async (t) => {
+    await t.test('constructor getter cannot redirect the private WeakMap set', () => {
+        const nativeSet = WeakMap.prototype.set;
+        let poisonedCalls = 0;
+        const options = makeOptions();
+        const write = options.write;
+        Object.defineProperty(options, 'write', {
+            enumerable: true,
+            configurable: true,
+            get() {
+                WeakMap.prototype.set = function poisonedSet(key, value) {
+                    if (key instanceof LegacySafety.AssetTrackerSaveQueue) poisonedCalls += 1;
+                    return Reflect.apply(nativeSet, this, [key, value]);
+                };
+                return write;
+            }
+        });
+
+        let queue;
+        try {
+            queue = new LegacySafety.AssetTrackerSaveQueue(options);
+        } finally {
+            WeakMap.prototype.set = nativeSet;
+        }
+
+        assert.equal(poisonedCalls, 0);
+        assert.equal(queue.getState().lastAcknowledgedHash, H0);
+    });
+
+    await t.test('receipt getter cannot redirect later private WeakMap gets', async () => {
+        const nativeGet = WeakMap.prototype.get;
+        let poisonedCalls = 0;
+        let poisoned = false;
+        let queue;
+        queue = makeQueue({
+            write: request => {
+                const values = { ...nativeReceipt(request, request.expectedHash, H1) };
+                return new Proxy(values, {
+                    get(target, key, receiver) {
+                        if (key === 'then') return undefined;
+                        if (!poisoned && key === 'ok') {
+                            poisoned = true;
+                            WeakMap.prototype.get = function poisonedGet(candidate) {
+                                if (candidate === queue) poisonedCalls += 1;
+                                return Reflect.apply(nativeGet, this, [candidate]);
+                            };
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+            }
+        });
+
+        let receipt;
+        try {
+            receipt = await queue.enqueue({
+                stateJson: '{"memo":"captured weak map"}',
+                reason: 'captured-weak-map'
+            });
+        } finally {
+            WeakMap.prototype.get = nativeGet;
+        }
+
+        assert.equal(poisonedCalls, 0);
+        assert.equal(receipt.stateHashAfter, H1);
+        assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    });
+});
+
+test('queue internals never dynamically dispatch the public getState method', async (t) => {
+    const prototype = LegacySafety.AssetTrackerSaveQueue.prototype;
+    const nativeGetState = Object.getOwnPropertyDescriptor(prototype, 'getState');
+
+    await t.test('descriptor getter cannot strand an accepted item before dispatch', async () => {
+        const calls = [];
+        const queue = makeQueue({
+            write: request => {
+                calls.push(request);
+                return nativeReceipt(request, request.expectedHash, H1);
+            }
+        });
+        const descriptor = {};
+        Object.defineProperty(descriptor, 'stateJson', {
+            get() {
+                Object.defineProperty(prototype, 'getState', {
+                    configurable: true,
+                    value() { throw new Error('poisoned public getState'); }
+                });
+                return '{"memo":"getState descriptor"}';
+            }
+        });
+        Object.defineProperty(descriptor, 'reason', {
+            get() { return 'getState-descriptor'; }
+        });
+
+        let savePromise;
+        try {
+            assert.doesNotThrow(() => {
+                savePromise = queue.enqueue(descriptor);
+            });
+        } finally {
+            Object.defineProperty(prototype, 'getState', nativeGetState);
+        }
+
+        const receipt = await savePromise;
+        assert.equal(receipt.stateHashAfter, H1);
+        assert.equal(calls.length, 1);
+        assert.equal(queue.getState().pendingCount, 0);
+    });
+
+    await t.test('receipt getter cannot redirect completion transition state reads', async () => {
+        let poisonedCalls = 0;
+        let poisoned = false;
+        const calls = [];
+        const queue = makeQueue({
+            write: request => {
+                calls.push(request);
+                const values = { ...nativeReceipt(request, request.expectedHash, H1) };
+                return new Proxy(values, {
+                    get(target, key, receiver) {
+                        if (key === 'then') return undefined;
+                        if (!poisoned && key === 'ok') {
+                            poisoned = true;
+                            Object.defineProperty(prototype, 'getState', {
+                                configurable: true,
+                                value() {
+                                    poisonedCalls += 1;
+                                    return Reflect.apply(nativeGetState.value, this, []);
+                                }
+                            });
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+            }
+        });
+
+        let receipt;
+        try {
+            receipt = await queue.enqueue({
+                stateJson: '{"memo":"getState receipt"}',
+                reason: 'getState-receipt'
+            });
+        } finally {
+            Object.defineProperty(prototype, 'getState', nativeGetState);
+        }
+
+        assert.equal(poisonedCalls, 0);
+        assert.equal(receipt.stateHashAfter, H1);
+        assert.equal(calls.length, 1);
+    });
+});
+
+test('descriptor side effects cannot change exact UTF-8 payload hash or byte count evidence', async () => {
+    const nativeIterator = String.prototype[Symbol.iterator];
+    const stateJson = '{"memo":"中💰 exact evidence"}';
+    const oracleHash = createHash('sha256').update(stateJson, 'utf8').digest('hex');
+    const oracleByteCount = new TextEncoder().encode(stateJson).byteLength;
+    const calls = [];
+    const queue = makeQueue({
+        expectedDurability: 'browser-local-committed',
+        write: request => {
+            calls.push(request);
+            return browserReceipt(request, request.expectedHash, H1, {
+                byteCount: oracleByteCount
+            });
+        }
+    });
+    const descriptor = {};
+    Object.defineProperty(descriptor, 'stateJson', {
+        get() {
+            String.prototype[Symbol.iterator] = function* poisonedStringIterator() {
+                yield 'x';
+            };
+            return stateJson;
+        }
+    });
+    Object.defineProperty(descriptor, 'reason', {
+        get() { return 'exact-evidence'; }
+    });
+
+    let savePromise;
+    try {
+        savePromise = queue.enqueue(descriptor);
+    } finally {
+        String.prototype[Symbol.iterator] = nativeIterator;
+    }
+    const receipt = await savePromise;
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].stateJson, stateJson);
+    assert.equal(calls[0].payloadHash, oracleHash);
+    assert.equal(receipt.payloadHash, oracleHash);
+    assert.equal(receipt.byteCount, oracleByteCount);
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+});
+
+test('receipt getter Array iterator poison cannot alter callback fence arguments', async () => {
+    const nativeIterator = Array.prototype[Symbol.iterator];
+    let poisoned = false;
+    let transitionCount = 0;
+    let acceptedState = null;
+    let completedState = null;
+    let acknowledgedReceipt = null;
+    let faultCount = 0;
+    const queue = makeQueue({
+        write: request => {
+            const values = { ...nativeReceipt(request, request.expectedHash, H1) };
+            return new Proxy(values, {
+                get(target, key, receiver) {
+                    if (key === 'then') return undefined;
+                    if (!poisoned && key === 'ok') {
+                        poisoned = true;
+                        Array.prototype[Symbol.iterator] = function* emptyIterator() {};
+                    }
+                    return Reflect.get(target, key, receiver);
+                }
+            });
+        },
+        onTransition: state => {
+            transitionCount += 1;
+            if (transitionCount === 1) acceptedState = state;
+            if (transitionCount === 2) completedState = state;
+            return undefined;
+        },
+        onAcknowledged: receipt => {
+            acknowledgedReceipt = receipt;
+            return undefined;
+        },
+        onFault: () => {
+            faultCount += 1;
+            return undefined;
+        }
+    });
+
+    let receipt;
+    try {
+        receipt = await queue.enqueue({
+            stateJson: '{"memo":"callback iterator"}',
+            reason: 'callback-iterator'
+        });
+    } finally {
+        Array.prototype[Symbol.iterator] = nativeIterator;
+    }
+
+    assert.equal(Object.isFrozen(acceptedState), true);
+    assert.equal(acceptedState.activeClientSaveId, receipt.clientSaveId);
+    assert.equal(Object.isFrozen(acknowledgedReceipt), true);
+    assert.equal(acknowledgedReceipt.stateHashAfter, H1);
+    assert.equal(Object.isFrozen(completedState), true);
+    assert.equal(completedState.lastAcknowledgedHash, H1);
+    assert.equal(faultCount, 0);
+    assert.equal(queue.getState().halted, false);
+    assert.equal(queue.getState().lanePhase, 'idle');
+});
+
+test('final receipt cannot make an inherited numeric ghost look like a pending lane item', async () => {
+    const nativeZero = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+    let poisoned = false;
+    const calls = [];
+    const queue = makeQueue({
+        write: request => {
+            calls.push(request);
+            const values = { ...nativeReceipt(request, request.expectedHash, H1) };
+            return new Proxy(values, {
+                get(target, key, receiver) {
+                    if (key === 'then') return undefined;
+                    if (!poisoned && key === 'ok') {
+                        poisoned = true;
+                        Object.defineProperty(Array.prototype, '0', {
+                            configurable: true,
+                            writable: true,
+                            value: Object.freeze({
+                                kind: 'save',
+                                clientSaveId: 'ghost-save'
+                            })
+                        });
+                    }
+                    return Reflect.get(target, key, receiver);
+                }
+            });
+        }
+    });
+
+    let receipt;
+    try {
+        receipt = await queue.enqueue({
+            stateJson: '{"memo":"no inherited ghost"}',
+            reason: 'no-inherited-ghost'
+        });
+    } finally {
+        if (nativeZero) {
+            Object.defineProperty(Array.prototype, '0', nativeZero);
+        } else {
+            delete Array.prototype[0];
+        }
+    }
+
+    const state = queue.getState();
+    assert.equal(receipt.stateHashAfter, H1);
+    assert.equal(calls.length, 1);
+    assert.equal(state.pendingCount, 0);
+    assert.equal(state.lanePhase, 'idle');
+    assert.equal(state.activeClientSaveId, null);
+    assert.equal(state.activeClientSnapshotId, null);
+});
+
+test('descriptor cannot change payload evidence through TypedArray length accessors', async () => {
+    const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+    const nativeLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'length');
+    const nativeByteLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, 'byteLength');
+    const stateJson = '{"memo":"typed array 中💰 evidence"}';
+    const oracleHash = createHash('sha256').update(stateJson, 'utf8').digest('hex');
+    const oracleByteCount = new TextEncoder().encode(stateJson).byteLength;
+    const calls = [];
+    const queue = makeQueue({
+        expectedDurability: 'browser-local-committed',
+        write: request => {
+            calls.push(request);
+            return browserReceipt(request, request.expectedHash, H1, {
+                byteCount: oracleByteCount
+            });
+        }
+    });
+    const descriptor = {};
+    Object.defineProperty(descriptor, 'stateJson', {
+        get() {
+            Object.defineProperty(typedArrayPrototype, 'length', {
+                configurable: true,
+                get() { return 0; }
+            });
+            Object.defineProperty(typedArrayPrototype, 'byteLength', {
+                configurable: true,
+                get() { return 0; }
+            });
+            return stateJson;
+        }
+    });
+    Object.defineProperty(descriptor, 'reason', {
+        get() { return 'typed-array-evidence'; }
+    });
+
+    let savePromise;
+    try {
+        savePromise = queue.enqueue(descriptor);
+    } finally {
+        Object.defineProperty(typedArrayPrototype, 'length', nativeLength);
+        Object.defineProperty(typedArrayPrototype, 'byteLength', nativeByteLength);
+    }
+    const receipt = await savePromise;
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].payloadHash, oracleHash);
+    assert.equal(receipt.payloadHash, oracleHash);
+    assert.equal(receipt.byteCount, oracleByteCount);
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
 });
 
 test('constructor rejects non-positive or save/barrier deadlines >= transport deadline', () => {
@@ -1948,7 +2384,6 @@ test('receipt verification rejects wrong identity, hashes, durability, byte coun
         ['durability', (_item, receipt) => ({ ...receipt, durability: 'browser-local-committed' })],
         ['state hash alias', (_item, receipt) => ({ ...receipt, stateHash: H2 })],
         ['state hash shape', (_item, receipt) => ({ ...receipt, stateHashAfter: 'bad', stateHash: 'bad' })],
-        ['byteCount', (_item, receipt) => ({ ...receipt, byteCount: receipt.byteCount + 1 })],
         ['updatedAt metadata', (_item, receipt) => ({ ...receipt, updatedAt: null })],
         ['storagePath metadata', (_item, receipt) => ({ ...receipt, storagePath: '' })],
         ['recovery health domain', (_item, receipt) => ({
@@ -1983,6 +2418,88 @@ test('receipt verification rejects wrong identity, hashes, durability, byte coun
             assert.equal(queue.getState().halted, true);
             assert.equal(writeCalls.length, 1);
         });
+    }
+});
+
+test('save receipt byteCount distinguishes native envelope bytes from exact browser payload bytes', async (t) => {
+    await t.test('native envelope count advances the ledger', async () => {
+        const writes = [];
+        const queue = makeQueue({
+            write: request => {
+                writes.push(request);
+                return Promise.resolve(nativeReceipt(request, request.expectedHash, H1));
+            }
+        });
+        const stateJson = '{"memo":"秋山-非 ASCII"}';
+        const payloadBytes = new TextEncoder().encode(stateJson).byteLength;
+        const receipt = await queue.enqueue({ stateJson, reason: 'native-envelope-byte-count' });
+
+        assert.notEqual(writes[0].payloadHash, H1);
+        assert.equal(receipt.stateHashAfter, H1);
+        assert.equal(receipt.byteCount, payloadBytes + 200);
+        assert.equal(queue.getState().lastAcknowledgedHash, H1);
+        assert.equal(Object.isFrozen(receipt), true);
+    });
+
+    await t.test('browser count must equal exact UTF-8 payload bytes', async () => {
+        const writes = [];
+        const notApplicable = health('ordinary', 'not-applicable');
+        const queue = makeQueue({
+            expectedDurability: 'browser-local-committed',
+            initialRecoveryHealth: {
+                ordinary: notApplicable,
+                snapshot: health('snapshot', 'not-applicable')
+            },
+            write: request => {
+                writes.push(request);
+                return Promise.resolve(browserReceipt(request, request.expectedHash, H1, {
+                    byteCount: new TextEncoder().encode(request.stateJson).byteLength + 1
+                }));
+            }
+        });
+        const error = await queue.enqueue({
+            stateJson: '{"memo":"浏览器"}',
+            reason: 'browser-wrong-byte-count'
+        }).then(() => null, value => value);
+
+        assert.equal(error.queueOutcome, 'durability-unknown');
+        assert.equal(queue.getState().lastAcknowledgedHash, H0);
+        assert.equal(writes.length, 1);
+    });
+});
+
+test('save receipt byteCount must be a positive safe integer for both durability domains', async (t) => {
+    for (const durability of ['native-durable', 'browser-local-committed']) {
+        for (const byteCount of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+            await t.test(`${durability} ${byteCount}`, async () => {
+                const writes = [];
+                const isBrowser = durability === 'browser-local-committed';
+                const queue = makeQueue({
+                    ...(isBrowser ? {
+                        expectedDurability: durability,
+                        initialRecoveryHealth: {
+                            ordinary: health('ordinary', 'not-applicable'),
+                            snapshot: health('snapshot', 'not-applicable')
+                        }
+                    } : {}),
+                    write: request => {
+                        writes.push(request);
+                        const receipt = isBrowser
+                            ? browserReceipt(request, request.expectedHash, H1, { byteCount })
+                            : nativeReceipt(request, request.expectedHash, H1, { byteCount });
+                        return Promise.resolve(receipt);
+                    }
+                });
+                const error = await queue.enqueue({
+                    stateJson: '{"memo":"invalid byte count"}',
+                    reason: `${durability}-${byteCount}`
+                }).then(() => null, value => value);
+
+                assert.equal(error.queueOutcome, 'durability-unknown');
+                assert.equal(queue.getState().lastAcknowledgedHash, H0);
+                assert.equal(writes.length, 1);
+            });
+        }
     }
 });
 
@@ -2065,6 +2582,555 @@ test('receipt extraction reads every top-level and nested getter once through a 
     const canonical = await alternatingPromise;
     assert.equal(canonical.clientSaveId, alternatingItem.clientSaveId);
     assert.equal(canonical.recoveryHealth.code, null);
+});
+
+test('queue save and snapshot receipts resist getter poisoning of protected validators', async (t) => {
+    await t.test('save hash RegExp.test', async () => {
+        const nativeTest = RegExp.prototype.test;
+        const calls = [];
+        let poisoned = false;
+        const queue = makeQueue({
+            write: request => {
+                calls.push(request);
+                const values = {
+                    ...nativeReceipt(request, request.expectedHash, H1),
+                    stateHashAfter: 'not-a-hash',
+                    stateHash: 'not-a-hash'
+                };
+                return new Proxy(values, {
+                    get(target, key, receiver) {
+                        if (key === 'then') return undefined;
+                        if (!poisoned && key === 'ok') {
+                            poisoned = true;
+                            RegExp.prototype.test = () => true;
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+            }
+        });
+        let error;
+        try {
+            error = await queue.enqueue({ stateJson: '{"memo":"poison-save-hash"}', reason: 'poison' })
+                .then(() => null, value => value);
+        } finally {
+            RegExp.prototype.test = nativeTest;
+        }
+        assert.equal(error?.queueOutcome, 'durability-unknown');
+        assert.equal(queue.getState().lastAcknowledgedHash, H0);
+        assert.equal(calls.length, 1);
+    });
+
+    await t.test('save hash RegExp.exec', async () => {
+        const nativeExec = RegExp.prototype.exec;
+        let poisoned = false;
+        const queue = makeQueue({
+            write: request => {
+                const values = {
+                    ...nativeReceipt(request, request.expectedHash, H1),
+                    stateHashAfter: 'x',
+                    stateHash: 'x'
+                };
+                return new Proxy(values, {
+                    get(target, key, receiver) {
+                        if (key === 'then') return undefined;
+                        if (!poisoned && key === 'ok') {
+                            poisoned = true;
+                            RegExp.prototype.exec = () => ({
+                                0: 'fake-match',
+                                index: 0,
+                                input: 'x'
+                            });
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+            }
+        });
+        let error;
+        try {
+            error = await queue.enqueue({ stateJson: '{"memo":"poison-save-exec"}', reason: 'poison' })
+                .then(() => null, value => value);
+        } finally {
+            RegExp.prototype.exec = nativeExec;
+        }
+        assert.equal(error?.queueOutcome, 'durability-unknown');
+        assert.equal(queue.getState().lastAcknowledgedHash, H0);
+    });
+
+    await t.test('save health Number.isInteger', async () => {
+        const nativeIsInteger = Number.isInteger;
+        let poisoned = false;
+        const queue = makeQueue({
+            write: request => {
+                const healthValues = health('ordinary', 'degraded', {
+                    maintenancePendingCount: 0.5
+                });
+                const recoveryHealth = new Proxy(healthValues, {
+                    get(target, key, receiver) {
+                        if (!poisoned && key === 'domain') {
+                            poisoned = true;
+                            Number.isInteger = () => true;
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+                return { ...nativeReceipt(request, request.expectedHash, H1), recoveryHealth };
+            }
+        });
+        let error;
+        try {
+            error = await queue.enqueue({ stateJson: '{"memo":"poison-save-health"}', reason: 'poison' })
+                .then(() => null, value => value);
+        } finally {
+            Number.isInteger = nativeIsInteger;
+        }
+        assert.equal(error?.queueOutcome, 'durability-unknown');
+        assert.equal(queue.getState().lastAcknowledgedHash, H0);
+    });
+
+    await t.test('snapshot status Array.includes', async () => {
+        const nativeIncludes = Array.prototype.includes;
+        let poisoned = false;
+        const queue = makeQueue({
+            snapshot: request => {
+                const values = {
+                    ...snapshotReceipt(request),
+                    snapshotStatus: 'forged-status'
+                };
+                return new Proxy(values, {
+                    get(target, key, receiver) {
+                        if (key === 'then') return undefined;
+                        if (!poisoned && key === 'ok') {
+                            poisoned = true;
+                            Array.prototype.includes = () => true;
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+            }
+        });
+        let error;
+        try {
+            error = await queue.runBarrier({ clientSnapshotId: 'poison-snapshot-status', reason: 'manual' })
+                .then(() => null, value => value);
+        } finally {
+            Array.prototype.includes = nativeIncludes;
+        }
+        assert.equal(error?.queueOutcome, 'snapshot-outcome-unknown');
+        assert.equal(queue.getState().barrierState, 'outcome-unknown');
+    });
+
+    await t.test('snapshot health Array.includes', async () => {
+        const nativeIncludes = Array.prototype.includes;
+        let poisoned = false;
+        const queue = makeQueue({
+            snapshot: request => {
+                const healthValues = health('snapshot', 'healthy', { status: 'forged-health' });
+                const recoveryHealth = new Proxy(healthValues, {
+                    get(target, key, receiver) {
+                        if (!poisoned && key === 'domain') {
+                            poisoned = true;
+                            Array.prototype.includes = () => true;
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+                return { ...snapshotReceipt(request), recoveryHealth };
+            }
+        });
+        let error;
+        try {
+            error = await queue.runBarrier({ clientSnapshotId: 'poison-snapshot-health', reason: 'manual' })
+                .then(() => null, value => value);
+        } finally {
+            Array.prototype.includes = nativeIncludes;
+        }
+        assert.equal(error?.queueOutcome, 'snapshot-outcome-unknown');
+        assert.equal(queue.getState().barrierState, 'outcome-unknown');
+    });
+});
+
+test('save receipt getters cannot poison lane removal or recompute Web payload bytes', async (t) => {
+    await t.test('acknowledged save is removed exactly once with captured array structure', async () => {
+        const nativeShift = Array.prototype.shift;
+        const clock = manualClock();
+        const calls = [];
+        const never = deferred();
+        let poisoned = false;
+        const queue = makeQueue({
+            clock: clock.clock,
+            write: request => {
+                calls.push(request);
+                if (calls.length > 1) return never.promise;
+                const values = { ...nativeReceipt(request, request.expectedHash, H1) };
+                return new Proxy(values, {
+                    get(target, key, receiver) {
+                        if (key === 'then') return undefined;
+                        if (!poisoned && key === 'ok') {
+                            poisoned = true;
+                            Array.prototype.shift = () => undefined;
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+            }
+        });
+
+        let receipt;
+        try {
+            receipt = await queue.enqueue({
+                stateJson: '{"memo":"captured shift"}',
+                reason: 'captured-shift'
+            });
+        } finally {
+            Array.prototype.shift = nativeShift;
+        }
+
+        assert.equal(receipt.stateHashAfter, H1);
+        assert.equal(calls.length, 1, 'an acknowledged item must never auto-dispatch again');
+        assert.equal(queue.getState().pendingCount, 0);
+        assert.equal(queue.getState().lanePhase, 'idle');
+        assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    });
+
+    await t.test('browser byte count uses acceptance-time evidence after String iterator poison', async () => {
+        const nativeIterator = String.prototype[Symbol.iterator];
+        let poisoned = false;
+        const calls = [];
+        const queue = makeQueue({
+            expectedDurability: 'browser-local-committed',
+            write: request => {
+                calls.push(request);
+                const values = {
+                    ...browserReceipt(request, request.expectedHash, H1),
+                    byteCount: 1
+                };
+                return new Proxy(values, {
+                    get(target, key, receiver) {
+                        if (key === 'then') return undefined;
+                        if (!poisoned && key === 'ok') {
+                            poisoned = true;
+                            String.prototype[Symbol.iterator] = function* poisonedIterator() {
+                                yield 'x';
+                            };
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+            }
+        });
+
+        let error;
+        try {
+            error = await queue.enqueue({
+                stateJson: '{"memo":"中 payload bytes"}',
+                reason: 'captured-byte-count'
+            }).then(() => null, value => value);
+        } finally {
+            String.prototype[Symbol.iterator] = nativeIterator;
+        }
+
+        assert.equal(error?.queueOutcome, 'durability-unknown');
+        assert.equal(queue.getState().lastAcknowledgedHash, H0);
+        assert.equal(calls.length, 1);
+    });
+});
+
+test('inherited numeric array setters cannot swallow accepted private lane items', async (t) => {
+    await t.test('descriptor getter still dispatches the first accepted item exactly once', async () => {
+        const nativeZero = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+        const calls = [];
+        const queue = makeQueue({
+            write: request => {
+                calls.push(request);
+                return nativeReceipt(request, request.expectedHash, H1);
+            }
+        });
+        const descriptor = {};
+        Object.defineProperty(descriptor, 'stateJson', {
+            enumerable: true,
+            get() {
+                Object.defineProperty(Array.prototype, '0', {
+                    configurable: true,
+                    set() {}
+                });
+                return '{"memo":"numeric descriptor poison"}';
+            }
+        });
+        Object.defineProperty(descriptor, 'reason', {
+            enumerable: true,
+            get() { return 'numeric-descriptor-poison'; }
+        });
+
+        let settled = false;
+        let receipt = null;
+        try {
+            queue.enqueue(descriptor).then(value => {
+                settled = true;
+                receipt = value;
+            });
+        } finally {
+            if (nativeZero) {
+                Object.defineProperty(Array.prototype, '0', nativeZero);
+            } else {
+                delete Array.prototype[0];
+            }
+        }
+        await new Promise(resolve => setImmediate(resolve));
+
+        assert.equal(calls.length, 1);
+        assert.equal(settled, true);
+        assert.equal(receipt?.stateHashAfter, H1);
+        assert.equal(queue.getState().pendingCount, 0);
+    });
+
+    await t.test('receipt getter cannot swallow a reentrant next item', async () => {
+        const nativeZero = Object.getOwnPropertyDescriptor(Array.prototype, '0');
+        const calls = [];
+        let poisoned = false;
+        let reentrantPromise = null;
+        let reentrantSettled = false;
+        let queue;
+        queue = makeQueue({
+            write: request => {
+                calls.push(request);
+                const stateHashAfter = calls.length === 1 ? H1 : H2;
+                const values = {
+                    ...nativeReceipt(request, request.expectedHash, stateHashAfter)
+                };
+                if (calls.length !== 1) return values;
+                return new Proxy(values, {
+                    get(target, key, receiver) {
+                        if (key === 'then') return undefined;
+                        if (!poisoned && key === 'ok') {
+                            poisoned = true;
+                            Object.defineProperty(Array.prototype, '0', {
+                                configurable: true,
+                                set() {}
+                            });
+                        }
+                        return Reflect.get(target, key, receiver);
+                    }
+                });
+            },
+            onAcknowledged: receipt => {
+                if (receipt.stateHashAfter === H1) {
+                    reentrantPromise = queue.enqueue({
+                        stateJson: '{"memo":"numeric reentrant H2"}',
+                        reason: 'numeric-reentrant-H2'
+                    });
+                    reentrantPromise.then(() => { reentrantSettled = true; });
+                }
+                return undefined;
+            }
+        });
+
+        try {
+            await queue.enqueue({
+                stateJson: '{"memo":"numeric outer H1"}',
+                reason: 'numeric-outer-H1'
+            });
+        } finally {
+            if (nativeZero) {
+                Object.defineProperty(Array.prototype, '0', nativeZero);
+            } else {
+                delete Array.prototype[0];
+            }
+        }
+        await new Promise(resolve => setImmediate(resolve));
+
+        assert.notEqual(reentrantPromise, null);
+        assert.equal(calls.length, 2);
+        assert.equal(reentrantSettled, true);
+        assert.equal(queue.getState().lastAcknowledgedHash, H2);
+        assert.equal(queue.getState().pendingCount, 0);
+    });
+});
+
+test('receipt getter prototype setters cannot erase canonical success or health own fields', async () => {
+    const nativeStateHashAfter = Object.getOwnPropertyDescriptor(
+        Object.prototype,
+        'stateHashAfter'
+    );
+    const nativeStatus = Object.getOwnPropertyDescriptor(Object.prototype, 'status');
+    let poisoned = false;
+    const queue = makeQueue({
+        write: request => {
+            const values = { ...nativeReceipt(request, request.expectedHash, H1) };
+            return new Proxy(values, {
+                get(target, key, receiver) {
+                    if (key === 'then') return undefined;
+                    if (!poisoned && key === 'ok') {
+                        poisoned = true;
+                        Object.defineProperty(Object.prototype, 'stateHashAfter', {
+                            configurable: true,
+                            set() {}
+                        });
+                        Object.defineProperty(Object.prototype, 'status', {
+                            configurable: true,
+                            set() {}
+                        });
+                    }
+                    return Reflect.get(target, key, receiver);
+                }
+            });
+        }
+    });
+
+    let receipt;
+    try {
+        receipt = await queue.enqueue({
+            stateJson: '{"memo":"own canonical fields"}',
+            reason: 'own-canonical-fields'
+        });
+    } finally {
+        if (nativeStateHashAfter) {
+            Object.defineProperty(Object.prototype, 'stateHashAfter', nativeStateHashAfter);
+        } else {
+            delete Object.prototype.stateHashAfter;
+        }
+        if (nativeStatus) {
+            Object.defineProperty(Object.prototype, 'status', nativeStatus);
+        } else {
+            delete Object.prototype.status;
+        }
+    }
+
+    assert.equal(Object.hasOwn(receipt, 'stateHashAfter'), true);
+    assert.equal(receipt.stateHashAfter, H1);
+    assert.equal(Object.hasOwn(receipt.recoveryHealth, 'status'), true);
+    assert.equal(receipt.recoveryHealth.status, 'healthy');
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+});
+
+test('structured error prototype setters cannot forge the caller-visible terminal proof', async () => {
+    const errorPrototype = LegacySafety.AssetTrackerSaveError.prototype;
+    const nativeQueueOutcome = Object.getOwnPropertyDescriptor(errorPrototype, 'queueOutcome');
+    const nativeTerminalReason = Object.getOwnPropertyDescriptor(errorPrototype, 'terminalReason');
+    let poisoned = false;
+    const queue = makeQueue({
+        write: request => {
+            const target = structuredSaveError(request, {
+                writeOutcome: 'forged-outcome'
+            });
+            const source = new Proxy(target, {
+                get(error, key, receiver) {
+                    if (!poisoned && key === 'code') {
+                        poisoned = true;
+                        Object.defineProperty(errorPrototype, 'queueOutcome', {
+                            configurable: true,
+                            get() { return 'not-committed'; },
+                            set() {}
+                        });
+                        Object.defineProperty(errorPrototype, 'terminalReason', {
+                            configurable: true,
+                            get() { return 'save-not-committed'; },
+                            set() {}
+                        });
+                    }
+                    return Reflect.get(error, key, receiver);
+                }
+            });
+            return Promise.reject(source);
+        }
+    });
+
+    let error;
+    try {
+        error = await queue.enqueue({
+            stateJson: '{"memo":"own terminal proof"}',
+            reason: 'own-terminal-proof'
+        }).then(() => null, value => value);
+    } finally {
+        if (nativeQueueOutcome) {
+            Object.defineProperty(errorPrototype, 'queueOutcome', nativeQueueOutcome);
+        } else {
+            delete errorPrototype.queueOutcome;
+        }
+        if (nativeTerminalReason) {
+            Object.defineProperty(errorPrototype, 'terminalReason', nativeTerminalReason);
+        } else {
+            delete errorPrototype.terminalReason;
+        }
+    }
+
+    assert.equal(Object.hasOwn(error, 'queueOutcome'), true);
+    assert.equal(error.queueOutcome, 'durability-unknown');
+    assert.equal(Object.hasOwn(error, 'terminalReason'), true);
+    assert.equal(error.terminalReason, 'save-outcome-unknown');
+    assert.equal(queue.getState().primaryStatus, 'durability-unknown');
+    assert.equal(queue.getState().lastAcknowledgedHash, H0);
+});
+
+test('queue structured errors cannot turn poisoned invalid proof into a known outcome', async (t) => {
+    await t.test('save error outcome and conflict', async () => {
+        const nativeIncludes = Array.prototype.includes;
+        let poisoned = false;
+        const queue = makeQueue({
+            write: request => {
+                const target = structuredSaveError(request, {
+                    writeOutcome: 'forged-outcome',
+                    conflict: 'forged-conflict'
+                });
+                const source = new Proxy(target, {
+                    get(error, key, receiver) {
+                        if (!poisoned && key === 'code') {
+                            poisoned = true;
+                            Array.prototype.includes = () => true;
+                        }
+                        return Reflect.get(error, key, receiver);
+                    }
+                });
+                return Promise.reject(source);
+            }
+        });
+        let error;
+        try {
+            error = await queue.enqueue({ stateJson: '{"memo":"poison-save-error"}', reason: 'poison' })
+                .then(() => null, value => value);
+        } finally {
+            Array.prototype.includes = nativeIncludes;
+        }
+        assert.equal(error.queueOutcome, 'durability-unknown');
+        assert.equal(error.terminalReason, 'save-outcome-unknown');
+        assert.equal(error.writeOutcome, 'unknown');
+        assert.equal(error.conflict, false);
+    });
+
+    await t.test('snapshot error outcome and conflict', async () => {
+        const nativeIncludes = Array.prototype.includes;
+        let poisoned = false;
+        const queue = makeQueue({
+            snapshot: request => {
+                const target = structuredSnapshotError(request, {
+                    snapshotOutcome: 'forged-outcome',
+                    conflict: 'forged-conflict'
+                });
+                const source = new Proxy(target, {
+                    get(error, key, receiver) {
+                        if (!poisoned && key === 'code') {
+                            poisoned = true;
+                            Array.prototype.includes = () => true;
+                        }
+                        return Reflect.get(error, key, receiver);
+                    }
+                });
+                return Promise.reject(source);
+            }
+        });
+        let error;
+        try {
+            error = await queue.runBarrier({ clientSnapshotId: 'poison-snapshot-error', reason: 'manual' })
+                .then(() => null, value => value);
+        } finally {
+            Array.prototype.includes = nativeIncludes;
+        }
+        assert.equal(error.queueOutcome, 'snapshot-outcome-unknown');
+        assert.equal(error.terminalReason, 'snapshot-outcome-unknown');
+        assert.equal(error.snapshotOutcome, 'unknown');
+        assert.equal(error.conflict, false);
+    });
 });
 
 test('receipt completion uses captured keys, create, and array intrinsics after module load', async t => {
@@ -3217,8 +4283,8 @@ test('timer handle zero is cleared for save ACK and synchronous terminal timeout
     });
 });
 
-test('terminal receipt uses exact one-read extraction while malformed and lost ACKs leave Web terminal', async t => {
-    for (const settlement of ['malformed', 'lost']) {
+test('terminal receipt one-reads stable first reason while malformed and lost ACKs leave Web terminal', async t => {
+    for (const settlement of ['different-stable-reason', 'malformed', 'lost']) {
         await t.test(settlement, async () => {
             const result = deferred();
             const terminalResult = deferred();
@@ -3252,7 +4318,9 @@ test('terminal receipt uses exact one-read extraction while malformed and lost A
                     ok: true,
                     protocolVersion: 2,
                     loadId: terminalCalls[0].sessionContext.loadId,
-                    reason: 'wrong-reason',
+                    reason: settlement === 'different-stable-reason'
+                        ? 'snapshot-conflict'
+                        : 'wrong-reason',
                     gateState: 'terminal-locked'
                 });
                 terminalResult.resolve(receiptSource.record);

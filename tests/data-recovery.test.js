@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const childProcess = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const safety = require('../legacy-safety.js');
 const { deferred, loadAssetTracker } = require('./helpers/asset-tracker-harness');
@@ -78,6 +79,196 @@ function assertRecoveryVisible(app) {
 
 function sourceHash(raw) {
     return raw === null ? null : safety.inspectDOMString(raw).rawHash;
+}
+
+function recoveryHealth(domain, status = 'healthy', overrides = {}) {
+    return {
+        domain,
+        status,
+        auditComplete: true,
+        code: status === 'degraded' ? 'maintenance-pending' : null,
+        maintenancePendingCount: status === 'degraded' ? 1 : 0,
+        detail: status === 'degraded' ? 'fixture' : null,
+        ...overrides
+    };
+}
+
+function completeNativeLoadHealth() {
+    return {
+        updatedAt: null,
+        recoveryHealthComplete: true,
+        ordinaryRecoveryHealth: recoveryHealth('ordinary'),
+        snapshotRecoveryHealth: recoveryHealth('snapshot')
+    };
+}
+
+function oneReadRecord(label, values) {
+    const reads = Object.create(null);
+    const source = new Proxy(Object.create(null), {
+        get(_target, key) {
+            if (key === 'then') return undefined;
+            if (!Object.prototype.hasOwnProperty.call(values, key)) {
+                throw new Error(`${label}.${String(key)} is not allowed`);
+            }
+            reads[key] = (reads[key] || 0) + 1;
+            if (reads[key] !== 1) throw new Error(`${label}.${key} read more than once`);
+            return values[key];
+        },
+        ownKeys() {
+            throw new Error(`${label} was enumerated`);
+        },
+        getOwnPropertyDescriptor() {
+            throw new Error(`${label} descriptor was inspected`);
+        }
+    });
+    return {
+        source,
+        assertReadOnce(fields = Object.keys(values)) {
+            for (const field of fields) {
+                assert.equal(reads[field], 1, `${label}.${field} read count`);
+            }
+        }
+    };
+}
+
+function nativeAdapterHarness(t) {
+    const app = loadAssetTracker({ nativeHandler() {} });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    return { app, adapter: tracker.storageAdapter };
+}
+
+function settleNativeRequest(app, request, response) {
+    app.context.window.AssetTrackerHost.__handleResponse({
+        id: request.id,
+        ...response
+    });
+}
+
+function strictNativeSaveRequest(overrides = {}) {
+    const stateJson = JSON.stringify({ memo: 'native-H1' });
+    return {
+        clientSaveId: 'native-save-1',
+        stateJson,
+        payloadHash: sourceHash(stateJson),
+        reason: 'manual',
+        expectedHash: '0'.repeat(64),
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'native-load-1',
+            writeSessionToken: 'native-token-1'
+        },
+        ...overrides
+    };
+}
+
+function strictNativeSnapshotRequest(overrides = {}) {
+    return {
+        clientSnapshotId: 'native-snapshot-1',
+        reason: 'manual',
+        expectedHash: '1'.repeat(64),
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'native-load-1',
+            writeSessionToken: 'native-token-1'
+        },
+        ...overrides
+    };
+}
+
+function nativeLoadResult(overrides = {}) {
+    const raw = JSON.stringify(validLegacy({ memo: 'native-load' }));
+    const hash = sourceHash(raw);
+    return {
+        protocolVersion: 2,
+        loadId: 'native-load-health',
+        status: 'readableBytes',
+        reason: null,
+        stateJson: raw,
+        stateHash: hash,
+        rawHash: hash,
+        hashAlgorithm: 'sha256',
+        updatedAt: '2026-08-10T01:02:03.456+08:00',
+        storagePath: '/canonical/AssetTrackerBook.json',
+        canExportRaw: true,
+        canRevealFolder: true,
+        recoveryHealthComplete: true,
+        ordinaryRecoveryHealth: recoveryHealth('ordinary'),
+        snapshotRecoveryHealth: recoveryHealth('snapshot', 'degraded'),
+        ...overrides
+    };
+}
+
+function saveQueueForAdapter(adapter, overrides = {}) {
+    return new safety.AssetTrackerSaveQueue({
+        write: request => adapter.save(request),
+        snapshot: request => adapter.snapshot(request),
+        terminalize: request => Promise.resolve({
+            ok: true,
+            protocolVersion: request.protocolVersion,
+            loadId: request.loadId,
+            reason: request.reason,
+            gateState: 'terminal-locked'
+        }),
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'native-load-1',
+            writeSessionToken: 'native-token-1'
+        },
+        initialAcknowledged: {
+            stateJson: '{"memo":"H0"}',
+            stateHash: '0'.repeat(64)
+        },
+        initialRecoveryHealth: {
+            ordinary: recoveryHealth('ordinary'),
+            snapshot: recoveryHealth('snapshot')
+        },
+        expectedDurability: 'native-durable',
+        durabilityDeadlineMs: 29_000,
+        barrierDeadlineMs: 29_000,
+        transportDeadlineMs: 30_000,
+        generationToken: `adapter-integration-${Date.now()}`,
+        clock: { setTimeout, clearTimeout },
+        onTransition: () => undefined,
+        onAcknowledged: () => undefined,
+        onFault: () => undefined,
+        ...overrides
+    });
+}
+
+function webQueueForAdapter(app, adapter, loaded, confirmed, stateJson, overrides = {}) {
+    const stateHash = sourceHash(stateJson);
+    return new app.context.AssetTrackerLegacySafety.AssetTrackerSaveQueue({
+        write: request => adapter.save(request),
+        snapshot: request => adapter.snapshot(request),
+        terminalize: request => Promise.resolve({
+            ok: true,
+            protocolVersion: request.sessionContext.protocolVersion,
+            loadId: request.sessionContext.loadId,
+            reason: request.reason,
+            gateState: 'terminal-locked'
+        }),
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: loaded.loadId,
+            writeSessionToken: confirmed.writeSessionToken
+        },
+        initialAcknowledged: { stateJson, stateHash },
+        initialRecoveryHealth: {
+            ordinary: recoveryHealth('ordinary', 'not-applicable'),
+            snapshot: recoveryHealth('snapshot', 'not-applicable')
+        },
+        expectedDurability: 'browser-local-committed',
+        durabilityDeadlineMs: 29_000,
+        barrierDeadlineMs: 29_000,
+        transportDeadlineMs: 30_000,
+        generationToken: 'web-error-proof-queue',
+        clock: { setTimeout, clearTimeout },
+        onTransition: () => undefined,
+        onAcknowledged: () => undefined,
+        onFault: () => undefined,
+        ...overrides
+    });
 }
 
 test('raw evidence hashes well-formed DOMStrings as UTF-8 bytes', () => {
@@ -405,6 +596,1910 @@ test('runtime-critical entity fields are required before a book can be rendered'
     }
 });
 
+test('native Host preserves structured object errors while strings and missing responses stay conservative', async (t) => {
+    const pendingTimeouts = new Map();
+    let timerSequence = 0;
+    const app = loadAssetTracker({
+        nativeHandler() {},
+        clock: {
+            setTimeout(callback) {
+                const handle = ++timerSequence;
+                pendingTimeouts.set(handle, callback);
+                return handle;
+            },
+            clearTimeout(handle) {
+                pendingTimeouts.delete(handle);
+            },
+            setInterval,
+            clearInterval
+        }
+    });
+    t.after(app.dispose);
+    const host = app.context.window.AssetTrackerHost;
+    const structured = new Proxy({ code: 'structured-native-error', message: 'native failed' }, {
+        ownKeys() {
+            throw new Error('Host must not enumerate structured error');
+        },
+        getOwnPropertyDescriptor() {
+            throw new Error('Host must not inspect structured error descriptors');
+        }
+    });
+
+    const structuredObserved = host.invoke('probe.structured').then(
+        () => assert.fail('structured response must reject'),
+        error => error
+    );
+    const stringObserved = host.invoke('probe.string').then(
+        () => assert.fail('string response must reject'),
+        error => error
+    );
+    const missingObserved = host.invoke('probe.missing').then(
+        () => assert.fail('missing response error must reject'),
+        error => error
+    );
+    const lostObserved = host.invoke('probe.lost').then(
+        () => assert.fail('lost response must reject'),
+        error => error
+    );
+    const [structuredRequest, stringRequest, missingRequest] = app.bridgeRequests;
+
+    settleNativeRequest(app, structuredRequest, { ok: false, error: structured });
+    settleNativeRequest(app, stringRequest, { ok: false, error: 'native string failure' });
+    settleNativeRequest(app, missingRequest, { ok: false });
+    assert.doesNotThrow(() => host.__handleResponse({
+        id: 'unknown-response-id',
+        ok: false,
+        get error() {
+            throw new Error('unknown response must not read error');
+        }
+    }));
+    const [lostTimeout] = pendingTimeouts.values();
+    lostTimeout();
+
+    const [structuredError, stringError, missingError, lostError] = await Promise.all([
+        structuredObserved,
+        stringObserved,
+        missingObserved,
+        lostObserved
+    ]);
+    assert.strictEqual(structuredError, structured);
+    assert.equal(stringError.constructor.name, 'Error');
+    assert.equal(stringError.message, 'native string failure');
+    assert.equal(missingError.constructor.name, 'Error');
+    assert.equal(missingError.message, 'Native host returned error');
+    assert.equal(lostError.constructor.name, 'Error');
+    assert.equal(lostError.message, 'Native host request timeout');
+});
+
+test('native strict save maps only queue-owned fields and returns a protected exact receipt without fallback', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const request = strictNativeSaveRequest();
+    adapter.stateHash = 'f'.repeat(64);
+    const save = adapter.save(request);
+    const saveObserved = save.then(value => value, error => error);
+
+    assert.equal(app.bridgeRequests.length, 1);
+    const wireRequest = app.bridgeRequests[0];
+    assert.equal(wireRequest.type, 'storage.save');
+    assert.deepEqual(JSON.parse(JSON.stringify(wireRequest.payload)), {
+        protocolVersion: 2,
+        loadId: 'native-load-1',
+        writeSessionToken: 'native-token-1',
+        clientSaveId: 'native-save-1',
+        stateJson: request.stateJson,
+        payloadHash: request.payloadHash,
+        reason: 'manual',
+        expectedHash: '0'.repeat(64),
+        validatedSourceHash: '0'.repeat(64),
+        schemaVersion: 1
+    });
+
+    const healthValues = recoveryHealth('ordinary');
+    const healthSource = oneReadRecord('nativeSaveReceipt.recoveryHealth', healthValues);
+    const receiptValues = {
+        ok: true,
+        clientSaveId: request.clientSaveId,
+        payloadHash: request.payloadHash,
+        sourceHashBefore: request.expectedHash,
+        stateHashAfter: '1'.repeat(64),
+        stateHash: '1'.repeat(64),
+        byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+        durability: 'native-durable',
+        updatedAt: 'native-wire-time',
+        storagePath: '/native/wire/path',
+        recoveryHealth: healthSource.source
+    };
+    const receiptSource = oneReadRecord('nativeSaveReceipt', receiptValues);
+    settleNativeRequest(app, wireRequest, { ok: true, result: receiptSource.source });
+    const receipt = await saveObserved;
+
+    receiptSource.assertReadOnce();
+    healthSource.assertReadOnce();
+    assert.deepEqual(JSON.parse(JSON.stringify(receipt)), {
+        ...receiptValues,
+        recoveryHealth: healthValues
+    });
+    assert.notStrictEqual(receipt, receiptSource.source);
+    assert.equal(adapter.stateHash, 'f'.repeat(64), 'adapter stateHash is not strict-save authority');
+
+    const legacyReceipt = adapter.save(strictNativeSaveRequest({ clientSaveId: 'native-save-2' }));
+    const legacyObserved = legacyReceipt.then(
+        () => assert.fail('the old Task2 receipt is not strict proof'),
+        error => error
+    );
+    settleNativeRequest(app, app.bridgeRequests[1], {
+        ok: true,
+        result: {
+            ok: true,
+            stateHash: '2'.repeat(64),
+            time: 'legacy-wire-time',
+            path: '/legacy/wire/path'
+        }
+    });
+    const legacyError = await legacyObserved;
+    assert.equal(legacyError.constructor.name, 'TypeError');
+    assert.equal(legacyError.message, 'INVALID_NATIVE_SAVE_RECEIPT');
+    assert.equal(adapter.stateHash, 'f'.repeat(64));
+});
+
+test('native strict save converts thrown and resolved structured failures into typed protected errors', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const request = strictNativeSaveRequest();
+    const errorHealthValues = recoveryHealth('ordinary', 'degraded');
+    const errorHealth = oneReadRecord('nativeSaveError.recoveryHealthEvidence', errorHealthValues);
+    const errorValues = {
+        code: 'native-save-failed',
+        message: 'native save failed',
+        writeOutcome: 'not-committed',
+        conflict: false,
+        clientSaveId: request.clientSaveId,
+        payloadHash: request.payloadHash,
+        sourceHashAfter: request.expectedHash,
+        sourceReverified: true,
+        coordinatorReleased: true,
+        healthPersisted: true,
+        recoveryHealthEvidence: errorHealth.source
+    };
+    const errorSource = oneReadRecord('nativeSaveError', errorValues);
+    const rejected = adapter.save(request).then(
+        () => assert.fail('structured native failure must reject'),
+        error => error
+    );
+    settleNativeRequest(app, app.bridgeRequests[0], { ok: false, error: errorSource.source });
+    const typed = await rejected;
+
+    errorSource.assertReadOnce();
+    errorHealth.assertReadOnce();
+    assert.equal(typed.constructor.name, 'AssetTrackerSaveError');
+    assert.notStrictEqual(typed, errorSource.source);
+    assert.equal(typed.code, 'native-save-failed');
+    assert.equal(typed.writeOutcome, 'not-committed');
+    assert.deepEqual(JSON.parse(JSON.stringify(typed.recoveryHealthEvidence)), errorHealthValues);
+
+    const resolvedRequest = strictNativeSaveRequest({ clientSaveId: 'native-save-resolved-false' });
+    const resolved = adapter.save(resolvedRequest).then(
+        () => assert.fail('resolved failure union is forbidden'),
+        error => error
+    );
+    settleNativeRequest(app, app.bridgeRequests[1], {
+        ok: true,
+        result: {
+            ok: false,
+            error: {
+                ...errorValues,
+                clientSaveId: 'native-save-resolved-false',
+                recoveryHealthEvidence: errorHealthValues
+            }
+        }
+    });
+    const resolvedError = await resolved;
+    assert.equal(resolvedError.constructor.name, 'TypeError');
+    assert.equal(resolvedError.message, 'INVALID_NATIVE_SAVE_RECEIPT');
+    assert.equal(resolvedError.clientSaveId, undefined, 'resolved failure proof is unavailable');
+});
+
+test('native error DTO getter setters cannot forge or erase typed adapter own fields', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const request = strictNativeSaveRequest({ clientSaveId: 'native-error-own-fields' });
+    const values = {
+        code: 'native-unknown',
+        message: 'native outcome unknown',
+        writeOutcome: 'unknown',
+        conflict: false,
+        clientSaveId: request.clientSaveId,
+        payloadHash: request.payloadHash,
+        sourceHashAfter: null,
+        sourceReverified: false,
+        coordinatorReleased: true,
+        healthPersisted: false,
+        recoveryHealthEvidence: null
+    };
+    let poisoned = false;
+    const source = new Proxy(Object.create(null), {
+        get(_target, key) {
+            if (!poisoned) {
+                poisoned = true;
+                app.context.__nativeErrorExpectedHash = request.expectedHash;
+                vm.runInContext(`
+                    const prototype = globalThis.AssetTrackerLegacySafety.AssetTrackerSaveError.prototype;
+                    Object.defineProperty(prototype, 'writeOutcome', {
+                        configurable: true,
+                        get() { return 'not-committed'; },
+                        set() {}
+                    });
+                    Object.defineProperty(prototype, 'sourceHashAfter', {
+                        configurable: true,
+                        get() { return globalThis.__nativeErrorExpectedHash; },
+                        set() {}
+                    });
+                    Object.defineProperty(prototype, 'sourceReverified', {
+                        configurable: true,
+                        get() { return true; },
+                        set() {}
+                    });
+                `, app.context);
+            }
+            return values[key];
+        }
+    });
+    const result = adapter.save(request).then(
+        () => assert.fail('structured native error must reject'),
+        error => error
+    );
+    settleNativeRequest(app, app.bridgeRequests[0], { ok: false, error: source });
+    const error = await result;
+
+    assert.equal(Object.hasOwn(error, 'writeOutcome'), true);
+    assert.equal(error.writeOutcome, 'unknown');
+    assert.equal(Object.hasOwn(error, 'sourceHashAfter'), true);
+    assert.equal(error.sourceHashAfter, null);
+    assert.equal(Object.hasOwn(error, 'sourceReverified'), true);
+    assert.equal(error.sourceReverified, false);
+});
+
+test('native adapter protected receipt extraction uses load-time intrinsics after first-field poisoning', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const request = strictNativeSaveRequest({ clientSaveId: 'native-intrinsic-save' });
+    const save = adapter.save(request);
+    const healthValues = recoveryHealth('ordinary');
+    const healthSource = oneReadRecord('intrinsicReceipt.recoveryHealth', healthValues);
+    const receiptValues = {
+        ok: true,
+        clientSaveId: request.clientSaveId,
+        payloadHash: request.payloadHash,
+        sourceHashBefore: request.expectedHash,
+        stateHashAfter: '7'.repeat(64),
+        stateHash: '7'.repeat(64),
+        byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+        durability: 'native-durable',
+        updatedAt: 'native-intrinsic-time',
+        storagePath: '/native/intrinsic/path',
+        recoveryHealth: healthSource.source
+    };
+    const reads = Object.create(null);
+    let poisoned = false;
+    const source = new Proxy(Object.create(null), {
+        get(_target, key) {
+            if (key === 'then') return undefined;
+            if (!Object.prototype.hasOwnProperty.call(receiptValues, key)) {
+                throw new Error(`intrinsicReceipt.${String(key)} is not allowed`);
+            }
+            reads[key] = (reads[key] || 0) + 1;
+            if (reads[key] !== 1) throw new Error(`intrinsicReceipt.${key} read more than once`);
+            if (!poisoned) {
+                poisoned = true;
+                vm.runInContext(`
+                    Reflect.get = () => { throw new Error('poisoned Reflect.get'); };
+                    Object.freeze = () => { throw new Error('poisoned Object.freeze'); };
+                    Object.create = () => { throw new Error('poisoned Object.create'); };
+                    Array.isArray = () => true;
+                    Number.isInteger = () => false;
+                `, app.context);
+            }
+            return receiptValues[key];
+        },
+        ownKeys() {
+            throw new Error('intrinsicReceipt was enumerated');
+        },
+        getOwnPropertyDescriptor() {
+            throw new Error('intrinsicReceipt descriptor was inspected');
+        }
+    });
+    settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: source });
+
+    const receipt = await save;
+
+    for (const field of Object.keys(receiptValues)) {
+        assert.equal(reads[field], 1, `intrinsicReceipt.${field} read count`);
+    }
+    healthSource.assertReadOnce();
+    assert.notStrictEqual(receipt, source);
+    assert.equal(Object.isFrozen(receipt), true);
+    assert.equal(Object.isFrozen(receipt.recoveryHealth), true);
+    assert.deepEqual(JSON.parse(JSON.stringify(receipt)), {
+        ...receiptValues,
+        recoveryHealth: healthValues
+    });
+});
+
+test('native receipt getter toString and toStringTag poisoning cannot misroute the next strict save', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const firstRequest = strictNativeSaveRequest({ clientSaveId: 'native-route-first' });
+    const secondValues = strictNativeSaveRequest({ clientSaveId: 'native-route-second' });
+    app.context.__routeSecondValues = secondValues;
+    const secondRequest = vm.runInContext(`({
+        clientSaveId: globalThis.__routeSecondValues.clientSaveId,
+        stateJson: globalThis.__routeSecondValues.stateJson,
+        payloadHash: globalThis.__routeSecondValues.payloadHash,
+        reason: globalThis.__routeSecondValues.reason,
+        expectedHash: globalThis.__routeSecondValues.expectedHash,
+        sessionContext: {
+            protocolVersion: globalThis.__routeSecondValues.sessionContext.protocolVersion,
+            loadId: globalThis.__routeSecondValues.sessionContext.loadId,
+            writeSessionToken: globalThis.__routeSecondValues.sessionContext.writeSessionToken
+        }
+    })`, app.context);
+    const first = adapter.save(firstRequest);
+    const firstValues = {
+        ok: true,
+        clientSaveId: firstRequest.clientSaveId,
+        payloadHash: firstRequest.payloadHash,
+        sourceHashBefore: firstRequest.expectedHash,
+        stateHashAfter: '7'.repeat(64),
+        stateHash: '7'.repeat(64),
+        byteCount: Buffer.byteLength(firstRequest.stateJson, 'utf8'),
+        durability: 'native-durable',
+        updatedAt: 'native-route-first-time',
+        storagePath: '/native/route/first',
+        recoveryHealth: recoveryHealth('ordinary')
+    };
+    let poisoned = false;
+    const firstSource = new Proxy(Object.create(null), {
+        get(_target, key) {
+            if (key === 'then') return undefined;
+            if (!poisoned) {
+                poisoned = true;
+                vm.runInContext(
+                    `
+                        Object.prototype.toString = () => '[object Array]';
+                        Object.defineProperty(Object.prototype, Symbol.toStringTag, {
+                            configurable: true,
+                            value: 'Array'
+                        });
+                    `,
+                    app.context
+                );
+            }
+            return firstValues[key];
+        }
+    });
+    settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: firstSource });
+    assert.equal((await first).stateHashAfter, '7'.repeat(64));
+
+    const second = adapter.save(secondRequest).then(value => value, error => error);
+    assert.equal(app.bridgeRequests.length, 2, 'plain strict request must still reach Host once');
+    settleNativeRequest(app, app.bridgeRequests[1], {
+        ok: true,
+        result: {
+            ok: true,
+            clientSaveId: secondRequest.clientSaveId,
+            payloadHash: secondRequest.payloadHash,
+            sourceHashBefore: secondRequest.expectedHash,
+            stateHashAfter: '8'.repeat(64),
+            stateHash: '8'.repeat(64),
+            byteCount: Buffer.byteLength(secondRequest.stateJson, 'utf8'),
+            durability: 'native-durable',
+            updatedAt: 'native-route-second-time',
+            storagePath: '/native/route/second',
+            recoveryHealth: recoveryHealth('ordinary')
+        }
+    });
+    const receipt = await second;
+    assert.equal(receipt.stateHashAfter, '8'.repeat(64));
+});
+
+test('native strict save routing accepts only cross-realm or null-prototype plain records', async (t) => {
+    await t.test('null-prototype record reaches Host', async (subtest) => {
+        const { app, adapter } = nativeAdapterHarness(subtest);
+        const values = strictNativeSaveRequest({ clientSaveId: 'native-null-prototype' });
+        const request = Object.assign(Object.create(null), values);
+        const save = adapter.save(request);
+
+        assert.equal(app.bridgeRequests.length, 1);
+        settleNativeRequest(app, app.bridgeRequests[0], {
+            ok: true,
+            result: {
+                ok: true,
+                clientSaveId: request.clientSaveId,
+                payloadHash: request.payloadHash,
+                sourceHashBefore: request.expectedHash,
+                stateHashAfter: '9'.repeat(64),
+                stateHash: '9'.repeat(64),
+                byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+                durability: 'native-durable',
+                updatedAt: 'native-null-prototype-time',
+                storagePath: '/native/null-prototype',
+                recoveryHealth: recoveryHealth('ordinary')
+            }
+        });
+        assert.equal((await save).stateHashAfter, '9'.repeat(64));
+    });
+
+    for (const [label, makeRequest] of [
+        ['class instance', values => Object.assign(new (class StrictRequest {})(), values)],
+        ['throwing getPrototypeOf proxy', values => new Proxy(values, {
+            getPrototypeOf() {
+                throw new Error('request prototype is hostile');
+            }
+        })]
+    ]) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const request = makeRequest(strictNativeSaveRequest({
+                clientSaveId: `native-invalid-shape-${label}`
+            }));
+            const observed = adapter.save(request).then(
+                value => ({ value }),
+                error => ({ error })
+            );
+            if (app.bridgeRequests.length !== 0) {
+                settleNativeRequest(app, app.bridgeRequests[0], {
+                    ok: true,
+                    result: {
+                        ok: true,
+                        clientSaveId: request.clientSaveId,
+                        payloadHash: request.payloadHash,
+                        sourceHashBefore: request.expectedHash,
+                        stateHashAfter: 'a'.repeat(64),
+                        stateHash: 'a'.repeat(64),
+                        byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+                        durability: 'native-durable',
+                        updatedAt: 'native-invalid-shape-time',
+                        storagePath: '/native/invalid-shape',
+                        recoveryHealth: recoveryHealth('ordinary')
+                    }
+                });
+            }
+            const { error = null } = await observed;
+
+            assert.notEqual(error, null);
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_SAVE_ARGUMENT_SHAPE');
+            assert.equal(app.bridgeRequests.length, 0);
+        });
+    }
+});
+
+test('native adapter poisoned intrinsics cannot turn a false ACK into a valid receipt', async (t) => {
+    await t.test('Reflect.get forgery', async (subtest) => {
+        const { app, adapter } = nativeAdapterHarness(subtest);
+        const request = strictNativeSaveRequest({ clientSaveId: 'native-reflect-forgery' });
+        const healthValues = recoveryHealth('snapshot');
+        const healthSource = oneReadRecord('falseAckReflect.recoveryHealth', healthValues);
+        const originalValues = {
+            ok: true,
+            clientSaveId: 'wrong-original-client-id',
+            payloadHash: 'not-a-hash',
+            sourceHashBefore: 'not-a-source-hash',
+            stateHashAfter: 'not-a-state-hash',
+            stateHash: 'not-a-state-hash',
+            byteCount: -1,
+            durability: 'browser-local-committed',
+            updatedAt: '',
+            storagePath: '',
+            recoveryHealth: healthSource.source
+        };
+        const forgedValues = {
+            clientSaveId: request.clientSaveId,
+            payloadHash: request.payloadHash,
+            sourceHashBefore: request.expectedHash,
+            stateHashAfter: '6'.repeat(64),
+            stateHash: '6'.repeat(64),
+            byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+            durability: 'native-durable',
+            updatedAt: 'forged-time',
+            storagePath: '/forged/path'
+        };
+        const reads = Object.create(null);
+        let poisoned = false;
+        const source = new Proxy(Object.create(null), {
+            get(_target, key) {
+                if (key === 'then') return undefined;
+                if (!Object.prototype.hasOwnProperty.call(originalValues, key)) {
+                    throw new Error(`falseAckReflect.${String(key)} is not allowed`);
+                }
+                reads[key] = (reads[key] || 0) + 1;
+                if (reads[key] !== 1) throw new Error(`falseAckReflect.${key} read more than once`);
+                if (!poisoned) {
+                    poisoned = true;
+                    app.context.__forgedReceipt = forgedValues;
+                    app.context.__forgedHealth = recoveryHealth('ordinary');
+                    app.context.__forgedHealthSource = healthSource.source;
+                    vm.runInContext(`
+                        Reflect.get = (_source, key) => {
+                            if (key === 'recoveryHealth') return globalThis.__forgedHealthSource;
+                            if (Object.prototype.hasOwnProperty.call(globalThis.__forgedReceipt, key)) {
+                                return globalThis.__forgedReceipt[key];
+                            }
+                            return globalThis.__forgedHealth[key];
+                        };
+                    `, app.context);
+                }
+                return originalValues[key];
+            },
+            ownKeys() {
+                throw new Error('falseAckReflect was enumerated');
+            },
+            getOwnPropertyDescriptor() {
+                throw new Error('falseAckReflect descriptor was inspected');
+            }
+        });
+        const result = adapter.save(request).then(
+            () => assert.fail('forged values must not replace the first-read false ACK'),
+            error => error
+        );
+        settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: source });
+        const error = await result;
+        assert.equal(error.constructor.name, 'TypeError');
+        assert.equal(error.message, 'INVALID_NATIVE_SAVE_RECEIPT');
+        for (const field of Object.keys(originalValues)) {
+            assert.equal(reads[field], 1, `falseAckReflect.${field} read count`);
+        }
+        healthSource.assertReadOnce();
+    });
+
+    await t.test('RegExp.test and Array.includes forgery', async (subtest) => {
+        const { app, adapter } = nativeAdapterHarness(subtest);
+        const request = strictNativeSaveRequest({ clientSaveId: 'native-prototype-forgery' });
+        const healthValues = recoveryHealth('ordinary', 'healthy', { status: 'forged-status' });
+        const healthSource = oneReadRecord('falseAckPrototype.recoveryHealth', healthValues);
+        const receiptValues = {
+            ok: true,
+            clientSaveId: request.clientSaveId,
+            payloadHash: request.payloadHash,
+            sourceHashBefore: request.expectedHash,
+            stateHashAfter: 'not-a-state-hash',
+            stateHash: 'not-a-state-hash',
+            byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+            durability: 'native-durable',
+            updatedAt: 'prototype-forgery-time',
+            storagePath: '/prototype/forgery/path',
+            recoveryHealth: healthSource.source
+        };
+        const reads = Object.create(null);
+        let poisoned = false;
+        const source = new Proxy(Object.create(null), {
+            get(_target, key) {
+                if (key === 'then') return undefined;
+                if (!Object.prototype.hasOwnProperty.call(receiptValues, key)) {
+                    throw new Error(`falseAckPrototype.${String(key)} is not allowed`);
+                }
+                reads[key] = (reads[key] || 0) + 1;
+                if (reads[key] !== 1) throw new Error(`falseAckPrototype.${key} read more than once`);
+                if (!poisoned) {
+                    poisoned = true;
+                    vm.runInContext(`
+                        RegExp.prototype.test = () => true;
+                        Array.prototype.includes = () => true;
+                    `, app.context);
+                }
+                return receiptValues[key];
+            },
+            ownKeys() {
+                throw new Error('falseAckPrototype was enumerated');
+            },
+            getOwnPropertyDescriptor() {
+                throw new Error('falseAckPrototype descriptor was inspected');
+            }
+        });
+        const result = adapter.save(request).then(
+            () => assert.fail('prototype poisoning must not validate a false ACK'),
+            error => error
+        );
+        settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: source });
+        const error = await result;
+        assert.equal(error.constructor.name, 'TypeError');
+        assert.equal(error.message, 'INVALID_NATIVE_SAVE_RECEIPT');
+        for (const field of Object.keys(receiptValues)) {
+            assert.equal(reads[field], 1, `falseAckPrototype.${field} read count`);
+        }
+        healthSource.assertReadOnce();
+    });
+
+    await t.test('RegExp.exec forgery', async (subtest) => {
+        const { app, adapter } = nativeAdapterHarness(subtest);
+        const request = strictNativeSaveRequest({ clientSaveId: 'native-regexp-exec-forgery' });
+        const healthValues = recoveryHealth('ordinary');
+        const healthSource = oneReadRecord('falseAckExec.recoveryHealth', healthValues);
+        const receiptValues = {
+            ok: true,
+            clientSaveId: request.clientSaveId,
+            payloadHash: request.payloadHash,
+            sourceHashBefore: request.expectedHash,
+            stateHashAfter: 'x',
+            stateHash: 'x',
+            byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+            durability: 'native-durable',
+            updatedAt: 'regexp-exec-forgery-time',
+            storagePath: '/regexp/exec/forgery',
+            recoveryHealth: healthSource.source
+        };
+        let poisoned = false;
+        const source = new Proxy(Object.create(null), {
+            get(_target, key) {
+                if (key === 'then') return undefined;
+                if (!Object.prototype.hasOwnProperty.call(receiptValues, key)) {
+                    throw new Error(`falseAckExec.${String(key)} is not allowed`);
+                }
+                if (!poisoned) {
+                    poisoned = true;
+                    vm.runInContext(`
+                        RegExp.prototype.exec = () => ({
+                            0: 'fake-match',
+                            index: 0,
+                            input: 'x'
+                        });
+                    `, app.context);
+                }
+                return receiptValues[key];
+            },
+            ownKeys() {
+                throw new Error('falseAckExec was enumerated');
+            },
+            getOwnPropertyDescriptor() {
+                throw new Error('falseAckExec descriptor was inspected');
+            }
+        });
+        const result = adapter.save(request).then(
+            () => assert.fail('RegExp.exec poisoning must not validate a false ACK'),
+            error => error
+        );
+        settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: source });
+        const error = await result;
+        assert.equal(error.constructor.name, 'TypeError');
+        assert.equal(error.message, 'INVALID_NATIVE_SAVE_RECEIPT');
+        healthSource.assertReadOnce();
+    });
+
+    await t.test('Number.isInteger forgery', async (subtest) => {
+        const { app, adapter } = nativeAdapterHarness(subtest);
+        const request = strictNativeSaveRequest({ clientSaveId: 'native-integer-forgery' });
+        const healthValues = recoveryHealth('ordinary', 'healthy', {
+            maintenancePendingCount: 0.5
+        });
+        const healthSource = oneReadRecord('falseAckInteger.recoveryHealth', healthValues);
+        const receiptValues = {
+            ok: true,
+            clientSaveId: request.clientSaveId,
+            payloadHash: request.payloadHash,
+            sourceHashBefore: request.expectedHash,
+            stateHashAfter: '5'.repeat(64),
+            stateHash: '5'.repeat(64),
+            byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+            durability: 'native-durable',
+            updatedAt: 'integer-forgery-time',
+            storagePath: '/integer/forgery/path',
+            recoveryHealth: healthSource.source
+        };
+        const reads = Object.create(null);
+        let poisoned = false;
+        const source = new Proxy(Object.create(null), {
+            get(_target, key) {
+                if (key === 'then') return undefined;
+                if (!Object.prototype.hasOwnProperty.call(receiptValues, key)) {
+                    throw new Error(`falseAckInteger.${String(key)} is not allowed`);
+                }
+                reads[key] = (reads[key] || 0) + 1;
+                if (reads[key] !== 1) throw new Error(`falseAckInteger.${key} read more than once`);
+                if (!poisoned) {
+                    poisoned = true;
+                    vm.runInContext('Number.isInteger = () => true;', app.context);
+                }
+                return receiptValues[key];
+            },
+            ownKeys() {
+                throw new Error('falseAckInteger was enumerated');
+            },
+            getOwnPropertyDescriptor() {
+                throw new Error('falseAckInteger descriptor was inspected');
+            }
+        });
+        const result = adapter.save(request).then(
+            () => assert.fail('fractional health count must not become a valid ACK'),
+            error => error
+        );
+        settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: source });
+        const error = await result;
+        assert.equal(error.constructor.name, 'TypeError');
+        assert.equal(error.message, 'INVALID_NATIVE_SAVE_RECEIPT');
+        for (const field of Object.keys(receiptValues)) {
+            assert.equal(reads[field], 1, `falseAckInteger.${field} read count`);
+        }
+        healthSource.assertReadOnce();
+    });
+});
+
+test('native strict snapshot maps the queue request and protects success and structured failure DTOs', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const request = strictNativeSnapshotRequest();
+    const snapshot = adapter.snapshot(request);
+    const snapshotObserved = snapshot.then(value => value, error => error);
+
+    assert.equal(app.bridgeRequests.length, 1);
+    const wireRequest = app.bridgeRequests[0];
+    assert.equal(wireRequest.type, 'storage.snapshot');
+    assert.deepEqual(JSON.parse(JSON.stringify(wireRequest.payload)), {
+        protocolVersion: 2,
+        loadId: 'native-load-1',
+        writeSessionToken: 'native-token-1',
+        clientSnapshotId: 'native-snapshot-1',
+        reason: 'manual',
+        expectedHash: '1'.repeat(64)
+    });
+    const healthValues = recoveryHealth('snapshot');
+    const healthSource = oneReadRecord('nativeSnapshotReceipt.recoveryHealth', healthValues);
+    const receiptValues = {
+        ok: true,
+        clientSnapshotId: request.clientSnapshotId,
+        sourceHash: request.expectedHash,
+        snapshotHash: request.expectedHash,
+        ordinal: 3,
+        snapshotStatus: 'created',
+        durability: 'native-durable',
+        retainedCount: 4,
+        recoveryHealth: healthSource.source
+    };
+    const receiptSource = oneReadRecord('nativeSnapshotReceipt', receiptValues);
+    settleNativeRequest(app, wireRequest, { ok: true, result: receiptSource.source });
+    const canonicalReceipt = await snapshotObserved;
+    receiptSource.assertReadOnce();
+    healthSource.assertReadOnce();
+    assert.deepEqual(JSON.parse(JSON.stringify(canonicalReceipt)), {
+        ...receiptValues,
+        recoveryHealth: healthValues
+    });
+
+    const failedRequest = strictNativeSnapshotRequest({ clientSnapshotId: 'native-snapshot-failed' });
+    const failed = adapter.snapshot(failedRequest).then(
+        () => assert.fail('resolved snapshot failure is forbidden'),
+        error => error
+    );
+    const failureHealthValues = recoveryHealth('snapshot', 'degraded');
+    const failureHealth = oneReadRecord(
+        'nativeSnapshotError.recoveryHealthEvidence',
+        failureHealthValues
+    );
+    const failureValues = {
+        code: 'snapshot-not-created',
+        message: 'snapshot not created',
+        snapshotOutcome: 'not-created',
+        conflict: false,
+        clientSnapshotId: 'native-snapshot-failed',
+        sourceHashAfter: failedRequest.expectedHash,
+        sourceReverified: true,
+        coordinatorReleased: true,
+        healthPersisted: true,
+        recoveryHealthEvidence: failureHealth.source
+    };
+    const failureSource = oneReadRecord('nativeSnapshotError', failureValues);
+    settleNativeRequest(app, app.bridgeRequests[1], { ok: false, error: failureSource.source });
+    const typed = await failed;
+    failureSource.assertReadOnce();
+    failureHealth.assertReadOnce();
+    assert.equal(typed.constructor.name, 'AssetTrackerSnapshotError');
+    assert.equal(typed.snapshotOutcome, 'not-created');
+    assert.equal(typed.clientSnapshotId, 'native-snapshot-failed');
+    assert.deepEqual(JSON.parse(JSON.stringify(typed.recoveryHealthEvidence)), failureHealthValues);
+
+    const resolvedRequest = strictNativeSnapshotRequest({ clientSnapshotId: 'native-snapshot-resolved-false' });
+    const resolved = adapter.snapshot(resolvedRequest).then(
+        () => assert.fail('resolved snapshot failure union is malformed'),
+        error => error
+    );
+    settleNativeRequest(app, app.bridgeRequests[2], {
+        ok: true,
+        result: {
+            ok: false,
+            error: {
+                ...failureValues,
+                clientSnapshotId: resolvedRequest.clientSnapshotId,
+                recoveryHealthEvidence: failureHealthValues
+            }
+        }
+    });
+    const resolvedError = await resolved;
+    assert.equal(resolvedError.constructor.name, 'TypeError');
+    assert.equal(resolvedError.message, 'INVALID_NATIVE_SNAPSHOT_RECEIPT');
+    assert.equal(resolvedError.clientSnapshotId, undefined, 'resolved failure proof is unavailable');
+});
+
+test('native strict snapshot rejects null hashes and non-product reasons before Host I/O', async (t) => {
+    for (const [label, overrides] of [
+        ['null expected hash', { expectedHash: null }],
+        ['final reason', { reason: 'final' }],
+        ['unknown reason', { reason: 'automatic' }]
+    ]) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const observed = adapter.snapshot(strictNativeSnapshotRequest(overrides)).then(
+                () => null,
+                error => error
+            );
+            const hostCalls = app.bridgeRequests.length;
+            if (hostCalls > 0) {
+                settleNativeRequest(app, app.bridgeRequests[0], {
+                    ok: false,
+                    error: 'invalid snapshot request must not reach Host'
+                });
+            }
+            const error = await observed;
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_SNAPSHOT_REQUEST');
+            assert.equal(hostCalls, 0);
+        });
+    }
+
+    const scheduledHarness = nativeAdapterHarness(t);
+    const scheduledRequest = strictNativeSnapshotRequest({
+        clientSnapshotId: 'native-scheduled-snapshot',
+        reason: 'scheduled'
+    });
+    const scheduled = scheduledHarness.adapter.snapshot(scheduledRequest);
+    assert.equal(scheduledHarness.app.bridgeRequests.length, 1);
+    assert.equal(scheduledHarness.app.bridgeRequests[0].payload.reason, 'scheduled');
+    settleNativeRequest(scheduledHarness.app, scheduledHarness.app.bridgeRequests[0], {
+        ok: true,
+        result: {
+            ok: true,
+            clientSnapshotId: scheduledRequest.clientSnapshotId,
+            sourceHash: scheduledRequest.expectedHash,
+            snapshotHash: scheduledRequest.expectedHash,
+            ordinal: 2,
+            snapshotStatus: 'created',
+            durability: 'native-durable',
+            retainedCount: 2,
+            recoveryHealth: recoveryHealth('snapshot')
+        }
+    });
+    assert.equal((await scheduled).clientSnapshotId, scheduledRequest.clientSnapshotId);
+});
+
+test('resolved native failure unions terminate the queue as unknown and never dispatch the next item', async (t) => {
+    await t.test('save union', async (subtest) => {
+        const { app, adapter } = nativeAdapterHarness(subtest);
+        const queue = saveQueueForAdapter(adapter);
+        const h1 = queue.enqueue({ stateJson: '{"memo":"H1"}', reason: 'H1' });
+        const h2 = queue.enqueue({ stateJson: '{"memo":"H2"}', reason: 'H2' });
+        const request = app.bridgeRequests[0];
+        settleNativeRequest(app, request, {
+            ok: true,
+            result: {
+                ok: false,
+                error: {
+                    code: 'forbidden-proof',
+                    message: 'must not classify',
+                    writeOutcome: 'not-committed',
+                    conflict: false,
+                    clientSaveId: request.payload.clientSaveId,
+                    payloadHash: request.payload.payloadHash,
+                    sourceHashAfter: request.payload.expectedHash,
+                    sourceReverified: true,
+                    coordinatorReleased: true,
+                    healthPersisted: false,
+                    recoveryHealthEvidence: null
+                }
+            }
+        });
+        const activeError = await h1.then(() => null, error => error);
+        const pendingError = await h2.then(() => null, error => error);
+        assert.equal(activeError.queueOutcome, 'durability-unknown');
+        assert.equal(pendingError.queueOutcome, 'not-dispatched');
+        assert.equal(app.bridgeRequests.filter(item => item.type === 'storage.save').length, 1);
+    });
+
+    await t.test('snapshot union', async (subtest) => {
+        const { app, adapter } = nativeAdapterHarness(subtest);
+        const queue = saveQueueForAdapter(adapter);
+        const barrier = queue.runBarrier({ clientSnapshotId: 'union-snapshot', reason: 'manual' });
+        const h2 = queue.enqueue({ stateJson: '{"memo":"H2"}', reason: 'H2' });
+        settleNativeRequest(app, app.bridgeRequests[0], {
+            ok: true,
+            result: {
+                ok: false,
+                error: {
+                    code: 'forbidden-proof',
+                    message: 'must not classify',
+                    snapshotOutcome: 'not-created',
+                    conflict: false,
+                    clientSnapshotId: 'union-snapshot',
+                    sourceHashAfter: '0'.repeat(64),
+                    sourceReverified: true,
+                    coordinatorReleased: true,
+                    healthPersisted: false,
+                    recoveryHealthEvidence: null
+                }
+            }
+        });
+        const activeError = await barrier.then(() => null, error => error);
+        const pendingError = await h2.then(() => null, error => error);
+        assert.equal(activeError.queueOutcome, 'snapshot-outcome-unknown');
+        assert.equal(pendingError.queueOutcome, 'not-dispatched');
+        assert.equal(app.bridgeRequests.filter(item => item.type === 'storage.snapshot').length, 1);
+        assert.equal(app.bridgeRequests.filter(item => item.type === 'storage.save').length, 0);
+    });
+});
+
+test('Web strict snapshot fails closed without localStorage or legacy backup writes', async (t) => {
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: JSON.stringify(validLegacy()) } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    const writesBefore = app.localStorageWrites.length;
+
+    const error = await tracker.storageAdapter.snapshot(strictNativeSnapshotRequest()).then(
+        () => null,
+        value => value
+    );
+
+    assert.notEqual(error, null);
+    assert.equal(error.constructor.name, 'AssetTrackerSnapshotError');
+    assert.equal(error.message, 'NATIVE_SNAPSHOT_REQUIRED');
+    assert.equal(error.snapshotOutcome, 'unknown');
+    assert.equal(error.conflict, false);
+    assert.equal(error.clientSnapshotId, 'native-snapshot-1');
+    assert.equal(error.sourceHashAfter, null);
+    assert.equal(error.sourceReverified, false);
+    assert.equal(error.coordinatorReleased, true);
+    assert.equal(error.healthPersisted, false);
+    assert.equal(error.recoveryHealthEvidence, null);
+    assert.equal(app.localStorageWrites.length, writesBefore);
+    assert.equal(app.readLocalStorage('assetTrackerBackup'), null);
+    assert.equal(app.readLocalStorage('assetTrackerLastBackupTime'), null);
+
+    const queue = saveQueueForAdapter(tracker.storageAdapter, {
+        expectedDurability: 'browser-local-committed',
+        initialRecoveryHealth: {
+            ordinary: recoveryHealth('ordinary', 'not-applicable'),
+            snapshot: recoveryHealth('snapshot', 'not-applicable')
+        }
+    });
+    const barrier = queue.runBarrier({ clientSnapshotId: 'web-snapshot', reason: 'manual' });
+    const pending = queue.enqueue({ stateJson: '{"memo":"never-written"}', reason: 'pending' });
+    const barrierError = await barrier.then(() => null, value => value);
+    const pendingError = await pending.then(() => null, value => value);
+    assert.equal(barrierError.queueOutcome, 'snapshot-outcome-unknown');
+    assert.equal(pendingError.queueOutcome, 'not-dispatched');
+    assert.equal(app.localStorageWrites.length, writesBefore);
+});
+
+test('queue Web ACK keeps acceptance-time byte count after transition poisons TypedArray byteLength', async (t) => {
+    const h0 = JSON.stringify(validLegacy({ memo: 'web-byte-count-H0' }));
+    const h1 = JSON.stringify(validLegacy({ memo: '中💰-web-byte-count-H1' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: h0 } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    const adapter = tracker.storageAdapter;
+    const loaded = await adapter.load();
+    const confirmed = await adapter.confirmLoad({
+        protocolVersion: 2,
+        loadId: loaded.loadId,
+        outcome: 'valid',
+        reason: null,
+        validatedSourceHash: loaded.rawHash
+    });
+    let poisoned = false;
+    const queue = webQueueForAdapter(app, adapter, loaded, confirmed, h0, {
+        onTransition(state) {
+            if (poisoned || state.lanePhase !== 'saving') return undefined;
+            poisoned = true;
+            vm.runInContext(`
+                const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+                Object.defineProperty(typedArrayPrototype, 'byteLength', {
+                    configurable: true,
+                    get() { return 1; }
+                });
+            `, app.context);
+            return undefined;
+        }
+    });
+
+    const outcome = await queue.enqueue({ stateJson: h1, reason: 'web-byte-count-H1' }).then(
+        receipt => ({ receipt }),
+        error => ({ error })
+    );
+
+    assert.equal(app.readLocalStorage('assetTrackerData'), h1, 'the exact H1 bytes were committed');
+    assert.equal(outcome.error, undefined);
+    assert.equal(outcome.receipt.byteCount, Buffer.byteLength(h1, 'utf8'));
+    assert.equal(queue.getState().lastAcknowledgedHash, sourceHash(h1));
+    assert.equal(queue.getState().primaryStatus, 'browser-local-committed');
+    assert.equal(queue.getState().lanePhase, 'idle');
+});
+
+test('queue Web strict save ignores transition poisoning of gate membership and receipt time', async (t) => {
+    for (const [label, poison] of [
+        ['Array includes gate membership', `Array.prototype.includes = () => false;`],
+        ['Date toISOString receipt time', `Date.prototype.toISOString = () => '';`]
+    ]) {
+        await t.test(label, async (subtest) => {
+            const h0 = JSON.stringify(validLegacy({ memo: `${label}-H0` }));
+            const h1 = JSON.stringify(validLegacy({ memo: `${label}-H1` }));
+            const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: h0 } });
+            subtest.after(app.dispose);
+            const tracker = new app.AssetTracker();
+            const adapter = tracker.storageAdapter;
+            const loaded = await adapter.load();
+            const confirmed = await adapter.confirmLoad({
+                protocolVersion: 2,
+                loadId: loaded.loadId,
+                outcome: 'valid',
+                reason: null,
+                validatedSourceHash: loaded.rawHash
+            });
+            let poisoned = false;
+            const queue = webQueueForAdapter(app, adapter, loaded, confirmed, h0, {
+                onTransition(state) {
+                    if (poisoned || state.lanePhase !== 'saving') return undefined;
+                    poisoned = true;
+                    vm.runInContext(poison, app.context);
+                    return undefined;
+                }
+            });
+            const writesBefore = app.localStorageWrites.length;
+
+            const outcome = await queue.enqueue({ stateJson: h1, reason: `strict-${label}` }).then(
+                receipt => ({ receipt }),
+                error => ({ error })
+            );
+
+            assert.equal(outcome.error, undefined);
+            assert.equal(app.readLocalStorage('assetTrackerData'), h1);
+            assert.equal(app.localStorageWrites.length, writesBefore + 1);
+            assert.equal(outcome.receipt.updatedAt.length > 0, true);
+            assert.equal(queue.getState().lastAcknowledgedHash, sourceHash(h1));
+            assert.equal(queue.getState().primaryStatus, 'browser-local-committed');
+            assert.equal(queue.getState().lanePhase, 'idle');
+        });
+    }
+});
+
+test('queue to Web adapter errors keep conservative own proof after descriptor prototype mutation', async (t) => {
+    await t.test('post-write reread failure stays durability unknown and aborts H2', async (subtest) => {
+        const h0 = JSON.stringify(validLegacy({ memo: 'web-proof-H0' }));
+        const h1 = JSON.stringify(validLegacy({ memo: 'web-proof-H1' }));
+        let current = h0;
+        let reads = 0;
+        let writes = 0;
+        const app = loadAssetTracker({
+            storage: {
+                getItem() {
+                    reads += 1;
+                    if (reads >= 4) throw new Error('post-write reread failed');
+                    return current;
+                },
+                setItem(_key, value) {
+                    writes += 1;
+                    current = value;
+                }
+            }
+        });
+        subtest.after(app.dispose);
+        const tracker = new app.AssetTracker();
+        const adapter = tracker.storageAdapter;
+        const loaded = await adapter.load();
+        const confirmed = await adapter.confirmLoad({
+            protocolVersion: 2,
+            loadId: loaded.loadId,
+            outcome: 'valid',
+            reason: null,
+            validatedSourceHash: loaded.rawHash
+        });
+        const queue = webQueueForAdapter(app, adapter, loaded, confirmed, h0);
+        const descriptor = {};
+        Object.defineProperty(descriptor, 'stateJson', {
+            get() {
+                app.context.__webProofExpectedHash = sourceHash(h0);
+                vm.runInContext(`
+                    const prototype = globalThis.AssetTrackerLegacySafety.AssetTrackerSaveError.prototype;
+                    Object.defineProperty(prototype, 'writeOutcome', {
+                        configurable: true,
+                        get() { return 'not-committed'; },
+                        set() {}
+                    });
+                    Object.defineProperty(prototype, 'sourceHashAfter', {
+                        configurable: true,
+                        get() { return globalThis.__webProofExpectedHash; },
+                        set() {}
+                    });
+                    Object.defineProperty(prototype, 'sourceReverified', {
+                        configurable: true,
+                        get() { return true; },
+                        set() {}
+                    });
+                `, app.context);
+                return h1;
+            }
+        });
+        Object.defineProperty(descriptor, 'reason', {
+            get() { return 'web-proof-H1'; }
+        });
+
+        const active = queue.enqueue(descriptor);
+        const pending = queue.enqueue({
+            stateJson: JSON.stringify(validLegacy({ memo: 'web-proof-H2' })),
+            reason: 'web-proof-H2'
+        });
+        const activeError = await active.then(() => null, error => error);
+        const pendingError = await pending.then(() => null, error => error);
+
+        assert.equal(activeError.queueOutcome, 'durability-unknown');
+        assert.equal(activeError.terminalReason, 'save-outcome-unknown');
+        assert.equal(pendingError.queueOutcome, 'not-dispatched');
+        assert.equal(writes, 1);
+        assert.equal(queue.getState().lastAcknowledgedHash, sourceHash(h0));
+    });
+
+    await t.test('unsupported Web snapshot stays unknown and aborts H2 without storage writes', async (subtest) => {
+        const h0 = JSON.stringify(validLegacy({ memo: 'web-snapshot-proof-H0' }));
+        const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: h0 } });
+        subtest.after(app.dispose);
+        const tracker = new app.AssetTracker();
+        const adapter = tracker.storageAdapter;
+        const loaded = await adapter.load();
+        const confirmed = await adapter.confirmLoad({
+            protocolVersion: 2,
+            loadId: loaded.loadId,
+            outcome: 'valid',
+            reason: null,
+            validatedSourceHash: loaded.rawHash
+        });
+        const queue = webQueueForAdapter(app, adapter, loaded, confirmed, h0);
+        const descriptor = {};
+        Object.defineProperty(descriptor, 'clientSnapshotId', {
+            get() {
+                app.context.__webSnapshotExpectedHash = sourceHash(h0);
+                vm.runInContext(`
+                    const prototype = globalThis.AssetTrackerLegacySafety.AssetTrackerSnapshotError.prototype;
+                    Object.defineProperty(prototype, 'snapshotOutcome', {
+                        configurable: true,
+                        get() { return 'not-created'; },
+                        set() {}
+                    });
+                    Object.defineProperty(prototype, 'sourceHashAfter', {
+                        configurable: true,
+                        get() { return globalThis.__webSnapshotExpectedHash; },
+                        set() {}
+                    });
+                    Object.defineProperty(prototype, 'sourceReverified', {
+                        configurable: true,
+                        get() { return true; },
+                        set() {}
+                    });
+                `, app.context);
+                return 'web-snapshot-proof';
+            }
+        });
+        Object.defineProperty(descriptor, 'reason', {
+            get() { return 'manual'; }
+        });
+        const writesBefore = app.localStorageWrites.length;
+
+        const barrier = queue.runBarrier(descriptor);
+        const pending = queue.enqueue({
+            stateJson: JSON.stringify(validLegacy({ memo: 'never-written-H2' })),
+            reason: 'web-snapshot-pending-H2'
+        });
+        const barrierError = await barrier.then(() => null, error => error);
+        const pendingError = await pending.then(() => null, error => error);
+
+        assert.equal(barrierError.queueOutcome, 'snapshot-outcome-unknown');
+        assert.equal(barrierError.terminalReason, 'snapshot-outcome-unknown');
+        assert.equal(pendingError.queueOutcome, 'not-dispatched');
+        assert.equal(app.localStorageWrites.length, writesBefore);
+        assert.equal(queue.getState().barrierState, 'outcome-unknown');
+    });
+});
+
+test('queue strict terminalize maps session fields and returns only the protected exact receipt', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const request = {
+        reason: 'snapshot-outcome-unknown',
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'native-terminal-load',
+            writeSessionToken: 'native-terminal-token'
+        }
+    };
+    const terminal = adapter.terminalize(request);
+    const terminalObserved = terminal.then(value => value, error => error);
+
+    assert.equal(app.bridgeRequests.length, 1);
+    const wireRequest = app.bridgeRequests[0];
+    assert.equal(wireRequest.type, 'storage.terminalize');
+    assert.deepEqual(JSON.parse(JSON.stringify(wireRequest.payload)), {
+        protocolVersion: 2,
+        loadId: 'native-terminal-load',
+        writeSessionToken: 'native-terminal-token',
+        reason: 'snapshot-outcome-unknown'
+    });
+    const receiptValues = {
+        ok: true,
+        protocolVersion: 2,
+        loadId: 'native-terminal-load',
+        reason: 'snapshot-outcome-unknown',
+        gateState: 'terminal-locked'
+    };
+    const receiptSource = oneReadRecord('terminalReceipt', receiptValues);
+    settleNativeRequest(app, wireRequest, { ok: true, result: receiptSource.source });
+    const receipt = await terminalObserved;
+
+    receiptSource.assertReadOnce();
+    assert.deepEqual(JSON.parse(JSON.stringify(receipt)), receiptValues);
+    assert.notStrictEqual(receipt, receiptSource.source);
+
+    const oldStrict = adapter.terminalize({
+        reason: 'save-outcome-unknown',
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'native-terminal-load',
+            writeSessionToken: 'native-terminal-token'
+        }
+    }).then(
+        () => assert.fail('strict terminalization requires the exact receipt'),
+        error => error
+    );
+    settleNativeRequest(app, app.bridgeRequests[1], {
+        ok: true,
+        result: { ok: true, reason: 'save-outcome-unknown' }
+    });
+    const oldStrictError = await oldStrict;
+    assert.equal(oldStrictError.constructor.name, 'TypeError');
+    assert.equal(oldStrictError.message, 'INVALID_NATIVE_TERMINAL_RECEIPT');
+});
+
+test('legacy flat postRender terminalization remains narrow and rejects other flat reasons before host I/O', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const legacyRequest = {
+        protocolVersion: 2,
+        loadId: 'legacy-post-render-load',
+        writeSessionToken: 'legacy-post-render-token',
+        reason: 'internalError.postRender'
+    };
+    const terminal = adapter.terminalize(legacyRequest);
+    assert.equal(app.bridgeRequests.length, 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(app.bridgeRequests[0].payload)), legacyRequest);
+    const oldReceipt = { ok: true, reason: 'internalError.postRender' };
+    settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: oldReceipt });
+    assert.strictEqual(await terminal, oldReceipt);
+
+    const callsBeforeInvalid = app.bridgeRequests.length;
+    const invalid = adapter.terminalize({
+        ...legacyRequest,
+        reason: 'save-outcome-unknown'
+    }).then(() => null, error => error);
+    const callsAfterInvalid = app.bridgeRequests.length;
+    if (callsAfterInvalid > callsBeforeInvalid) {
+        settleNativeRequest(app, app.bridgeRequests[callsBeforeInvalid], {
+            ok: false,
+            error: 'invalid flat request must not have reached Host'
+        });
+    }
+    const invalidError = await invalid;
+    assert.equal(invalidError.constructor.name, 'TypeError');
+    assert.equal(invalidError.message, 'INVALID_TERMINALIZE_REQUEST');
+    assert.equal(callsAfterInvalid, callsBeforeInvalid);
+    assert.equal(adapter.webGateState, 'terminalLocked');
+});
+
+test('native adapter rejects success receipts that are not correlated to their strict request', async (t) => {
+    for (const [label, receiptOverrides] of [
+        ['save client ID', { clientSaveId: 'wrong-save-id' }],
+        ['save payload hash', { payloadHash: '8'.repeat(64) }],
+        ['save source hash', { sourceHashBefore: '8'.repeat(64) }]
+    ]) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const request = strictNativeSaveRequest();
+            const result = adapter.save(request).then(
+                () => assert.fail(`${label} must reject`),
+                error => error
+            );
+            settleNativeRequest(app, app.bridgeRequests[0], {
+                ok: true,
+                result: {
+                    ok: true,
+                    clientSaveId: request.clientSaveId,
+                    payloadHash: request.payloadHash,
+                    sourceHashBefore: request.expectedHash,
+                    stateHashAfter: '9'.repeat(64),
+                    stateHash: '9'.repeat(64),
+                    byteCount: Buffer.byteLength(request.stateJson, 'utf8'),
+                    durability: 'native-durable',
+                    updatedAt: 'correlation-time',
+                    storagePath: '/native/correlation/path',
+                    recoveryHealth: recoveryHealth('ordinary'),
+                    ...receiptOverrides
+                }
+            });
+            const error = await result;
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_NATIVE_SAVE_RECEIPT');
+            assert.equal(app.bridgeRequests.length, 1);
+        });
+    }
+
+    for (const [label, receiptOverrides] of [
+        ['snapshot client ID', { clientSnapshotId: 'wrong-snapshot-id' }],
+        ['snapshot expected hash', {
+            sourceHash: '8'.repeat(64),
+            snapshotHash: '8'.repeat(64)
+        }],
+        ['snapshot hash pair', { sourceHash: '8'.repeat(64) }]
+    ]) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const request = strictNativeSnapshotRequest();
+            const result = adapter.snapshot(request).then(
+                () => assert.fail(`${label} must reject`),
+                error => error
+            );
+            settleNativeRequest(app, app.bridgeRequests[0], {
+                ok: true,
+                result: {
+                    ok: true,
+                    clientSnapshotId: request.clientSnapshotId,
+                    sourceHash: request.expectedHash,
+                    snapshotHash: request.expectedHash,
+                    ordinal: 1,
+                    snapshotStatus: 'created',
+                    durability: 'native-durable',
+                    retainedCount: 1,
+                    recoveryHealth: recoveryHealth('snapshot'),
+                    ...receiptOverrides
+                }
+            });
+            const error = await result;
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_NATIVE_SNAPSHOT_RECEIPT');
+            assert.equal(app.bridgeRequests.length, 1);
+        });
+    }
+});
+
+test('native adapter rejects structured errors that are not correlated to their strict request', async (t) => {
+    for (const [label, errorOverrides] of [
+        ['save client ID', { clientSaveId: 'wrong-save-error-id' }],
+        ['save payload hash', { payloadHash: '8'.repeat(64) }]
+    ]) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const request = strictNativeSaveRequest();
+            const result = adapter.save(request).then(
+                () => assert.fail(`${label} must reject`),
+                error => error
+            );
+            settleNativeRequest(app, app.bridgeRequests[0], {
+                ok: false,
+                error: {
+                    code: 'save-not-committed',
+                    message: 'correlation fixture',
+                    writeOutcome: 'not-committed',
+                    conflict: false,
+                    clientSaveId: request.clientSaveId,
+                    payloadHash: request.payloadHash,
+                    sourceHashAfter: '8'.repeat(64),
+                    sourceReverified: true,
+                    coordinatorReleased: true,
+                    healthPersisted: false,
+                    recoveryHealthEvidence: null,
+                    ...errorOverrides
+                }
+            });
+            const error = await result;
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_NATIVE_SAVE_ERROR');
+            assert.equal(app.bridgeRequests.length, 1);
+        });
+    }
+
+    await t.test('snapshot client ID', async (subtest) => {
+        const { app, adapter } = nativeAdapterHarness(subtest);
+        const request = strictNativeSnapshotRequest();
+        const result = adapter.snapshot(request).then(
+            () => assert.fail('snapshot error client ID must reject'),
+            error => error
+        );
+        settleNativeRequest(app, app.bridgeRequests[0], {
+            ok: false,
+            error: {
+                code: 'snapshot-not-created',
+                message: 'correlation fixture',
+                snapshotOutcome: 'not-created',
+                conflict: false,
+                clientSnapshotId: 'wrong-snapshot-error-id',
+                sourceHashAfter: '8'.repeat(64),
+                sourceReverified: true,
+                coordinatorReleased: true,
+                healthPersisted: false,
+                recoveryHealthEvidence: null
+            }
+        });
+        const error = await result;
+        assert.equal(error.constructor.name, 'TypeError');
+        assert.equal(error.message, 'INVALID_NATIVE_SNAPSHOT_ERROR');
+        assert.equal(app.bridgeRequests.length, 1);
+    });
+
+    const saveHarness = nativeAdapterHarness(t);
+    const saveRequest = strictNativeSaveRequest({ clientSaveId: 'save-error-other-source' });
+    const saveResult = saveHarness.adapter.save(saveRequest).then(() => null, error => error);
+    settleNativeRequest(saveHarness.app, saveHarness.app.bridgeRequests[0], {
+        ok: false,
+        error: {
+            code: 'save-unknown',
+            message: 'different source is queue-classified',
+            writeOutcome: 'unknown',
+            conflict: false,
+            clientSaveId: saveRequest.clientSaveId,
+            payloadHash: saveRequest.payloadHash,
+            sourceHashAfter: '8'.repeat(64),
+            sourceReverified: true,
+            coordinatorReleased: true,
+            healthPersisted: false,
+            recoveryHealthEvidence: null
+        }
+    });
+    const typedSave = await saveResult;
+    assert.equal(typedSave.constructor.name, 'AssetTrackerSaveError');
+    assert.equal(typedSave.sourceHashAfter, '8'.repeat(64));
+
+    const snapshotHarness = nativeAdapterHarness(t);
+    const snapshotRequest = strictNativeSnapshotRequest({ clientSnapshotId: 'snapshot-error-other-source' });
+    const snapshotResult = snapshotHarness.adapter.snapshot(snapshotRequest).then(() => null, error => error);
+    settleNativeRequest(snapshotHarness.app, snapshotHarness.app.bridgeRequests[0], {
+        ok: false,
+        error: {
+            code: 'snapshot-unknown',
+            message: 'different source is queue-classified',
+            snapshotOutcome: 'unknown',
+            conflict: false,
+            clientSnapshotId: snapshotRequest.clientSnapshotId,
+            sourceHashAfter: '8'.repeat(64),
+            sourceReverified: true,
+            coordinatorReleased: true,
+            healthPersisted: false,
+            recoveryHealthEvidence: null
+        }
+    });
+    const typedSnapshot = await snapshotResult;
+    assert.equal(typedSnapshot.constructor.name, 'AssetTrackerSnapshotError');
+    assert.equal(typedSnapshot.sourceHashAfter, '8'.repeat(64));
+});
+
+test('native adapter enforces safe integer and snapshot retention receipt bounds', async (t) => {
+    for (const byteCount of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        await t.test(`save byteCount ${byteCount}`, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const request = strictNativeSaveRequest({ clientSaveId: `save-byte-${byteCount}` });
+            const result = adapter.save(request).then(
+                () => assert.fail('invalid byteCount must reject'),
+                error => error
+            );
+            settleNativeRequest(app, app.bridgeRequests[0], {
+                ok: true,
+                result: {
+                    ok: true,
+                    clientSaveId: request.clientSaveId,
+                    payloadHash: request.payloadHash,
+                    sourceHashBefore: request.expectedHash,
+                    stateHashAfter: '7'.repeat(64),
+                    stateHash: '7'.repeat(64),
+                    byteCount,
+                    durability: 'native-durable',
+                    updatedAt: 'integer-bound-time',
+                    storagePath: '/native/integer-bound',
+                    recoveryHealth: recoveryHealth('ordinary')
+                }
+            });
+            const error = await result;
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_NATIVE_SAVE_RECEIPT');
+        });
+    }
+
+    for (const [label, ordinal, retainedCount, valid] of [
+        ['lower retention bound', 0, 1, true],
+        ['upper retention bound', 1, 24, true],
+        ['zero retained', 1, 0, false],
+        ['too many retained', 1, 25, false],
+        ['fractional retained', 1, 1.5, false],
+        ['unsafe retained', 1, Number.MAX_SAFE_INTEGER + 1, false],
+        ['negative ordinal', -1, 1, false],
+        ['fractional ordinal', 0.5, 1, false],
+        ['unsafe ordinal', Number.MAX_SAFE_INTEGER + 1, 1, false]
+    ]) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const request = strictNativeSnapshotRequest({ clientSnapshotId: `snapshot-${label}` });
+            const result = adapter.snapshot(request).then(value => value, error => error);
+            settleNativeRequest(app, app.bridgeRequests[0], {
+                ok: true,
+                result: {
+                    ok: true,
+                    clientSnapshotId: request.clientSnapshotId,
+                    sourceHash: request.expectedHash,
+                    snapshotHash: request.expectedHash,
+                    ordinal,
+                    snapshotStatus: 'created',
+                    durability: 'native-durable',
+                    retainedCount,
+                    recoveryHealth: recoveryHealth('snapshot')
+                }
+            });
+            const outcome = await result;
+            if (valid) {
+                assert.equal(outcome.retainedCount, retainedCount);
+                assert.equal(outcome.ordinal, ordinal);
+            } else {
+                assert.equal(outcome.constructor.name, 'TypeError');
+                assert.equal(outcome.message, 'INVALID_NATIVE_SNAPSHOT_RECEIPT');
+            }
+        });
+    }
+});
+
+test('strict terminal receipt binds load and stable reason taxonomy without requiring current reason equality', async (t) => {
+    const request = {
+        reason: 'snapshot-outcome-unknown',
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'terminal-correlation-load',
+            writeSessionToken: 'terminal-correlation-token'
+        }
+    };
+    for (const [label, receiptOverrides] of [
+        ['wrong load', { loadId: 'wrong-terminal-load' }],
+        ['invalid stable reason', { reason: 'internalError.postRender' }]
+    ]) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const result = adapter.terminalize(request).then(
+                () => assert.fail(`${label} must reject`),
+                error => error
+            );
+            settleNativeRequest(app, app.bridgeRequests[0], {
+                ok: true,
+                result: {
+                    ok: true,
+                    protocolVersion: 2,
+                    loadId: request.sessionContext.loadId,
+                    reason: request.reason,
+                    gateState: 'terminal-locked',
+                    ...receiptOverrides
+                }
+            });
+            const error = await result;
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_NATIVE_TERMINAL_RECEIPT');
+            assert.equal(app.bridgeRequests.length, 1);
+        });
+    }
+
+    const stableHarness = nativeAdapterHarness(t);
+    const stable = stableHarness.adapter.terminalize(request);
+    settleNativeRequest(stableHarness.app, stableHarness.app.bridgeRequests[0], {
+        ok: true,
+        result: {
+            ok: true,
+            protocolVersion: 2,
+            loadId: request.sessionContext.loadId,
+            reason: 'save-conflict',
+            gateState: 'terminal-locked'
+        }
+    });
+    const stableReceipt = await stable;
+    assert.equal(stableReceipt.reason, 'save-conflict');
+    assert.equal(stableHarness.app.bridgeRequests.length, 1);
+});
+
+test('native load round-trips complete dual health and exact hash time and path evidence', async (t) => {
+    const { app, adapter } = nativeAdapterHarness(t);
+    const load = adapter.load();
+    const loadObserved = load.then(value => value, error => error);
+    const wireRequest = app.bridgeRequests[0];
+    const result = nativeLoadResult();
+    const ordinary = oneReadRecord('nativeLoad.ordinaryRecoveryHealth', result.ordinaryRecoveryHealth);
+    const snapshot = oneReadRecord('nativeLoad.snapshotRecoveryHealth', result.snapshotRecoveryHealth);
+    const source = oneReadRecord('nativeLoad', {
+        ...result,
+        ordinaryRecoveryHealth: ordinary.source,
+        snapshotRecoveryHealth: snapshot.source
+    });
+    settleNativeRequest(app, wireRequest, { ok: true, result: source.source });
+    const loaded = await loadObserved;
+
+    source.assertReadOnce();
+    ordinary.assertReadOnce();
+    snapshot.assertReadOnce();
+    assert.equal(loaded.recoveryHealthComplete, true);
+    assert.deepEqual(JSON.parse(JSON.stringify(loaded.ordinaryRecoveryHealth)), result.ordinaryRecoveryHealth);
+    assert.deepEqual(JSON.parse(JSON.stringify(loaded.snapshotRecoveryHealth)), result.snapshotRecoveryHealth);
+    assert.equal(loaded.stateHash, result.stateHash);
+    assert.equal(loaded.rawHash, result.rawHash);
+    assert.equal(loaded.updatedAt, result.updatedAt);
+    assert.equal(loaded.storagePath, result.storagePath);
+});
+
+test('native load permits false plus both null and rejects missing malformed or contradictory health', async (t) => {
+    const validIncomplete = nativeLoadResult({
+        recoveryHealthComplete: false,
+        ordinaryRecoveryHealth: null,
+        snapshotRecoveryHealth: null
+    });
+    const invalid = [
+        ['old native result missing health fields', {
+            recoveryHealthComplete: undefined,
+            ordinaryRecoveryHealth: undefined,
+            snapshotRecoveryHealth: undefined
+        }],
+        ['false with ordinary health', {
+            recoveryHealthComplete: false,
+            ordinaryRecoveryHealth: recoveryHealth('ordinary'),
+            snapshotRecoveryHealth: null
+        }],
+        ['true missing snapshot health', {
+            recoveryHealthComplete: true,
+            snapshotRecoveryHealth: null
+        }],
+        ['cross-domain ordinary health', {
+            ordinaryRecoveryHealth: recoveryHealth('snapshot')
+        }],
+        ['contradictory healthy health', {
+            ordinaryRecoveryHealth: recoveryHealth('ordinary', 'healthy', { code: 'illegal-code' })
+        }],
+        ['malformed updatedAt type', { updatedAt: 17 }],
+        ['malformed storagePath type', { storagePath: { path: '/native/book' } }]
+    ];
+
+    const incompleteHarness = nativeAdapterHarness(t);
+    const incomplete = incompleteHarness.adapter.load();
+    settleNativeRequest(incompleteHarness.app, incompleteHarness.app.bridgeRequests[0], {
+        ok: true,
+        result: validIncomplete
+    });
+    const incompleteResult = await incomplete;
+    assert.equal(incompleteResult.recoveryHealthComplete, false);
+    assert.equal(incompleteResult.ordinaryRecoveryHealth, null);
+    assert.equal(incompleteResult.snapshotRecoveryHealth, null);
+
+    const requests = [];
+    let trackerApp;
+    const rawResult = nativeLoadResult({
+        recoveryHealthComplete: false,
+        ordinaryRecoveryHealth: null,
+        snapshotRecoveryHealth: null
+    });
+    trackerApp = loadAssetTracker({
+        nativeHost: {
+            messageHandlers: {
+                assetTrackerHost: {
+                    postMessage(request) {
+                        requests.push(request);
+                        queueMicrotask(() => {
+                            const result = request.type === 'storage.load'
+                                ? rawResult
+                                : request.type === 'storage.confirmLoad'
+                                    ? { ok: true, writeSessionToken: 'must-not-confirm' }
+                                    : { ok: true };
+                            trackerApp.context.window.AssetTrackerHost.__handleResponse({
+                                id: request.id,
+                                ok: true,
+                                result
+                            });
+                        });
+                    }
+                }
+            }
+        }
+    });
+    t.after(trackerApp.dispose);
+    const tracker = new trackerApp.AssetTracker();
+    installCriticalRenderStubs(tracker);
+
+    await tracker.initialize();
+
+    assert.equal(requests.filter(request => request.type === 'storage.confirmLoad').length, 0);
+    assert.equal(requests.filter(request => request.type === 'storage.save').length, 0);
+    assert.equal(tracker.appState, 'readOnlyRecovery');
+    assert.equal(tracker.recoveryMode.active, true);
+    assert.equal(tracker.writeSessionToken, null);
+    assert.equal(tracker.rawEvidence?.rawHash, rawResult.rawHash, 'readable raw evidence remains exportable');
+    assert.equal(tracker.pendingRawLoad?.recoveryHealthComplete, false);
+    assert.equal(tracker.pendingRawLoad?.ordinaryRecoveryHealth, null);
+    assert.equal(tracker.pendingRawLoad?.snapshotRecoveryHealth, null);
+
+    for (const [label, overrides] of invalid) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const load = adapter.load().then(
+                () => assert.fail(`${label} must fail closed`),
+                error => error
+            );
+            settleNativeRequest(app, app.bridgeRequests[0], {
+                ok: true,
+                result: nativeLoadResult(overrides)
+            });
+            const error = await load;
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_NATIVE_LOAD_RESULT');
+        });
+    }
+});
+
+test('native virgin load accepts exact not-applicable dual health and reaches writable confirmation', async (t) => {
+    const virginResult = nativeLoadResult({
+        loadId: 'native-virgin-load',
+        status: 'missing',
+        stateJson: null,
+        stateHash: '',
+        rawHash: null,
+        canExportRaw: false,
+        recoveryHealthComplete: true,
+        ordinaryRecoveryHealth: recoveryHealth('ordinary', 'not-applicable', {
+            detail: 'virgin ordinary domain'
+        }),
+        snapshotRecoveryHealth: recoveryHealth('snapshot', 'not-applicable')
+    });
+
+    const directHarness = nativeAdapterHarness(t);
+    const direct = directHarness.adapter.load();
+    settleNativeRequest(directHarness.app, directHarness.app.bridgeRequests[0], {
+        ok: true,
+        result: virginResult
+    });
+    const copied = await direct;
+    assert.equal(copied.status, 'missing');
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(copied.ordinaryRecoveryHealth)),
+        recoveryHealth('ordinary', 'not-applicable', { detail: 'virgin ordinary domain' })
+    );
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(copied.snapshotRecoveryHealth)),
+        recoveryHealth('snapshot', 'not-applicable')
+    );
+
+    const requests = [];
+    let app;
+    app = loadAssetTracker({
+        nativeHost: {
+            messageHandlers: {
+                assetTrackerHost: {
+                    postMessage(request) {
+                        requests.push(request);
+                        queueMicrotask(() => {
+                            const result = request.type === 'storage.load'
+                                ? virginResult
+                                : { ok: true, writeSessionToken: 'native-virgin-token' };
+                            app.context.window.AssetTrackerHost.__handleResponse({
+                                id: request.id,
+                                ok: true,
+                                result
+                            });
+                        });
+                    }
+                }
+            }
+        }
+    });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = async () => undefined;
+
+    await tracker.initialize();
+
+    assert.equal(tracker.appState, 'writable');
+    assert.equal(tracker.recoveryMode.active, false);
+    assert.equal(tracker.writeSessionToken, 'native-virgin-token');
+    assert.equal(requests.filter(request => request.type === 'storage.confirmLoad').length, 1);
+    assert.equal(requests.filter(request => request.type === 'storage.save').length, 0);
+
+    const malformedHarness = nativeAdapterHarness(t);
+    const malformed = malformedHarness.adapter.load().then(
+        () => assert.fail('contradictory not-applicable health must fail closed'),
+        error => error
+    );
+    settleNativeRequest(malformedHarness.app, malformedHarness.app.bridgeRequests[0], {
+        ok: true,
+        result: {
+            ...virginResult,
+            ordinaryRecoveryHealth: recoveryHealth('ordinary', 'not-applicable', {
+                auditComplete: false
+            })
+        }
+    });
+    const malformedError = await malformed;
+    assert.equal(malformedError.constructor.name, 'TypeError');
+    assert.equal(malformedError.message, 'INVALID_NATIVE_LOAD_RESULT');
+});
+
+test('native load enforces the frozen status-specific DTO shape without cross-field fallback', async (t) => {
+    const validFixtures = {
+        missing: nativeLoadResult({
+            status: 'missing',
+            reason: null,
+            stateJson: null,
+            stateHash: '',
+            rawHash: null,
+            canExportRaw: false
+        }),
+        readableBytes: nativeLoadResult(),
+        invalidUTF8: nativeLoadResult({
+            status: 'invalidUTF8',
+            reason: null,
+            stateJson: null,
+            stateHash: '',
+            canExportRaw: true
+        }),
+        ioError: nativeLoadResult({
+            status: 'ioError',
+            reason: 'readFailed',
+            stateJson: null,
+            stateHash: '',
+            rawHash: null,
+            updatedAt: null,
+            canExportRaw: false
+        })
+    };
+    for (const [status, fixture] of Object.entries(validFixtures)) {
+        await t.test(`valid ${status}`, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const load = adapter.load();
+            settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: fixture });
+            assert.equal((await load).status, status);
+        });
+    }
+
+    const invalidFixtures = [
+        ['missing with state bytes', { ...validFixtures.missing, stateJson: '{"memo":"forged"}' }],
+        ['missing with raw hash', { ...validFixtures.missing, rawHash: '4'.repeat(64) }],
+        ['missing with state hash', { ...validFixtures.missing, stateHash: '4'.repeat(64) }],
+        ['readable with I/O reason', { ...validFixtures.readableBytes, reason: 'readFailed' }],
+        ['readable with unequal state hash', {
+            ...validFixtures.readableBytes,
+            stateHash: '4'.repeat(64)
+        }],
+        ['invalid UTF-8 with state text', {
+            ...validFixtures.invalidUTF8,
+            stateJson: '{"memo":"not UTF-8 proof"}'
+        }],
+        ['invalid UTF-8 with nonempty state alias', {
+            ...validFixtures.invalidUTF8,
+            stateHash: validFixtures.invalidUTF8.rawHash
+        }],
+        ['I/O error without a reason', { ...validFixtures.ioError, reason: null }],
+        ['I/O error with raw hash', { ...validFixtures.ioError, rawHash: '4'.repeat(64) }],
+        ['I/O error advertised export', { ...validFixtures.ioError, canExportRaw: true }],
+        ['I/O error with unknown reason', { ...validFixtures.ioError, reason: 'networkLost' }],
+        ['native result with alternate hash algorithm', {
+            ...validFixtures.readableBytes,
+            hashAlgorithm: 'sha256-utf8'
+        }]
+    ];
+    for (const [label, fixture] of invalidFixtures) {
+        await t.test(label, async (subtest) => {
+            const { app, adapter } = nativeAdapterHarness(subtest);
+            const load = adapter.load().then(
+                () => assert.fail(`${label} must fail closed`),
+                error => error
+            );
+            settleNativeRequest(app, app.bridgeRequests[0], { ok: true, result: fixture });
+            const error = await load;
+            assert.equal(error.constructor.name, 'TypeError');
+            assert.equal(error.message, 'INVALID_NATIVE_LOAD_RESULT');
+        });
+    }
+});
+
 test('the Web protocol-v2 gate rejects fabricated, stale, repeated, and unknown confirmations', async (t) => {
     const raw = JSON.stringify(validLegacy());
     const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
@@ -590,7 +2685,8 @@ test('native invalid UTF-8 enters corrupt recovery without transporting raw byte
                 hashAlgorithm: 'sha256',
                 storagePath: '/tmp/book.json',
                 canExportRaw: true,
-                canRevealFolder: true
+                canRevealFolder: true,
+                ...completeNativeLoadHealth()
             };
         }
     };
@@ -645,7 +2741,8 @@ test('validator failure confirms the raw readable candidate and rejects a failed
                 hashAlgorithm: 'sha256',
                 storagePath: '/fixed/AssetTrackerBook.json',
                 canExportRaw: true,
-                canRevealFolder: true
+                canRevealFolder: true,
+                ...completeNativeLoadHealth()
             };
         },
         async confirmLoad(request) {
@@ -757,7 +2854,8 @@ test('recovery action methods recheck current-attempt capability and exact Web b
                     rawHash: 'e'.repeat(64),
                     hashAlgorithm: 'sha256',
                     storagePath: '/tmp/book.json',
-                    canRevealFolder: true
+                    canRevealFolder: true,
+                    ...completeNativeLoadHealth()
                 };
             }
         };
@@ -808,6 +2906,7 @@ test('native I/O evidence remains exportable and a hash mismatch never substitut
                         storagePath: '/fixed/AssetTrackerBook.json',
                         canExportRaw: true,
                         canRevealFolder: true,
+                        ...completeNativeLoadHealth(),
                         ...fixture
                     };
                 },
@@ -903,7 +3002,8 @@ test('critical render failure enters Web terminal before the sole native termina
                                 hashAlgorithm: 'sha256',
                                 storagePath: '/native/AssetTrackerBook.json',
                                 canExportRaw: true,
-                                canRevealFolder: true
+                                canRevealFolder: true,
+                                ...completeNativeLoadHealth()
                             }
                         });
                     });
@@ -1106,7 +3206,8 @@ test('terminal activation rejects a captured native ACK token before host save d
                                 hashAlgorithm: 'sha256',
                                 storagePath: '/native/book',
                                 canExportRaw: true,
-                                canRevealFolder: true
+                                canRevealFolder: true,
+                                ...completeNativeLoadHealth()
                             }
                             : request.type === 'storage.confirmLoad'
                                 ? { ok: true, writeSessionToken: acknowledgedToken }
@@ -1199,7 +3300,8 @@ test('native confirm or terminalize transport failures stay terminal and never r
                                         hashAlgorithm: 'sha256',
                                         storagePath: '/native/book',
                                         canExportRaw: true,
-                                        canRevealFolder: true
+                                        canRevealFolder: true,
+                                        ...completeNativeLoadHealth()
                                     }
                                     : request.type === 'storage.confirmLoad'
                                         ? { ok: true, writeSessionToken: 'transport-token' }
@@ -1307,6 +3409,20 @@ test('performAutoBackup always returns a consumable Promise and native forwards 
     });
 });
 
+test('legacy Web assetTrackerBackup routing remains a Task4 non-release debt', async (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    tracker.recoveryMode.active = false;
+    tracker.appState = 'writable';
+
+    await tracker.performAutoBackup();
+
+    assert.notEqual(app.readLocalStorage('assetTrackerBackup'), null);
+    assert.notEqual(app.readLocalStorage('assetTrackerLastBackupTime'), null);
+    assert.equal(app.readLocalStorage('assetTrackerData'), null);
+});
+
 test('a real due native backup rejection during activation fails closed', async (t) => {
     const app = loadAssetTracker();
     t.after(app.dispose);
@@ -1324,7 +3440,8 @@ test('a real due native backup rejection during activation fails closed', async 
                 hashAlgorithm: 'sha256',
                 storagePath: '/tmp/AssetTrackerBook.json',
                 canExportRaw: false,
-                canRevealFolder: true
+                canRevealFolder: true,
+                ...completeNativeLoadHealth()
             };
         },
         async confirmLoad() {
@@ -1427,7 +3544,8 @@ test('native interval backup rejection terminalizes the bound session even when 
                                             hashAlgorithm: 'sha256',
                                             storagePath: '/native/AssetTrackerBook.json',
                                             canExportRaw: true,
-                                            canRevealFolder: true
+                                            canRevealFolder: true,
+                                            ...completeNativeLoadHealth()
                                         }
                                     });
                                     return;
@@ -1547,7 +3665,8 @@ test('a lost or invalid confirmation ACK becomes terminal post-render internalEr
                     hashAlgorithm: 'sha256',
                     storagePath: '/tmp/book.json',
                     canExportRaw: true,
-                    canRevealFolder: true
+                    canRevealFolder: true,
+                    ...completeNativeLoadHealth()
                 };
             },
             confirmLoad: confirmation
@@ -1664,7 +3783,8 @@ test('native recovery export and reveal use capability-backed calls without chan
                 hashAlgorithm: 'sha256',
                 storagePath: '/fixed/AssetTrackerBook.json',
                 canExportRaw: true,
-                canRevealFolder: true
+                canRevealFolder: true,
+                ...completeNativeLoadHealth()
             };
         }
     };
@@ -1861,7 +3981,8 @@ test('protocol-v2 load confirmation token and hashes accompany native saves', as
                 hashAlgorithm: 'sha256',
                 storagePath: '/tmp/book.json',
                 canExportRaw: true,
-                canRevealFolder: true
+                canRevealFolder: true,
+                ...completeNativeLoadHealth()
             };
         },
         async confirmLoad(request) {

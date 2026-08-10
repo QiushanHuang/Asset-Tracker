@@ -3,6 +3,22 @@ const ASSET_BOOK_FORMAT_VERSION = 1;
 const ASSET_BOOK_SCHEMA_VERSION = 1;
 const ASSET_BOOK_PROTOCOL_VERSION = 2;
 const LegacySafety = globalThis.AssetTrackerLegacySafety;
+const adapterReflectGet = Reflect.get;
+const adapterReflectApply = Reflect.apply;
+const adapterObjectCreate = Object.create;
+const adapterObjectDefineProperty = Object.defineProperty;
+const adapterObjectFreeze = Object.freeze;
+const adapterObjectGetPrototypeOf = Object.getPrototypeOf;
+const adapterObjectGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const adapterArrayIsArray = Array.isArray;
+const adapterNumberIsSafeInteger = Number.isSafeInteger;
+const adapterStringCharCodeAt = String.prototype.charCodeAt;
+const adapterDate = Date;
+const adapterDateToISOString = Date.prototype.toISOString;
+const adapterTypedArrayByteLengthGetter = adapterObjectGetOwnPropertyDescriptor(
+    adapterObjectGetPrototypeOf(Uint8Array.prototype),
+    'byteLength'
+).get;
 
 if (!LegacySafety || typeof LegacySafety.validateBookText !== 'function') {
     throw new Error('AssetTrackerLegacySafety must load before script.js');
@@ -65,7 +81,14 @@ if (!LegacySafety || typeof LegacySafety.validateBookText !== 'function') {
             if (response.ok) {
                 pending.resolve(response.result);
             } else {
-                pending.reject(new Error(response.error || 'Native host returned error'));
+                const responseError = response.error;
+                if (responseError !== null && typeof responseError === 'object') {
+                    pending.reject(responseError);
+                } else if (typeof responseError === 'string' && responseError.length > 0) {
+                    pending.reject(new Error(responseError));
+                } else {
+                    pending.reject(new Error('Native host returned error'));
+                }
             }
         }
     };
@@ -75,6 +98,472 @@ if (!LegacySafety || typeof LegacySafety.validateBookText !== 'function') {
 
 function safeComputeHash(text) {
     return LegacySafety.inspectDOMString(String(text)).rawHash;
+}
+
+function webNotApplicableRecoveryHealth(domain) {
+    return {
+        domain,
+        status: 'not-applicable',
+        auditComplete: true,
+        code: null,
+        maintenancePendingCount: 0,
+        detail: null
+    };
+}
+
+function createWebSaveError(request, message, overrides = {}) {
+    const error = new LegacySafety.AssetTrackerSaveError(message);
+    const values = {
+        code: 'web-write-outcome-unknown',
+        writeOutcome: 'unknown',
+        conflict: false,
+        clientSaveId: request.clientSaveId,
+        payloadHash: request.payloadHash,
+        sourceHashAfter: null,
+        sourceReverified: false,
+        coordinatorReleased: true,
+        healthPersisted: false,
+        recoveryHealthEvidence: null,
+        ...overrides
+    };
+    defineAdapterOwnData(error, 'code', values.code);
+    defineAdapterOwnData(error, 'writeOutcome', values.writeOutcome);
+    defineAdapterOwnData(error, 'conflict', values.conflict);
+    defineAdapterOwnData(error, 'clientSaveId', values.clientSaveId);
+    defineAdapterOwnData(error, 'payloadHash', values.payloadHash);
+    defineAdapterOwnData(error, 'sourceHashAfter', values.sourceHashAfter);
+    defineAdapterOwnData(error, 'sourceReverified', values.sourceReverified);
+    defineAdapterOwnData(error, 'coordinatorReleased', values.coordinatorReleased);
+    defineAdapterOwnData(error, 'healthPersisted', values.healthPersisted);
+    defineAdapterOwnData(error, 'recoveryHealthEvidence', values.recoveryHealthEvidence);
+    return adapterObjectFreeze(error);
+}
+
+const ADAPTER_RECOVERY_HEALTH_FIELDS = adapterObjectFreeze([
+    'domain',
+    'status',
+    'auditComplete',
+    'code',
+    'maintenancePendingCount',
+    'detail'
+]);
+const NATIVE_SAVE_RECEIPT_FIELDS = adapterObjectFreeze([
+    'ok',
+    'clientSaveId',
+    'payloadHash',
+    'sourceHashBefore',
+    'stateHashAfter',
+    'stateHash',
+    'byteCount',
+    'durability',
+    'updatedAt',
+    'storagePath',
+    'recoveryHealth'
+]);
+const NATIVE_SAVE_ERROR_FIELDS = adapterObjectFreeze([
+    'code',
+    'message',
+    'writeOutcome',
+    'conflict',
+    'clientSaveId',
+    'payloadHash',
+    'sourceHashAfter',
+    'sourceReverified',
+    'coordinatorReleased',
+    'healthPersisted',
+    'recoveryHealthEvidence'
+]);
+const NATIVE_SNAPSHOT_RECEIPT_FIELDS = adapterObjectFreeze([
+    'ok',
+    'clientSnapshotId',
+    'sourceHash',
+    'snapshotHash',
+    'ordinal',
+    'snapshotStatus',
+    'durability',
+    'retainedCount',
+    'recoveryHealth'
+]);
+const NATIVE_SNAPSHOT_ERROR_FIELDS = adapterObjectFreeze([
+    'code',
+    'message',
+    'snapshotOutcome',
+    'conflict',
+    'clientSnapshotId',
+    'sourceHashAfter',
+    'sourceReverified',
+    'coordinatorReleased',
+    'healthPersisted',
+    'recoveryHealthEvidence'
+]);
+const NATIVE_TERMINAL_RECEIPT_FIELDS = adapterObjectFreeze([
+    'ok',
+    'protocolVersion',
+    'loadId',
+    'reason',
+    'gateState'
+]);
+const NATIVE_LOAD_RESULT_FIELDS = adapterObjectFreeze([
+    'protocolVersion',
+    'loadId',
+    'status',
+    'reason',
+    'stateJson',
+    'stateHash',
+    'rawHash',
+    'hashAlgorithm',
+    'updatedAt',
+    'storagePath',
+    'canExportRaw',
+    'canRevealFolder',
+    'recoveryHealthComplete',
+    'ordinaryRecoveryHealth',
+    'snapshotRecoveryHealth'
+]);
+
+function isAdapterRecord(value) {
+    return value !== null && typeof value === 'object' && !adapterArrayIsArray(value);
+}
+
+function isAdapterPlainRecord(value) {
+    if (!isAdapterRecord(value)) return false;
+    try {
+        const prototype = adapterObjectGetPrototypeOf(value);
+        return prototype === null || adapterObjectGetPrototypeOf(prototype) === null;
+    } catch (_error) {
+        return false;
+    }
+}
+
+function isAdapterHash(value) {
+    if (typeof value !== 'string' || value.length !== 64) return false;
+    for (let index = 0; index < value.length; index += 1) {
+        const code = adapterReflectApply(adapterStringCharCodeAt, value, [index]);
+        if (!((code >= 48 && code <= 57) || (code >= 97 && code <= 102))) return false;
+    }
+    return true;
+}
+
+function readAdapterFields(source, fields, invalidMessage) {
+    if (!isAdapterRecord(source)) throw new TypeError(invalidMessage);
+    const values = adapterObjectCreate(null);
+    for (let index = 0; index < fields.length; index += 1) {
+        const field = fields[index];
+        try {
+            values[field] = adapterReflectGet(source, field);
+        } catch (_error) {
+            throw new TypeError(invalidMessage);
+        }
+    }
+    return adapterObjectFreeze(values);
+}
+
+function defineAdapterOwnData(target, key, value) {
+    adapterObjectDefineProperty(target, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true
+    });
+}
+
+function isStableTerminalReason(value) {
+    return value === 'save-not-committed'
+        || value === 'save-outcome-unknown'
+        || value === 'save-conflict'
+        || value === 'snapshot-outcome-unknown'
+        || value === 'snapshot-conflict'
+        || value === 'candidate-invalid'
+        || value === 'queue-callback-failed';
+}
+
+function copyAdapterRecoveryHealth(source, expectedDomain, invalidMessage) {
+    const health = readAdapterFields(source, ADAPTER_RECOVERY_HEALTH_FIELDS, invalidMessage);
+    if (health.domain !== expectedDomain
+        || (health.status !== 'healthy'
+            && health.status !== 'degraded'
+            && health.status !== 'not-applicable')
+        || typeof health.auditComplete !== 'boolean'
+        || !adapterNumberIsSafeInteger(health.maintenancePendingCount)
+        || health.maintenancePendingCount < 0
+        || (health.detail !== null && typeof health.detail !== 'string')) {
+        throw new TypeError(invalidMessage);
+    }
+    const degraded = health.status === 'degraded';
+    if ((degraded && (typeof health.code !== 'string' || health.code.length === 0))
+        || (!degraded && health.code !== null)
+        || (!degraded && health.auditComplete !== true)
+        || (!degraded && health.maintenancePendingCount !== 0)) {
+        throw new TypeError(invalidMessage);
+    }
+    return adapterObjectFreeze({
+        domain: health.domain,
+        status: health.status,
+        auditComplete: health.auditComplete,
+        code: health.code,
+        maintenancePendingCount: health.maintenancePendingCount,
+        detail: health.detail
+    });
+}
+
+function copyNativeSaveReceipt(source, request) {
+    const invalidMessage = 'INVALID_NATIVE_SAVE_RECEIPT';
+    const receipt = readAdapterFields(source, NATIVE_SAVE_RECEIPT_FIELDS, invalidMessage);
+    const recoveryHealth = copyAdapterRecoveryHealth(
+        receipt.recoveryHealth,
+        'ordinary',
+        invalidMessage
+    );
+    if (receipt.ok !== true
+        || receipt.clientSaveId !== request.clientSaveId
+        || receipt.payloadHash !== request.payloadHash
+        || receipt.sourceHashBefore !== request.expectedHash
+        || !isAdapterHash(receipt.stateHashAfter)
+        || receipt.stateHash !== receipt.stateHashAfter
+        || !adapterNumberIsSafeInteger(receipt.byteCount)
+        || receipt.byteCount <= 0
+        || receipt.durability !== 'native-durable'
+        || typeof receipt.updatedAt !== 'string'
+        || receipt.updatedAt.length === 0
+        || typeof receipt.storagePath !== 'string'
+        || receipt.storagePath.length === 0
+        || recoveryHealth.status === 'not-applicable') {
+        throw new TypeError(invalidMessage);
+    }
+    return adapterObjectFreeze({
+        ok: true,
+        clientSaveId: receipt.clientSaveId,
+        payloadHash: receipt.payloadHash,
+        sourceHashBefore: receipt.sourceHashBefore,
+        stateHashAfter: receipt.stateHashAfter,
+        stateHash: receipt.stateHash,
+        byteCount: receipt.byteCount,
+        durability: receipt.durability,
+        updatedAt: receipt.updatedAt,
+        storagePath: receipt.storagePath,
+        recoveryHealth
+    });
+}
+
+function copyNativeSnapshotReceipt(source, request) {
+    const invalidMessage = 'INVALID_NATIVE_SNAPSHOT_RECEIPT';
+    const receipt = readAdapterFields(source, NATIVE_SNAPSHOT_RECEIPT_FIELDS, invalidMessage);
+    const recoveryHealth = copyAdapterRecoveryHealth(
+        receipt.recoveryHealth,
+        'snapshot',
+        invalidMessage
+    );
+    if (receipt.ok !== true
+        || receipt.clientSnapshotId !== request.clientSnapshotId
+        || receipt.sourceHash !== request.expectedHash
+        || receipt.snapshotHash !== request.expectedHash
+        || !adapterNumberIsSafeInteger(receipt.ordinal)
+        || receipt.ordinal < 0
+        || (receipt.snapshotStatus !== 'created' && receipt.snapshotStatus !== 'deduplicated')
+        || receipt.durability !== 'native-durable'
+        || !adapterNumberIsSafeInteger(receipt.retainedCount)
+        || receipt.retainedCount < 1
+        || receipt.retainedCount > 24
+        || recoveryHealth.status === 'not-applicable') {
+        throw new TypeError(invalidMessage);
+    }
+    return adapterObjectFreeze({
+        ok: true,
+        clientSnapshotId: receipt.clientSnapshotId,
+        sourceHash: receipt.sourceHash,
+        snapshotHash: receipt.snapshotHash,
+        ordinal: receipt.ordinal,
+        snapshotStatus: receipt.snapshotStatus,
+        durability: receipt.durability,
+        retainedCount: receipt.retainedCount,
+        recoveryHealth
+    });
+}
+
+function copyNativeOperationError(source, kind, request) {
+    const isSave = kind === 'save';
+    const invalidMessage = isSave ? 'INVALID_NATIVE_SAVE_ERROR' : 'INVALID_NATIVE_SNAPSHOT_ERROR';
+    const fields = isSave ? NATIVE_SAVE_ERROR_FIELDS : NATIVE_SNAPSHOT_ERROR_FIELDS;
+    const values = readAdapterFields(source, fields, invalidMessage);
+    const outcome = isSave ? values.writeOutcome : values.snapshotOutcome;
+    if (typeof values.code !== 'string'
+        || values.code.length === 0
+        || typeof values.message !== 'string'
+        || values.message.length === 0
+        || !(isSave
+            ? (outcome === 'not-committed' || outcome === 'unknown')
+            : (outcome === 'not-created' || outcome === 'unknown'))
+        || (values.conflict !== false
+            && values.conflict !== 'source-changed'
+            && values.conflict !== 'session-invalid')
+        || (isSave
+            ? (values.clientSaveId !== request.clientSaveId
+                || values.payloadHash !== request.payloadHash)
+            : values.clientSnapshotId !== request.clientSnapshotId)
+        || (values.sourceHashAfter !== null && !isAdapterHash(values.sourceHashAfter))
+        || typeof values.sourceReverified !== 'boolean'
+        || typeof values.coordinatorReleased !== 'boolean'
+        || typeof values.healthPersisted !== 'boolean') {
+        throw new TypeError(invalidMessage);
+    }
+
+    let recoveryHealthEvidence = null;
+    if (values.healthPersisted) {
+        recoveryHealthEvidence = copyAdapterRecoveryHealth(
+            values.recoveryHealthEvidence,
+            isSave ? 'ordinary' : 'snapshot',
+            invalidMessage
+        );
+        if (recoveryHealthEvidence.status === 'not-applicable') {
+            throw new TypeError(invalidMessage);
+        }
+    } else if (values.recoveryHealthEvidence !== null) {
+        throw new TypeError(invalidMessage);
+    }
+
+    const error = isSave
+        ? new LegacySafety.AssetTrackerSaveError(values.message)
+        : new LegacySafety.AssetTrackerSnapshotError(values.message);
+    defineAdapterOwnData(error, 'code', values.code);
+    if (isSave) {
+        defineAdapterOwnData(error, 'writeOutcome', values.writeOutcome);
+    } else {
+        defineAdapterOwnData(error, 'snapshotOutcome', values.snapshotOutcome);
+    }
+    defineAdapterOwnData(error, 'conflict', values.conflict);
+    if (isSave) {
+        defineAdapterOwnData(error, 'clientSaveId', values.clientSaveId);
+        defineAdapterOwnData(error, 'payloadHash', values.payloadHash);
+    } else {
+        defineAdapterOwnData(error, 'clientSnapshotId', values.clientSnapshotId);
+    }
+    defineAdapterOwnData(error, 'sourceHashAfter', values.sourceHashAfter);
+    defineAdapterOwnData(error, 'sourceReverified', values.sourceReverified);
+    defineAdapterOwnData(error, 'coordinatorReleased', values.coordinatorReleased);
+    defineAdapterOwnData(error, 'healthPersisted', values.healthPersisted);
+    defineAdapterOwnData(error, 'recoveryHealthEvidence', recoveryHealthEvidence);
+    return adapterObjectFreeze(error);
+}
+
+function copyNativeTerminalReceipt(source, request) {
+    const invalidMessage = 'INVALID_NATIVE_TERMINAL_RECEIPT';
+    const receipt = readAdapterFields(source, NATIVE_TERMINAL_RECEIPT_FIELDS, invalidMessage);
+    if (receipt.ok !== true
+        || receipt.protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION
+        || receipt.loadId !== request.loadId
+        || !isStableTerminalReason(receipt.reason)
+        || receipt.gateState !== 'terminal-locked') {
+        throw new TypeError(invalidMessage);
+    }
+    return adapterObjectFreeze({
+        ok: true,
+        protocolVersion: receipt.protocolVersion,
+        loadId: receipt.loadId,
+        reason: receipt.reason,
+        gateState: receipt.gateState
+    });
+}
+
+function copyNativeLoadResult(source) {
+    const invalidMessage = 'INVALID_NATIVE_LOAD_RESULT';
+    const result = readAdapterFields(source, NATIVE_LOAD_RESULT_FIELDS, invalidMessage);
+    if (result.protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION
+        || typeof result.loadId !== 'string'
+        || result.loadId.length === 0
+        || (result.status !== 'missing'
+            && result.status !== 'readableBytes'
+            && result.status !== 'invalidUTF8'
+            && result.status !== 'ioError')
+        || (result.reason !== null && typeof result.reason !== 'string')
+        || (result.stateJson !== null && typeof result.stateJson !== 'string')
+        || (result.stateHash !== '' && !isAdapterHash(result.stateHash))
+        || (result.rawHash !== null && !isAdapterHash(result.rawHash))
+        || result.hashAlgorithm !== 'sha256'
+        || (result.updatedAt !== null && typeof result.updatedAt !== 'string')
+        || typeof result.storagePath !== 'string'
+        || result.storagePath.length === 0
+        || typeof result.canExportRaw !== 'boolean'
+        || typeof result.canRevealFolder !== 'boolean'
+        || typeof result.recoveryHealthComplete !== 'boolean') {
+        throw new TypeError(invalidMessage);
+    }
+    const invalidStatusTuple = result.status === 'missing'
+        ? (result.reason !== null
+            || result.stateJson !== null
+            || result.stateHash !== ''
+            || result.rawHash !== null
+            || result.canExportRaw !== false)
+        : result.status === 'readableBytes'
+            ? (result.reason !== null
+                || typeof result.stateJson !== 'string'
+                || !isAdapterHash(result.rawHash)
+                || result.stateHash !== result.rawHash
+                || result.canExportRaw !== true)
+            : result.status === 'invalidUTF8'
+                ? (result.reason !== null
+                    || result.stateJson !== null
+                    || result.stateHash !== ''
+                    || !isAdapterHash(result.rawHash)
+                    || result.canExportRaw !== true)
+                : ((result.reason !== 'permissionDenied'
+                        && result.reason !== 'notRegularFile'
+                        && result.reason !== 'readFailed')
+                    || result.stateJson !== null
+                    || result.stateHash !== ''
+                    || result.rawHash !== null
+                    || result.canExportRaw !== false);
+    if (invalidStatusTuple) {
+        throw new TypeError(invalidMessage);
+    }
+
+    let ordinaryRecoveryHealth = null;
+    let snapshotRecoveryHealth = null;
+    if (result.recoveryHealthComplete) {
+        ordinaryRecoveryHealth = copyAdapterRecoveryHealth(
+            result.ordinaryRecoveryHealth,
+            'ordinary',
+            invalidMessage
+        );
+        snapshotRecoveryHealth = copyAdapterRecoveryHealth(
+            result.snapshotRecoveryHealth,
+            'snapshot',
+            invalidMessage
+        );
+    } else if (result.ordinaryRecoveryHealth !== null || result.snapshotRecoveryHealth !== null) {
+        throw new TypeError(invalidMessage);
+    }
+
+    return adapterObjectFreeze({
+        protocolVersion: result.protocolVersion,
+        loadId: result.loadId,
+        status: result.status,
+        reason: result.reason,
+        stateJson: result.stateJson,
+        stateHash: result.stateHash,
+        rawHash: result.rawHash,
+        hashAlgorithm: result.hashAlgorithm,
+        updatedAt: result.updatedAt,
+        storagePath: result.storagePath,
+        canExportRaw: result.canExportRaw,
+        canRevealFolder: result.canRevealFolder,
+        recoveryHealthComplete: result.recoveryHealthComplete,
+        ordinaryRecoveryHealth,
+        snapshotRecoveryHealth
+    });
+}
+
+function createWebSnapshotError(request) {
+    const error = new LegacySafety.AssetTrackerSnapshotError('NATIVE_SNAPSHOT_REQUIRED');
+    defineAdapterOwnData(error, 'code', 'native-snapshot-required');
+    defineAdapterOwnData(error, 'snapshotOutcome', 'unknown');
+    defineAdapterOwnData(error, 'conflict', false);
+    defineAdapterOwnData(error, 'clientSnapshotId', request.clientSnapshotId);
+    defineAdapterOwnData(error, 'sourceHashAfter', null);
+    defineAdapterOwnData(error, 'sourceReverified', false);
+    defineAdapterOwnData(error, 'coordinatorReleased', true);
+    defineAdapterOwnData(error, 'healthPersisted', false);
+    defineAdapterOwnData(error, 'recoveryHealthEvidence', null);
+    return adapterObjectFreeze(error);
 }
 
 function bytesToBase64(bytes) {
@@ -271,23 +760,14 @@ class AssetTrackerStorageAdapter {
 
     async load({ retry = false } = {}) {
         if (this.supportsNative) {
-            const result = await window.AssetTrackerHost.invoke('storage.load', {
+            const source = await window.AssetTrackerHost.invoke('storage.load', {
                 protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
                 retry: Boolean(retry)
             });
-            if (!result || result.protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION) {
-                throw new Error('UNSUPPORTED_NATIVE_STORAGE_PROTOCOL');
-            }
-
-            this.stateHash = result.rawHash || result.stateHash || '';
-            this.storagePath = result.storagePath || this.storagePath;
-            return {
-                ...result,
-                stateHash: this.stateHash,
-                rawHash: result.rawHash || (result.status === 'readableBytes' ? result.stateHash : null),
-                updatedAt: result.updatedAt || null,
-                storagePath: this.storagePath
-            };
+            const result = copyNativeLoadResult(source);
+            this.stateHash = result.stateHash;
+            this.storagePath = result.storagePath;
+            return result;
         }
 
         const previousGateState = this.webGateState;
@@ -354,9 +834,15 @@ class AssetTrackerStorageAdapter {
     }
 
     registerWebLoad(result, { retry, previousGateState }) {
+        const completeResult = {
+            ...result,
+            recoveryHealthComplete: true,
+            ordinaryRecoveryHealth: webNotApplicableRecoveryHealth('ordinary'),
+            snapshotRecoveryHealth: webNotApplicableRecoveryHealth('snapshot')
+        };
         if (previousGateState === 'terminalLocked') {
             this.webGateState = 'terminalLocked';
-            return result;
+            return completeResult;
         }
 
         const isInitialLoad = !retry && previousGateState === 'neverLoaded';
@@ -374,7 +860,7 @@ class AssetTrackerStorageAdapter {
         } else {
             this.webGateState = 'recoverableLocked';
         }
-        return result;
+        return completeResult;
     }
 
     async confirmLoad(request) {
@@ -445,10 +931,251 @@ class AssetTrackerStorageAdapter {
         if (!this.supportsNative) {
             return { ok: true };
         }
-        return window.AssetTrackerHost.invoke('storage.terminalize', request);
+        const sessionContext = isAdapterRecord(request) ? request.sessionContext : null;
+        if (!isAdapterRecord(sessionContext)) {
+            const protocolVersion = isAdapterRecord(request) ? request.protocolVersion : null;
+            const loadId = isAdapterRecord(request) ? request.loadId : null;
+            const writeSessionToken = isAdapterRecord(request) ? request.writeSessionToken : null;
+            const reason = isAdapterRecord(request) ? request.reason : null;
+            if (protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION
+                || typeof loadId !== 'string'
+                || loadId.length === 0
+                || (writeSessionToken !== null
+                    && (typeof writeSessionToken !== 'string' || writeSessionToken.length === 0))
+                || (reason !== 'renderError.postRender'
+                    && reason !== 'internalError.postRender')) {
+                throw new TypeError('INVALID_TERMINALIZE_REQUEST');
+            }
+            return window.AssetTrackerHost.invoke('storage.terminalize', request);
+        }
+        const reason = request.reason;
+        const protocolVersion = sessionContext.protocolVersion;
+        const loadId = sessionContext.loadId;
+        const writeSessionToken = sessionContext.writeSessionToken;
+        if (typeof reason !== 'string'
+            || !isStableTerminalReason(reason)
+            || protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION
+            || typeof loadId !== 'string'
+            || loadId.length === 0
+            || typeof writeSessionToken !== 'string'
+            || writeSessionToken.length === 0) {
+            throw new TypeError('INVALID_TERMINALIZE_REQUEST');
+        }
+        const result = await window.AssetTrackerHost.invoke('storage.terminalize', {
+            protocolVersion,
+            loadId,
+            writeSessionToken,
+            reason
+        });
+        return copyNativeTerminalReceipt(result, { loadId });
     }
 
-    async save(stateJson, {
+    async save(requestOrStateJson, options = {}) {
+        if (typeof requestOrStateJson === 'string') {
+            return this.saveLegacy(requestOrStateJson, options);
+        }
+        if (isAdapterPlainRecord(requestOrStateJson)) {
+            return this.supportsNative
+                ? this.saveNativeQueueRequest(requestOrStateJson)
+                : this.saveWebQueueRequest(requestOrStateJson);
+        }
+        throw new TypeError('INVALID_SAVE_ARGUMENT_SHAPE');
+    }
+
+    async saveNativeQueueRequest(request) {
+        const clientSaveId = request.clientSaveId;
+        const stateJson = request.stateJson;
+        const payloadHash = request.payloadHash;
+        const reason = request.reason;
+        const expectedHash = request.expectedHash;
+        const sessionContext = request.sessionContext;
+        if (typeof clientSaveId !== 'string'
+            || clientSaveId.length === 0
+            || typeof stateJson !== 'string'
+            || stateJson.length === 0
+            || !isAdapterHash(payloadHash)
+            || typeof reason !== 'string'
+            || reason.length === 0
+            || (expectedHash !== null && !isAdapterHash(expectedHash))
+            || !isAdapterRecord(sessionContext)
+            || sessionContext.protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION
+            || typeof sessionContext.loadId !== 'string'
+            || sessionContext.loadId.length === 0
+            || typeof sessionContext.writeSessionToken !== 'string'
+            || sessionContext.writeSessionToken.length === 0) {
+            throw new TypeError('INVALID_NATIVE_SAVE_REQUEST');
+        }
+
+        let source;
+        try {
+            source = await window.AssetTrackerHost.invoke('storage.save', {
+                protocolVersion: sessionContext.protocolVersion,
+                loadId: sessionContext.loadId,
+                writeSessionToken: sessionContext.writeSessionToken,
+                clientSaveId,
+                stateJson,
+                payloadHash,
+                reason,
+                expectedHash,
+                validatedSourceHash: expectedHash,
+                schemaVersion: ASSET_BOOK_SCHEMA_VERSION
+            });
+        } catch (error) {
+            throw copyNativeOperationError(error, 'save', { clientSaveId, payloadHash });
+        }
+        return copyNativeSaveReceipt(source, { clientSaveId, payloadHash, expectedHash });
+    }
+
+    async snapshot(request) {
+        const clientSnapshotId = isAdapterRecord(request) ? request.clientSnapshotId : null;
+        const reason = isAdapterRecord(request) ? request.reason : null;
+        const expectedHash = isAdapterRecord(request) ? request.expectedHash : null;
+        const sessionContext = isAdapterRecord(request) ? request.sessionContext : null;
+        if (typeof clientSnapshotId !== 'string'
+            || clientSnapshotId.length === 0
+            || (reason !== 'manual' && reason !== 'scheduled')
+            || !isAdapterHash(expectedHash)
+            || !isAdapterRecord(sessionContext)
+            || sessionContext.protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION
+            || typeof sessionContext.loadId !== 'string'
+            || sessionContext.loadId.length === 0
+            || typeof sessionContext.writeSessionToken !== 'string'
+            || sessionContext.writeSessionToken.length === 0) {
+            throw new TypeError('INVALID_SNAPSHOT_REQUEST');
+        }
+        if (!this.supportsNative) {
+            throw createWebSnapshotError({ clientSnapshotId });
+        }
+
+        let source;
+        try {
+            source = await window.AssetTrackerHost.invoke('storage.snapshot', {
+                protocolVersion: sessionContext.protocolVersion,
+                loadId: sessionContext.loadId,
+                writeSessionToken: sessionContext.writeSessionToken,
+                clientSnapshotId,
+                reason,
+                expectedHash
+            });
+        } catch (error) {
+            throw copyNativeOperationError(error, 'snapshot', { clientSnapshotId });
+        }
+        return copyNativeSnapshotReceipt(source, { clientSnapshotId, expectedHash });
+    }
+
+    async saveWebQueueRequest(request) {
+        const {
+            clientSaveId,
+            stateJson,
+            payloadHash,
+            expectedHash,
+            sessionContext,
+            reason
+        } = request;
+        const errorRequest = { clientSaveId, payloadHash };
+        if (typeof clientSaveId !== 'string'
+            || clientSaveId.length === 0
+            || typeof stateJson !== 'string'
+            || stateJson.length === 0
+            || typeof payloadHash !== 'string'
+            || typeof reason !== 'string'
+            || reason.length === 0
+            || (expectedHash !== null && typeof expectedHash !== 'string')) {
+            throw new TypeError('INVALID_WEB_SAVE_REQUEST');
+        }
+
+        const session = this.confirmedSession;
+        if (this.webGateState === 'terminalLocked'
+            || !session
+            || (this.webGateState !== 'validatedMissing'
+                && this.webGateState !== 'validatedExisting')
+            || !sessionContext
+            || sessionContext.protocolVersion !== ASSET_BOOK_PROTOCOL_VERSION
+            || session.loadId !== sessionContext.loadId
+            || session.token !== sessionContext.writeSessionToken
+            || session.rawHash !== expectedHash) {
+            throw createWebSaveError(errorRequest, 'Web write session is invalid', {
+                code: 'session-conflict',
+                writeOutcome: 'not-committed',
+                conflict: 'session-invalid'
+            });
+        }
+
+        const candidateEvidence = LegacySafety.inspectDOMString(stateJson);
+        if (candidateEvidence.rawHash !== payloadHash) {
+            throw createWebSaveError(errorRequest, 'Web save payload hash is invalid', {
+                code: 'candidate-hash-mismatch',
+                writeOutcome: 'not-committed'
+            });
+        }
+
+        let sourceBefore;
+        try {
+            sourceBefore = localStorage.getItem(this.storageKey);
+        } catch (_error) {
+            throw createWebSaveError(errorRequest, 'Web source could not be read before write');
+        }
+        const sourceHashBefore = sourceBefore === null
+            ? null
+            : LegacySafety.inspectDOMString(sourceBefore).rawHash;
+        if (sourceHashBefore !== expectedHash) {
+            throw createWebSaveError(errorRequest, 'Web source changed before write', {
+                code: 'source-conflict',
+                writeOutcome: 'not-committed',
+                conflict: 'source-changed',
+                sourceHashAfter: sourceHashBefore,
+                sourceReverified: true
+            });
+        }
+
+        try {
+            localStorage.setItem(this.storageKey, stateJson);
+        } catch (_error) {
+            // The exact reread below, not the thrown host error, determines the outcome.
+        }
+
+        let sourceAfter;
+        try {
+            sourceAfter = localStorage.getItem(this.storageKey);
+        } catch (_error) {
+            throw createWebSaveError(errorRequest, 'Web write outcome could not be reread');
+        }
+        const sourceHashAfter = sourceAfter === null
+            ? null
+            : LegacySafety.inspectDOMString(sourceAfter).rawHash;
+        if (sourceAfter === stateJson && sourceHashAfter === payloadHash) {
+            this.stateHash = sourceHashAfter;
+            session.rawHash = sourceHashAfter;
+            this.webGateState = 'validatedExisting';
+            return {
+                ok: true,
+                clientSaveId,
+                payloadHash,
+                sourceHashBefore,
+                stateHashAfter: sourceHashAfter,
+                stateHash: sourceHashAfter,
+                byteCount: adapterReflectApply(adapterTypedArrayByteLengthGetter, candidateEvidence.bytes, []),
+                durability: 'browser-local-committed',
+                updatedAt: adapterReflectApply(adapterDateToISOString, new adapterDate(), []),
+                storagePath: 'localStorage:assetTrackerData',
+                recoveryHealth: webNotApplicableRecoveryHealth('none')
+            };
+        }
+        if (sourceAfter === sourceBefore && sourceHashAfter === sourceHashBefore) {
+            throw createWebSaveError(errorRequest, 'Web write was not committed', {
+                code: 'write-not-committed',
+                writeOutcome: 'not-committed',
+                sourceHashAfter,
+                sourceReverified: true
+            });
+        }
+        throw createWebSaveError(errorRequest, 'Web write outcome is unknown', {
+            sourceHashAfter,
+            sourceReverified: true
+        });
+    }
+
+    async saveLegacy(stateJson, {
         protocolVersion = null,
         loadId = null,
         writeSessionToken = null,
@@ -1510,9 +2237,37 @@ class AssetTracker {
         }
 
         this.pendingRawLoad = rawResult;
-        this.storageMeta.stateHash = rawResult.rawHash || rawResult.stateHash || '';
-        this.storageMeta.storagePath = rawResult.storagePath || this.storageMeta.storagePath;
-        this.storageMeta.updatedAt = rawResult.updatedAt || null;
+        if (this.storageAdapter.supportsNative) {
+            this.storageMeta.stateHash = rawResult.stateHash;
+            this.storageMeta.storagePath = rawResult.storagePath;
+            this.storageMeta.updatedAt = rawResult.updatedAt;
+        } else {
+            this.storageMeta.stateHash = rawResult.rawHash || rawResult.stateHash || '';
+            this.storageMeta.storagePath = rawResult.storagePath || this.storageMeta.storagePath;
+            this.storageMeta.updatedAt = rawResult.updatedAt || null;
+        }
+
+        if (this.storageAdapter.supportsNative && rawResult.recoveryHealthComplete !== true) {
+            const rawEvidence = rawResult.rawHash ? this.recordRawEvidence({
+                rawHash: rawResult.rawHash,
+                hashAlgorithm: rawResult.hashAlgorithm
+            }, rawResult, attemptEpoch ?? this.openAttemptEpoch) : null;
+            return {
+                status: 'ioError',
+                reason: 'recoveryHealthIncomplete',
+                loadId: rawResult.loadId,
+                rawHash: rawResult.rawHash,
+                hashAlgorithm: rawResult.hashAlgorithm,
+                rawEvidence,
+                storagePath: rawResult.storagePath,
+                canExportRaw: rawResult.canExportRaw,
+                canRevealFolder: rawResult.canRevealFolder,
+                recoveryHealthComplete: false,
+                ordinaryRecoveryHealth: null,
+                snapshotRecoveryHealth: null,
+                requiresConfirmation: false
+            };
+        }
 
         if (rawResult.status === 'missing') {
             return {
@@ -1583,7 +2338,7 @@ class AssetTracker {
         }
 
         const inspectedEvidence = LegacySafety.inspectDOMString(rawResult.stateJson);
-        const nativeRawHash = rawResult.rawHash || rawResult.stateHash || null;
+        const nativeRawHash = rawResult.rawHash;
         const evidence = this.storageAdapter.supportsNative
             ? (nativeRawHash ? this.recordRawEvidence({
                 rawHash: nativeRawHash,
