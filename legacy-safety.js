@@ -79,6 +79,10 @@
         'stateJson',
         'reason'
     ]);
+    const SNAPSHOT_DESCRIPTOR_FIELDS = intrinsicObjectFreeze([
+        'clientSnapshotId',
+        'reason'
+    ]);
     const SAVE_RECEIPT_FIELDS = intrinsicObjectFreeze([
         'ok',
         'clientSaveId',
@@ -99,6 +103,29 @@
         'conflict',
         'clientSaveId',
         'payloadHash',
+        'sourceHashAfter',
+        'sourceReverified',
+        'coordinatorReleased',
+        'healthPersisted',
+        'recoveryHealthEvidence'
+    ]);
+    const SNAPSHOT_RECEIPT_FIELDS = intrinsicObjectFreeze([
+        'ok',
+        'clientSnapshotId',
+        'sourceHash',
+        'snapshotHash',
+        'ordinal',
+        'snapshotStatus',
+        'durability',
+        'retainedCount',
+        'recoveryHealth'
+    ]);
+    const SNAPSHOT_ERROR_FIELDS = intrinsicObjectFreeze([
+        'code',
+        'message',
+        'snapshotOutcome',
+        'conflict',
+        'clientSnapshotId',
         'sourceHashAfter',
         'sourceReverified',
         'coordinatorReleased',
@@ -379,13 +406,14 @@
     }
 
     function createAbortError(item, cause) {
+        const itemKind = itemLaneKind(item);
         return freezeTypedError(
             new AssetTrackerQueueAbortError('Accepted queue item was not dispatched'),
             {
                 queueOutcome: 'not-dispatched',
-                itemKind: item.itemKind || item.kind,
-                clientItemId: item.clientSaveId,
-                payloadHash: item.payloadHash,
+                itemKind,
+                clientItemId: itemClientId(item),
+                payloadHash: itemKind === 'save' ? item.payloadHash : null,
                 causedByClientItemId: cause.causedByClientItemId,
                 causeKind: cause.causeKind,
                 callbackFaultId: cause.callbackFaultId,
@@ -505,13 +533,37 @@
         });
     }
 
-    function selectSavingState(queue) {
+    function itemLaneKind(item) {
+        if (!item) return null;
+        if (item.kind === 'callback-marker') return item.itemKind;
+        return item.kind;
+    }
+
+    function itemClientId(item) {
+        if (!item) return null;
+        return itemLaneKind(item) === 'snapshot'
+            ? item.clientSnapshotId
+            : item.clientSaveId;
+    }
+
+    function selectLaneState(queue, { drainedPrimaryStatus } = {}) {
         const internals = saveQueueInternals.get(queue);
         const nextItem = internals.items[0] || null;
+        const nextKind = itemLaneKind(nextItem);
         replaceQueueState(queue, {
-            lanePhase: nextItem ? 'saving' : 'idle',
-            activeClientSaveId: nextItem && nextItem.kind === 'save' ? nextItem.clientSaveId : null,
-            activeClientSnapshotId: null,
+            lanePhase: nextKind === 'snapshot'
+                ? 'barrier-running'
+                : nextItem
+                    ? 'saving'
+                    : 'idle',
+            primaryStatus: !nextItem && drainedPrimaryStatus !== undefined
+                ? drainedPrimaryStatus
+                : queue.queueState.primaryStatus,
+            barrierState: nextItem && nextItem.kind === 'snapshot'
+                ? 'running'
+                : queue.queueState.barrierState,
+            activeClientSaveId: nextKind === 'save' ? itemClientId(nextItem) : null,
+            activeClientSnapshotId: nextKind === 'snapshot' ? itemClientId(nextItem) : null,
             pendingCount: internals.items.length
         });
     }
@@ -723,6 +775,204 @@
         );
     }
 
+    function extractStructuredSnapshotError(source, item, expectedHash) {
+        if (!(source instanceof AssetTrackerSnapshotError)) {
+            throw new TypeError('Snapshot error is not typed');
+        }
+        const error = extractAllowedFields(source, SNAPSHOT_ERROR_FIELDS, 'snapshotError');
+        if (typeof error.code !== 'string'
+            || error.code.length === 0
+            || typeof error.message !== 'string'
+            || error.message.length === 0
+            || !['not-created', 'unknown'].includes(error.snapshotOutcome)
+            || ![false, 'source-changed', 'session-invalid'].includes(error.conflict)
+            || error.clientSnapshotId !== item.clientSnapshotId
+            || (error.sourceHashAfter !== null && !isValidHash(error.sourceHashAfter))
+            || typeof error.sourceReverified !== 'boolean'
+            || typeof error.coordinatorReleased !== 'boolean'
+            || typeof error.healthPersisted !== 'boolean') {
+            throw new TypeError('Snapshot error is malformed');
+        }
+
+        let recoveryHealthEvidence = null;
+        if (error.healthPersisted) {
+            if (error.recoveryHealthEvidence === null) {
+                throw new TypeError('Persisted snapshot health evidence is missing');
+            }
+            recoveryHealthEvidence = copyRecoveryHealth(
+                extractAllowedFields(
+                    error.recoveryHealthEvidence,
+                    RECOVERY_HEALTH_FIELDS,
+                    'snapshotError.recoveryHealthEvidence'
+                ),
+                'snapshot'
+            );
+            if (recoveryHealthEvidence.status === 'not-applicable') {
+                throw new TypeError('Persisted snapshot health evidence is inapplicable');
+            }
+        } else if (error.recoveryHealthEvidence !== null) {
+            throw new TypeError('Unpersisted snapshot health evidence must be null');
+        }
+
+        let classification = 'unknown';
+        if (error.conflict !== false) {
+            classification = 'conflict';
+        } else if (error.snapshotOutcome === 'not-created'
+            && error.sourceHashAfter === expectedHash
+            && error.sourceReverified === true
+            && error.coordinatorReleased === true) {
+            classification = 'not-created';
+        }
+        return { classification, values: error, recoveryHealthEvidence };
+    }
+
+    function createSnapshotError(internals, item, classification, structured = null) {
+        const message = structured ? structured.values.message : 'Snapshot outcome is unknown';
+        const wireProperties = structured
+            ? {
+                code: structured.values.code,
+                snapshotOutcome: structured.values.snapshotOutcome,
+                conflict: structured.values.conflict,
+                clientSnapshotId: structured.values.clientSnapshotId,
+                sourceHashAfter: structured.values.sourceHashAfter,
+                sourceReverified: structured.values.sourceReverified,
+                coordinatorReleased: structured.values.coordinatorReleased,
+                healthPersisted: structured.values.healthPersisted,
+                recoveryHealthEvidence: structured.recoveryHealthEvidence
+            }
+            : {
+                code: 'snapshot-outcome-unknown',
+                snapshotOutcome: 'unknown',
+                conflict: false,
+                clientSnapshotId: item.clientSnapshotId,
+                sourceHashAfter: null,
+                sourceReverified: false,
+                coordinatorReleased: false,
+                healthPersisted: false,
+                recoveryHealthEvidence: null
+            };
+        const outcomeProperties = classification === 'not-created'
+            ? { queueOutcome: 'not-created' }
+            : classification === 'conflict'
+                ? { queueOutcome: 'conflict', terminalReason: 'snapshot-conflict' }
+                : {
+                    queueOutcome: 'snapshot-outcome-unknown',
+                    terminalReason: 'snapshot-outcome-unknown'
+                };
+        return freezeTypedError(
+            new AssetTrackerSnapshotError(message),
+            {
+                ...wireProperties,
+                ...outcomeProperties,
+                lastAcknowledgedStateJson: internals.lastAcknowledgedStateJson,
+                lastAcknowledgedHash: internals.lastAcknowledgedHash,
+                attemptedStateJson: null,
+                activeClientItemId: item.clientSnapshotId,
+                callbackFaultId: null
+            }
+        );
+    }
+
+    function continueAfterKnownNotCreated(queue, item, structured) {
+        const internals = saveQueueInternals.get(queue);
+        const barrierError = createSnapshotError(internals, item, 'not-created', structured);
+        internals.items.shift();
+        internals.activeItem = null;
+        internals.laneRevision += 1;
+        const healthOverrides = structured.recoveryHealthEvidence
+            ? { snapshotRecoveryHealth: structured.recoveryHealthEvidence }
+            : {};
+        replaceQueueState(queue, {
+            ...healthOverrides,
+            barrierState: 'not-created'
+        });
+        selectLaneState(queue);
+        item.promiseCapability.reject(barrierError);
+
+        internals.fenceDepth += 1;
+        const transitionResult = invokeTotalCallback(
+            internals.configuration.onTransition,
+            [queue.getState()],
+            'onTransition'
+        );
+        internals.fenceDepth -= 1;
+        if (!transitionResult.ok) {
+            haltForCallbackFault(queue, createCallbackFault(internals, {
+                causeKind: 'post-operation-callback',
+                callbackName: transitionResult.callbackName,
+                clientItemId: null,
+                completedItemKind: 'snapshot',
+                completedClientItemId: item.clientSnapshotId,
+                completedOutcome: 'known-not-created'
+            }), null, 'not-created');
+            return;
+        }
+        if (internals.halted) return;
+        dispatchNextLaneItem(queue);
+    }
+
+    function haltForSnapshotFailure(queue, item, adapterError, expectedHash) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted || internals.activeItem !== item) return;
+        clearActiveDeadline(internals, item);
+        if (internals.halted || internals.activeItem !== item) return;
+
+        let structured = null;
+        let classification = 'unknown';
+        try {
+            structured = extractStructuredSnapshotError(adapterError, item, expectedHash);
+            classification = structured.classification;
+        } catch (_error) {
+            structured = null;
+        }
+        if (classification === 'not-created') {
+            continueAfterKnownNotCreated(queue, item, structured);
+            return;
+        }
+
+        const activeError = createSnapshotError(internals, item, classification, structured);
+        internals.halted = true;
+        internals.accepting = false;
+        internals.terminalCause = activeError;
+        internals.pendingTerminalCause = null;
+        internals.activeItem = null;
+        internals.laneRevision += 1;
+        const unsettledItems = internals.items.splice(0);
+        for (const pendingItem of unsettledItems) {
+            if (pendingItem === item) {
+                pendingItem.promiseCapability.reject(activeError);
+                continue;
+            }
+            pendingItem.promiseCapability.reject(createAbortError(pendingItem, {
+                causedByClientItemId: item.clientSnapshotId,
+                causeKind: 'storage-item',
+                callbackFaultId: null,
+                completedItemKind: null,
+                completedClientItemId: null,
+                completedOutcome: null
+            }));
+        }
+        const healthOverrides = structured && structured.recoveryHealthEvidence
+            ? { snapshotRecoveryHealth: structured.recoveryHealthEvidence }
+            : {};
+        replaceQueueState(queue, {
+            ...healthOverrides,
+            lanePhase: 'halted',
+            primaryStatus: classification === 'conflict'
+                ? 'failed-readonly'
+                : queue.queueState.primaryStatus,
+            barrierState: classification === 'conflict' ? 'conflict' : 'outcome-unknown',
+            activeClientSaveId: null,
+            activeClientSnapshotId: null,
+            pendingCount: 0,
+            accepting: false,
+            halted: true
+        });
+        rejectDeferredHaltedCapabilities(internals, activeError);
+        publishTerminalCallbacks(queue, activeError);
+        attemptTerminalization(queue, activeError.terminalReason);
+    }
+
     function haltForSaveFailure(queue, item, adapterError, expectedHash) {
         const internals = saveQueueInternals.get(queue);
         if (internals.halted || internals.activeItem !== item) return;
@@ -777,7 +1027,12 @@
         attemptTerminalization(queue, activeError.terminalReason);
     }
 
-    function haltForCallbackFault(queue, fault, triggeringItem = null) {
+    function haltForCallbackFault(
+        queue,
+        fault,
+        triggeringItem = null,
+        completedBarrierState = undefined
+    ) {
         const internals = saveQueueInternals.get(queue);
         if (internals.halted) return;
 
@@ -804,6 +1059,9 @@
             }));
         }
         replaceQueueState(queue, {
+            ...(completedBarrierState === undefined ? {} : {
+                barrierState: completedBarrierState
+            }),
             lanePhase: 'halted',
             primaryStatus: 'failed-readonly',
             activeClientSaveId: null,
@@ -880,6 +1138,45 @@
         });
     }
 
+    function extractAndValidateSnapshotReceipt(source, item, expectedHash) {
+        const receipt = extractAllowedFields(source, SNAPSHOT_RECEIPT_FIELDS, 'snapshotReceipt');
+        const recoveryHealth = copyRecoveryHealth(
+            extractAllowedFields(
+                receipt.recoveryHealth,
+                RECOVERY_HEALTH_FIELDS,
+                'snapshotReceipt.recoveryHealth'
+            ),
+            'snapshot'
+        );
+        if (receipt.ok !== true
+            || receipt.clientSnapshotId !== item.clientSnapshotId
+            || !isValidHash(receipt.sourceHash)
+            || receipt.sourceHash !== expectedHash
+            || receipt.snapshotHash !== receipt.sourceHash
+            || !Number.isSafeInteger(receipt.ordinal)
+            || receipt.ordinal < 0
+            || !['created', 'deduplicated'].includes(receipt.snapshotStatus)
+            || receipt.durability !== 'native-durable'
+            || !Number.isSafeInteger(receipt.retainedCount)
+            || receipt.retainedCount < 1
+            || receipt.retainedCount > 24
+            || recoveryHealth.status === 'not-applicable') {
+            throw new TypeError('Snapshot receipt is invalid');
+        }
+
+        return canonicalDeepFrozenCopy({
+            ok: true,
+            clientSnapshotId: receipt.clientSnapshotId,
+            sourceHash: receipt.sourceHash,
+            snapshotHash: receipt.snapshotHash,
+            ordinal: receipt.ordinal,
+            snapshotStatus: receipt.snapshotStatus,
+            durability: receipt.durability,
+            retainedCount: receipt.retainedCount,
+            recoveryHealth
+        });
+    }
+
     function completePreparationMarker(queue, marker) {
         const internals = saveQueueInternals.get(queue);
         if (internals.halted || internals.activeItem !== null || internals.items[0] !== marker) return;
@@ -914,7 +1211,7 @@
         haltForCallbackFault(queue, fault, marker);
     }
 
-    function dispatchNextSave(queue) {
+    function dispatchNextLaneItem(queue) {
         const internals = saveQueueInternals.get(queue);
         if (internals.halted
             || internals.fenceDepth !== 0
@@ -930,6 +1227,10 @@
         }
         if (item.kind === 'callback-marker') {
             completeCallbackMarker(queue, item);
+            return;
+        }
+        if (item.kind === 'snapshot') {
+            dispatchSnapshot(queue, item);
             return;
         }
         internals.activeItem = item;
@@ -985,6 +1286,132 @@
         }
     }
 
+    function dispatchSnapshot(queue, item) {
+        const internals = saveQueueInternals.get(queue);
+        internals.activeItem = item;
+        const request = intrinsicObjectFreeze({
+            clientSnapshotId: item.clientSnapshotId,
+            reason: item.reason,
+            expectedHash: internals.lastAcknowledgedHash,
+            sessionContext: internals.configuration.sessionContext
+        });
+        try {
+            const handle = internals.configuration.clock.setTimeout(() => {
+                haltForSnapshotFailure(queue, item, null, request.expectedHash);
+            }, internals.configuration.barrierDeadlineMs);
+            if (internals.halted || internals.activeItem !== item) {
+                try {
+                    internals.configuration.clock.clearTimeout(handle);
+                } catch (_error) {
+                    // A synchronously fired deadline is handled by the terminal path.
+                }
+                return;
+            }
+            internals.activeDeadline = { item, handle };
+        } catch (_error) {
+            haltForSnapshotFailure(queue, item, null, request.expectedHash);
+            return;
+        }
+        if (internals.halted || internals.activeItem !== item) return;
+
+        let adapterResult;
+        try {
+            adapterResult = internals.configuration.snapshot(request);
+        } catch (error) {
+            haltForSnapshotFailure(queue, item, error, request.expectedHash);
+            return;
+        }
+        try {
+            const adoptedResult = intrinsicPromiseResolve(adapterResult);
+            intrinsicPromiseThen(
+                adoptedResult,
+                receipt => {
+                    completeSnapshotReceipt(queue, item, request.expectedHash, receipt);
+                    return undefined;
+                },
+                error => {
+                    haltForSnapshotFailure(queue, item, error, request.expectedHash);
+                    return undefined;
+                }
+            );
+        } catch (_error) {
+            haltForSnapshotFailure(queue, item, null, request.expectedHash);
+        }
+    }
+
+    function completeSnapshotReceipt(queue, item, expectedHash, adapterReceipt) {
+        const internals = saveQueueInternals.get(queue);
+        if (internals.halted || internals.activeItem !== item) return;
+        clearActiveDeadline(internals, item);
+        if (internals.halted || internals.activeItem !== item) return;
+
+        let receipt;
+        try {
+            receipt = extractAndValidateSnapshotReceipt(adapterReceipt, item, expectedHash);
+        } catch (_error) {
+            haltForSnapshotFailure(queue, item, null, expectedHash);
+            return;
+        }
+
+        internals.items.shift();
+        internals.activeItem = null;
+        internals.laneRevision += 1;
+        const barrierState = receipt.recoveryHealth.status === 'degraded'
+            ? 'degraded'
+            : receipt.snapshotStatus;
+        replaceQueueState(queue, {
+            barrierState,
+            snapshotRecoveryHealth: receipt.recoveryHealth
+        });
+        selectLaneState(queue);
+
+        item.promiseCapability.resolve(canonicalDeepFrozenCopy(receipt));
+        internals.fenceDepth += 1;
+        const acknowledgedResult = invokeTotalCallback(
+            internals.configuration.onAcknowledged,
+            [canonicalDeepFrozenCopy(receipt)],
+            'onAcknowledged'
+        );
+        if (!acknowledgedResult.ok) {
+            internals.fenceDepth -= 1;
+            haltForCallbackFault(queue, createCallbackFault(internals, {
+                causeKind: 'post-operation-callback',
+                callbackName: acknowledgedResult.callbackName,
+                clientItemId: null,
+                completedItemKind: 'snapshot',
+                completedClientItemId: item.clientSnapshotId,
+                completedOutcome: 'successful-receipt'
+            }), null, barrierState);
+            return;
+        }
+        if (internals.halted) {
+            internals.fenceDepth -= 1;
+            return;
+        }
+
+        selectLaneState(queue);
+        const transitionResult = invokeTotalCallback(
+            internals.configuration.onTransition,
+            [queue.getState()],
+            'onTransition'
+        );
+        if (!transitionResult.ok) {
+            internals.fenceDepth -= 1;
+            haltForCallbackFault(queue, createCallbackFault(internals, {
+                causeKind: 'post-operation-callback',
+                callbackName: transitionResult.callbackName,
+                clientItemId: null,
+                completedItemKind: 'snapshot',
+                completedClientItemId: item.clientSnapshotId,
+                completedOutcome: 'successful-receipt'
+            }), null, barrierState);
+            return;
+        }
+        internals.fenceDepth -= 1;
+        if (internals.halted) return;
+        dispatchNextLaneItem(queue);
+    }
+
     function completeSaveReceipt(queue, item, expectedHash, adapterReceipt) {
         const internals = saveQueueInternals.get(queue);
         if (internals.halted || internals.activeItem !== item) return;
@@ -1013,16 +1440,13 @@
         const healthOverrides = receipt.durability === 'native-durable'
             ? { ordinaryRecoveryHealth: receipt.recoveryHealth }
             : {};
+        const completedBarrierState = queue.queueState.barrierState;
         replaceQueueState(queue, {
             ...healthOverrides,
-            lanePhase: 'saving',
-            activeClientSaveId: internals.items[0] && internals.items[0].kind === 'save'
-                ? internals.items[0].clientSaveId
-                : null,
-            activeClientSnapshotId: null,
-            pendingCount: internals.items.length,
-            lastAcknowledgedHash: receipt.stateHashAfter
+            lastAcknowledgedHash: receipt.stateHashAfter,
+            primaryStatus: receipt.durability
         });
+        selectLaneState(queue);
 
         const promiseReceipt = canonicalDeepFrozenCopy(receipt);
         const callbackReceipt = canonicalDeepFrozenCopy(receipt);
@@ -1043,7 +1467,7 @@
                 completedItemKind: 'save',
                 completedClientItemId: item.clientSaveId,
                 completedOutcome: 'successful-receipt'
-            }));
+            }), null, completedBarrierState);
             return;
         }
         if (internals.halted) {
@@ -1051,14 +1475,7 @@
             return;
         }
 
-        const nextItem = internals.items[0] || null;
-        replaceQueueState(queue, {
-            lanePhase: nextItem ? 'saving' : 'idle',
-            primaryStatus: nextItem ? queue.queueState.primaryStatus : receipt.durability,
-            activeClientSaveId: nextItem && nextItem.kind === 'save' ? nextItem.clientSaveId : null,
-            activeClientSnapshotId: null,
-            pendingCount: internals.items.length
-        });
+        selectLaneState(queue, { drainedPrimaryStatus: receipt.durability });
         const transitionResult = invokeTotalCallback(
             internals.configuration.onTransition,
             [queue.getState()],
@@ -1073,12 +1490,12 @@
                 completedItemKind: 'save',
                 completedClientItemId: item.clientSaveId,
                 completedOutcome: 'successful-receipt'
-            }));
+            }), null, completedBarrierState);
             return;
         }
 
         internals.fenceDepth -= 1;
-        if (!internals.halted) dispatchNextSave(queue);
+        if (!internals.halted) dispatchNextLaneItem(queue);
     }
 
     class AssetTrackerSaveQueue {
@@ -1155,7 +1572,7 @@
                 acceptedRevision: internals.nextAcceptedRevision
             });
             internals.items.push(item);
-            selectSavingState(this);
+            selectLaneState(this);
 
             internals.fenceDepth += 1;
             const transitionResult = invokeTotalCallback(
@@ -1198,11 +1615,100 @@
                     pendingCount: internals.items.length,
                     accepting: false
                 });
-                dispatchNextSave(this);
+                dispatchNextLaneItem(this);
                 return promiseCapability.promise;
             }
 
-            dispatchNextSave(this);
+            dispatchNextLaneItem(this);
+            return promiseCapability.promise;
+        }
+
+        runBarrier(descriptor) {
+            const promiseCapability = createPromiseCapability();
+            const internals = saveQueueInternals.get(this);
+            if (internals.halted) {
+                promiseCapability.reject(createHaltedError(internals.terminalCause));
+                return promiseCapability.promise;
+            }
+            if (!internals.accepting) {
+                deferHaltedCapability(internals, promiseCapability);
+                return promiseCapability.promise;
+            }
+
+            let values;
+            try {
+                values = extractAllowedFields(
+                    descriptor,
+                    SNAPSHOT_DESCRIPTOR_FIELDS,
+                    'snapshotDescriptor'
+                );
+                if (typeof values.clientSnapshotId !== 'string'
+                    || values.clientSnapshotId.length === 0) {
+                    throw new TypeError('Snapshot descriptor clientSnapshotId must be non-empty');
+                }
+                if (!['manual', 'scheduled'].includes(values.reason)) {
+                    throw new TypeError('Snapshot descriptor reason is invalid');
+                }
+            } catch (error) {
+                promiseCapability.reject(error);
+                return promiseCapability.promise;
+            }
+
+            const barrierStateBeforeAcceptance = this.queueState.barrierState;
+            internals.nextAcceptedRevision += 1;
+            internals.laneRevision += 1;
+            const item = intrinsicObjectFreeze({
+                kind: 'snapshot',
+                clientSnapshotId: values.clientSnapshotId,
+                reason: values.reason,
+                promiseCapability,
+                acceptedRevision: internals.nextAcceptedRevision
+            });
+            internals.items.push(item);
+            selectLaneState(this);
+
+            internals.fenceDepth += 1;
+            const transitionResult = invokeTotalCallback(
+                internals.configuration.onTransition,
+                [this.getState()],
+                'onTransition'
+            );
+            internals.fenceDepth -= 1;
+            if (!transitionResult.ok) {
+                const faultDetails = intrinsicObjectFreeze({
+                    causeKind: 'pre-dispatch-callback',
+                    callbackName: transitionResult.callbackName,
+                    clientItemId: item.clientSnapshotId,
+                    completedItemKind: null,
+                    completedClientItemId: null,
+                    completedOutcome: null,
+                    attemptedStateJson: null
+                });
+                const pendingFault = createCallbackFault(internals, faultDetails);
+                const itemIndex = internals.items.indexOf(item);
+                internals.items[itemIndex] = intrinsicObjectFreeze({
+                    kind: 'callback-marker',
+                    itemKind: 'snapshot',
+                    clientSnapshotId: item.clientSnapshotId,
+                    stateJson: null,
+                    payloadHash: null,
+                    promiseCapability: item.promiseCapability,
+                    acceptedRevision: item.acceptedRevision,
+                    callbackFaultId: pendingFault.callbackFaultId,
+                    faultDetails
+                });
+                internals.accepting = false;
+                internals.pendingTerminalCause = pendingFault;
+                replaceQueueState(this, {
+                    accepting: false,
+                    barrierState: barrierStateBeforeAcceptance
+                });
+                selectLaneState(this);
+                dispatchNextLaneItem(this);
+                return promiseCapability.promise;
+            }
+
+            dispatchNextLaneItem(this);
             return promiseCapability.promise;
         }
 
@@ -1302,12 +1808,12 @@
                     callbackFaultId: pendingFault.callbackFaultId,
                     faultDetails
                 });
-                dispatchNextSave(this);
+                dispatchNextLaneItem(this);
                 return promiseCapability.promise;
             }
 
             promiseCapability.reject(provisionalFault);
-            dispatchNextSave(this);
+            dispatchNextLaneItem(this);
             return promiseCapability.promise;
         }
 

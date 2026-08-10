@@ -96,6 +96,21 @@ function browserReceipt(item, sourceHashBefore, stateHashAfter, overrides = {}) 
     });
 }
 
+function snapshotReceipt(item, sourceHash = item.expectedHash, overrides = {}) {
+    return Object.freeze({
+        ok: true,
+        clientSnapshotId: item.clientSnapshotId,
+        sourceHash,
+        snapshotHash: sourceHash,
+        ordinal: 0,
+        snapshotStatus: 'created',
+        durability: 'native-durable',
+        retainedCount: 1,
+        recoveryHealth: health('snapshot'),
+        ...overrides
+    });
+}
+
 function structuredSaveError(item, overrides = {}) {
     const error = new LegacySafety.AssetTrackerSaveError('disk full');
     Object.assign(error, {
@@ -104,6 +119,23 @@ function structuredSaveError(item, overrides = {}) {
         conflict: false,
         clientSaveId: item.clientSaveId,
         payloadHash: item.payloadHash,
+        sourceHashAfter: item.expectedHash,
+        sourceReverified: true,
+        coordinatorReleased: true,
+        healthPersisted: false,
+        recoveryHealthEvidence: null,
+        ...overrides
+    });
+    return error;
+}
+
+function structuredSnapshotError(item, overrides = {}) {
+    const error = new LegacySafety.AssetTrackerSnapshotError('snapshot failed');
+    Object.assign(error, {
+        code: 'snapshot-failed',
+        snapshotOutcome: 'not-created',
+        conflict: false,
+        clientSnapshotId: item.clientSnapshotId,
         sourceHashAfter: item.expectedHash,
         sourceReverified: true,
         coordinatorReleased: true,
@@ -153,6 +185,49 @@ function oneReadTypedSaveError(item, overrides = {}) {
         assertEachReadOnce() {
             for (const key of Object.keys(values)) {
                 assert.equal(reads[key], 1, `saveError.${key} read count`);
+            }
+        }
+    };
+}
+
+function oneReadTypedSnapshotError(item, overrides = {}) {
+    const values = {
+        code: 'snapshot-failed',
+        message: 'snapshot failed',
+        snapshotOutcome: 'not-created',
+        conflict: false,
+        clientSnapshotId: item.clientSnapshotId,
+        sourceHashAfter: item.expectedHash,
+        sourceReverified: true,
+        coordinatorReleased: true,
+        healthPersisted: false,
+        recoveryHealthEvidence: null,
+        ...overrides
+    };
+    const reads = Object.create(null);
+    const target = new LegacySafety.AssetTrackerSnapshotError(values.message);
+    const source = new Proxy(target, {
+        get(object, key, receiver) {
+            if (Object.prototype.hasOwnProperty.call(values, key)) {
+                reads[key] = (reads[key] || 0) + 1;
+                if (reads[key] !== 1) throw new Error(`snapshotError.${key} was read more than once`);
+                return values[key];
+            }
+            return Reflect.get(object, key, receiver);
+        },
+        ownKeys() {
+            throw new Error('snapshotError source was enumerated');
+        },
+        getOwnPropertyDescriptor() {
+            throw new Error('snapshotError source descriptor was inspected');
+        }
+    });
+    return {
+        source,
+        values,
+        assertEachReadOnce() {
+            for (const key of Object.keys(values)) {
+                assert.equal(reads[key], 1, `snapshotError.${key} read count`);
             }
         }
     };
@@ -717,6 +792,1112 @@ test('FIFO two deferred receipts keep max active one and advance H0 to H1 to H2 
     assert.equal(queue.getState().lastAcknowledgedHash, H2);
     assert.equal(queue.getState().primaryStatus, 'native-durable');
     assert.equal(queue.getState().lanePhase, 'idle');
+});
+
+test('barrier shares the save FIFO and keeps H1 as the expected head for snapshot and H2', async () => {
+    const clock = manualClock();
+    const save1 = deferred();
+    const snapshot = deferred();
+    const save2 = deferred();
+    const callKinds = [];
+    const saveCalls = [];
+    const snapshotCalls = [];
+    const queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            callKinds.push('save');
+            saveCalls.push(request);
+            return saveCalls.length === 1 ? save1.promise : save2.promise;
+        },
+        snapshot: request => {
+            callKinds.push('snapshot');
+            snapshotCalls.push(request);
+            return snapshot.promise;
+        }
+    });
+
+    const h1 = queue.enqueue({ stateJson: '{"memo":"H1"}', reason: 'H1' });
+    const barrier = queue.runBarrier({ clientSnapshotId: 'snapshot-1', reason: 'manual' });
+    const h2 = queue.enqueue({ stateJson: '{"memo":"H2"}', reason: 'H2' });
+
+    assert.deepEqual(callKinds, ['save']);
+    assert.equal(queue.getState().lanePhase, 'saving');
+    assert.equal(queue.getState().pendingCount, 3);
+
+    save1.resolve(nativeReceipt(saveCalls[0], H0, H1));
+    await h1;
+    assert.deepEqual(callKinds, ['save', 'snapshot']);
+    assert.equal(snapshotCalls[0].expectedHash, H1);
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    assert.equal(queue.getState().lanePhase, 'barrier-running');
+    assert.equal(queue.getState().barrierState, 'running');
+    assert.equal(queue.getState().activeClientSnapshotId, 'snapshot-1');
+
+    snapshot.resolve(snapshotReceipt(snapshotCalls[0], H1));
+    await barrier;
+    assert.deepEqual(callKinds, ['save', 'snapshot', 'save']);
+    assert.equal(saveCalls[1].expectedHash, H1, 'barrier never advances the primary ledger');
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+
+    save2.resolve(nativeReceipt(saveCalls[1], H1, H2));
+    await h2;
+    assert.equal(queue.getState().lastAcknowledgedHash, H2);
+    assert.equal(queue.getState().lanePhase, 'idle');
+});
+
+test('an acknowledged H1 durability fact survives every queued barrier outcome without publishing idle success', async t => {
+    for (const outcome of ['created', 'known-not-created', 'unknown']) {
+        await t.test(outcome, async () => {
+            const clock = manualClock();
+            const h1Write = deferred();
+            const snapshot = deferred();
+            const h2Write = deferred();
+            const saveCalls = [];
+            const snapshotCalls = [];
+            const transitions = [];
+            const queue = makeQueue({
+                clock: clock.clock,
+                write: request => {
+                    saveCalls.push(request);
+                    return saveCalls.length === 1 ? h1Write.promise : h2Write.promise;
+                },
+                snapshot: request => {
+                    snapshotCalls.push(request);
+                    return snapshot.promise;
+                },
+                terminalize: request => Promise.resolve(terminalReceipt(request)),
+                onTransition: state => {
+                    transitions.push(state);
+                    return undefined;
+                }
+            });
+            const h1 = queue.enqueue({ stateJson: '{"memo":"H1"}', reason: 'H1' });
+            const barrier = queue.runBarrier({
+                clientSnapshotId: `snapshot-after-H1-${outcome}`,
+                reason: 'manual'
+            });
+            const h2 = queue.enqueue({ stateJson: '{"memo":"H2"}', reason: 'H2' });
+            const h2Observed = h2.then(
+                receipt => receipt,
+                error => error
+            );
+
+            h1Write.resolve(nativeReceipt(saveCalls[0], H0, H1));
+            await h1;
+            assert.equal(queue.getState().lanePhase, 'barrier-running');
+            assert.equal(queue.getState().lastAcknowledgedHash, H1);
+            assert.equal(queue.getState().primaryStatus, 'native-durable');
+            assert.equal(
+                transitions.some(state => state.lanePhase === 'idle'
+                    && state.lastAcknowledgedHash === H1),
+                false,
+                'H1 ACK is a durability fact but cannot publish stable idle success while work remains'
+            );
+
+            if (outcome === 'created') {
+                snapshot.resolve(snapshotReceipt(snapshotCalls[0], H1));
+                await barrier;
+                assert.equal(queue.getState().lanePhase, 'saving');
+                assert.equal(queue.getState().primaryStatus, 'native-durable');
+                h2Write.resolve(nativeReceipt(saveCalls[1], H1, H2));
+                await h2Observed;
+            } else if (outcome === 'known-not-created') {
+                snapshot.reject(structuredSnapshotError(snapshotCalls[0]));
+                const barrierError = await barrier.then(
+                    () => assert.fail('known-not-created must reject'),
+                    error => error
+                );
+                assert.equal(barrierError.queueOutcome, 'not-created');
+                assert.equal(queue.getState().lanePhase, 'saving');
+                assert.equal(queue.getState().primaryStatus, 'native-durable');
+                h2Write.resolve(nativeReceipt(saveCalls[1], H1, H2));
+                await h2Observed;
+            } else {
+                snapshot.reject(new Error('snapshot transport lost'));
+                const [barrierError, h2Error] = await Promise.all([
+                    barrier.then(() => assert.fail('unknown must reject'), error => error),
+                    h2Observed
+                ]);
+                assert.equal(barrierError.terminalReason, 'snapshot-outcome-unknown');
+                assert.equal(h2Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+                assert.equal(queue.getState().lanePhase, 'halted');
+                assert.equal(queue.getState().barrierState, 'outcome-unknown');
+                assert.equal(queue.getState().lastAcknowledgedHash, H1);
+                assert.equal(queue.getState().primaryStatus, 'native-durable');
+                assert.equal(saveCalls.length, 1);
+            }
+        });
+    }
+});
+
+test('a queued Web H2 cannot hide the browser-local-committed durability fact from H1 ACK', async () => {
+    const h1Write = deferred();
+    const h2Write = deferred();
+    const saveCalls = [];
+    const transitions = [];
+    const queue = makeQueue({
+        expectedDurability: 'browser-local-committed',
+        initialRecoveryHealth: {
+            ordinary: health('ordinary', 'not-applicable'),
+            snapshot: health('snapshot', 'not-applicable')
+        },
+        write: request => {
+            saveCalls.push(request);
+            return saveCalls.length === 1 ? h1Write.promise : h2Write.promise;
+        },
+        onTransition: state => {
+            transitions.push(state);
+            return undefined;
+        }
+    });
+    const h1 = queue.enqueue({ stateJson: '{"memo":"web-H1"}', reason: 'H1' });
+    const h2 = queue.enqueue({ stateJson: '{"memo":"web-H2"}', reason: 'H2' });
+
+    h1Write.resolve(browserReceipt(saveCalls[0], H0, H1));
+    await h1;
+    assert.equal(queue.getState().lanePhase, 'saving');
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    assert.equal(queue.getState().primaryStatus, 'browser-local-committed');
+    assert.equal(
+        transitions.some(state => state.lanePhase === 'idle'
+            && state.lastAcknowledgedHash === H1),
+        false
+    );
+
+    h2Write.resolve(browserReceipt(saveCalls[1], H1, H2));
+    await h2;
+});
+
+test('runBarrier one-reads and freezes only ID and reason while using queue-owned session hash and deadline', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const snapshot = deferred();
+    const saveCalls = [];
+    const snapshotCalls = [];
+    const descriptorValues = {
+        clientSnapshotId: 'snapshot-frozen',
+        reason: 'scheduled'
+    };
+    const descriptorReads = Object.create(null);
+    let injectedFieldReads = 0;
+    const descriptor = new Proxy(Object.create(null), {
+        get(_target, key) {
+            if (key === 'then') return undefined;
+            if (['operation', 'sessionContext', 'barrierDeadlineMs'].includes(key)) {
+                injectedFieldReads += 1;
+                return key === 'operation'
+                    ? () => { throw new Error('caller operation must not run'); }
+                    : key === 'sessionContext'
+                        ? { loadId: 'caller-load', writeSessionToken: 'caller-token' }
+                        : 1;
+            }
+            if (!Object.prototype.hasOwnProperty.call(descriptorValues, key)) {
+                throw new Error(`snapshotDescriptor.${String(key)} was not allowed`);
+            }
+            descriptorReads[key] = (descriptorReads[key] || 0) + 1;
+            if (descriptorReads[key] !== 1) {
+                throw new Error(`snapshotDescriptor.${key} was read more than once`);
+            }
+            return descriptorValues[key];
+        },
+        ownKeys() {
+            throw new Error('snapshotDescriptor source was enumerated');
+        },
+        getOwnPropertyDescriptor() {
+            throw new Error('snapshotDescriptor source descriptor was inspected');
+        }
+    });
+    const queue = makeQueue({
+        clock: clock.clock,
+        barrierDeadlineMs: 17_000,
+        write: request => {
+            saveCalls.push(request);
+            return first.promise;
+        },
+        snapshot: request => {
+            snapshotCalls.push(request);
+            return snapshot.promise;
+        }
+    });
+    const h1 = queue.enqueue({ stateJson: '{"memo":"H1"}', reason: 'H1' });
+
+    const barrier = queue.runBarrier(descriptor);
+    descriptorValues.clientSnapshotId = 'mutated-id';
+    descriptorValues.reason = 'manual';
+    assert.deepEqual({ ...descriptorReads }, { clientSnapshotId: 1, reason: 1 });
+    assert.equal(injectedFieldReads, 0);
+    first.resolve(nativeReceipt(saveCalls[0], H0, H1));
+    await h1;
+
+    assert.equal(snapshotCalls.length, 1);
+    assert.deepEqual(snapshotCalls[0], {
+        clientSnapshotId: 'snapshot-frozen',
+        reason: 'scheduled',
+        expectedHash: H1,
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'load-1',
+            writeSessionToken: 'token-1'
+        }
+    });
+    assert.equal(Object.isFrozen(snapshotCalls[0]), true);
+    assert.equal(Object.isFrozen(snapshotCalls[0].sessionContext), true);
+    assert.equal(clock.count(17_000), 1, 'caller cannot override the queue-owned barrier deadline');
+
+    snapshot.resolve(snapshotReceipt(snapshotCalls[0], H1));
+    await barrier;
+});
+
+test('created deduplicated and degraded snapshot receipts update only barrier and snapshot health state', async t => {
+    const variants = [
+        ['created', 'healthy', 'created'],
+        ['deduplicated', 'healthy', 'deduplicated'],
+        ['created', 'degraded', 'degraded']
+    ];
+
+    for (const [snapshotStatus, healthStatus, barrierState] of variants) {
+        await t.test(`${snapshotStatus}-${healthStatus}`, async () => {
+            const acknowledged = [];
+            const ordinaryDegraded = health('ordinary', 'degraded', {
+                code: 'ordinary-pending',
+                detail: 'ordinary remains degraded'
+            });
+            const snapshotHealth = health('snapshot', healthStatus, healthStatus === 'degraded'
+                ? { code: 'snapshot-pending', detail: 'snapshot cleanup pending' }
+                : {});
+            const queue = makeQueue({
+                initialRecoveryHealth: {
+                    ordinary: ordinaryDegraded,
+                    snapshot: health('snapshot', 'degraded')
+                },
+                snapshot: request => Promise.resolve(snapshotReceipt(request, H0, {
+                    snapshotStatus,
+                    recoveryHealth: snapshotHealth
+                })),
+                onAcknowledged: receipt => {
+                    acknowledged.push(receipt);
+                    return undefined;
+                }
+            });
+
+            const receipt = await queue.runBarrier({
+                clientSnapshotId: `snapshot-${snapshotStatus}-${healthStatus}`,
+                reason: 'manual'
+            });
+            const state = queue.getState();
+
+            assert.equal(receipt.snapshotStatus, snapshotStatus);
+            assert.equal(state.barrierState, barrierState);
+            assert.equal(state.lanePhase, 'idle');
+            assert.equal(state.lastAcknowledgedHash, H0);
+            assert.deepEqual(state.ordinaryRecoveryHealth, ordinaryDegraded);
+            assert.deepEqual(state.snapshotRecoveryHealth, snapshotHealth);
+            assert.equal(acknowledged.length, 1);
+            assert.equal(Object.isFrozen(receipt), true);
+            assert.equal(Object.isFrozen(receipt.recoveryHealth), true);
+        });
+    }
+});
+
+test('a healthy ordinary save does not clear a degraded snapshot-health domain', async () => {
+    const degradedSnapshotHealth = health('snapshot', 'degraded', {
+        code: 'snapshot-cleanup-pending',
+        detail: 'snapshot cleanup remains pending'
+    });
+    const queue = makeQueue({
+        initialRecoveryHealth: {
+            ordinary: health('ordinary', 'degraded'),
+            snapshot: degradedSnapshotHealth
+        },
+        write: request => Promise.resolve(nativeReceipt(request, H0, H1, {
+            recoveryHealth: health('ordinary')
+        }))
+    });
+
+    await queue.enqueue({ stateJson: '{"memo":"healthy-ordinary"}', reason: 'ordinary-save' });
+
+    assert.deepEqual(queue.getState().ordinaryRecoveryHealth, health('ordinary'));
+    assert.deepEqual(queue.getState().snapshotRecoveryHealth, degradedSnapshotHealth);
+});
+
+test('known-not-created rejects only its barrier, merges strict snapshot health, and continues H2 from the same head', async () => {
+    const clock = manualClock();
+    const snapshot = deferred();
+    const save = deferred();
+    const snapshotCalls = [];
+    const saveCalls = [];
+    const terminalCalls = [];
+    const transitions = [];
+    const persistedHealth = health('snapshot', 'degraded', {
+        code: 'snapshot-orphan-pending',
+        detail: 'orphan cleanup pending'
+    });
+    const queue = makeQueue({
+        clock: clock.clock,
+        snapshot: request => {
+            snapshotCalls.push(request);
+            return snapshot.promise;
+        },
+        write: request => {
+            saveCalls.push(request);
+            return save.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onTransition: state => {
+            transitions.push(state);
+            return undefined;
+        }
+    });
+    const barrier = queue.runBarrier({ clientSnapshotId: 'snapshot-not-created', reason: 'manual' });
+    const h2 = queue.enqueue({ stateJson: '{"memo":"H2"}', reason: 'H2' });
+
+    snapshot.reject(structuredSnapshotError(snapshotCalls[0], {
+        healthPersisted: true,
+        recoveryHealthEvidence: persistedHealth
+    }));
+    await Promise.resolve();
+    assert.equal(queue.getState().barrierState, 'not-created');
+    const barrierError = await barrier.then(
+        () => assert.fail('known-not-created barrier must reject'),
+        error => error
+    );
+
+    assert.equal(barrierError instanceof LegacySafety.AssetTrackerSnapshotError, true);
+    assert.equal(Object.isFrozen(barrierError), true);
+    assert.equal(Object.isFrozen(barrierError.recoveryHealthEvidence), true);
+    assert.equal(barrierError.snapshotOutcome, 'not-created');
+    assert.equal(queue.getState().barrierState, 'not-created');
+    assert.equal(queue.getState().lastAcknowledgedHash, H0);
+    assert.deepEqual(queue.getState().snapshotRecoveryHealth, persistedHealth);
+    assert.deepEqual(queue.getState().ordinaryRecoveryHealth, health('ordinary'));
+    assert.equal(saveCalls.length, 1, 'H2 dispatches only after the rejection transition fence');
+    assert.equal(saveCalls[0].expectedHash, H0);
+    assert.equal(terminalCalls.length, 0);
+    assert.equal(transitions.some(state => state.barrierState === 'not-created'), true);
+
+    save.resolve(nativeReceipt(saveCalls[0], H0, H2));
+    await h2;
+});
+
+test('malformed snapshot receipts and inconsistent health proof halt unknown and abort H2 with its save ID', async t => {
+    const variants = [
+        ['wrong source hash', request => Promise.resolve(snapshotReceipt(request, H2))],
+        ['wrong snapshot hash', request => Promise.resolve(snapshotReceipt(request, H0, {
+            snapshotHash: H2
+        }))],
+        ['resolved failure union', () => Promise.resolve({ ok: false, error: 'snapshot failed' })],
+        ['cross-domain success health', request => Promise.resolve(snapshotReceipt(request, H0, {
+            recoveryHealth: health('ordinary')
+        }))],
+        ['throwing receipt getter', request => Promise.resolve(new Proxy(
+            snapshotReceipt(request, H0),
+            {
+                get(target, key, receiver) {
+                    if (key === 'snapshotHash') throw new Error('snapshotHash getter failed');
+                    return Reflect.get(target, key, receiver);
+                }
+            }
+        ))],
+        ['false with non-null health', request => Promise.reject(structuredSnapshotError(request, {
+            healthPersisted: false,
+            recoveryHealthEvidence: health('snapshot', 'degraded')
+        }))],
+        ['true with null health', request => Promise.reject(structuredSnapshotError(request, {
+            healthPersisted: true,
+            recoveryHealthEvidence: null
+        }))],
+        ['cross-domain health', request => Promise.reject(structuredSnapshotError(request, {
+            healthPersisted: true,
+            recoveryHealthEvidence: health('ordinary', 'degraded')
+        }))]
+    ];
+
+    for (const [label, snapshot] of variants) {
+        await t.test(label, async () => {
+            const clock = manualClock();
+            const saveCalls = [];
+            const terminalCalls = [];
+            const queue = makeQueue({
+                clock: clock.clock,
+                snapshot,
+                write: request => {
+                    saveCalls.push(request);
+                    return Promise.reject(new Error('H2 must not dispatch'));
+                },
+                terminalize: request => {
+                    terminalCalls.push(request);
+                    return Promise.resolve(terminalReceipt(request));
+                }
+            });
+            const barrier = queue.runBarrier({
+                clientSnapshotId: `snapshot-unknown-${label}`,
+                reason: 'manual'
+            });
+            const h2 = queue.enqueue({ stateJson: '{"memo":"pending-H2"}', reason: 'H2' });
+            await Promise.resolve();
+            assert.equal(queue.getState().halted, true);
+            const [barrierError, h2Error] = await Promise.all([
+                barrier.then(() => assert.fail('barrier must reject unknown'), error => error),
+                h2.then(() => assert.fail('H2 must abort'), error => error)
+            ]);
+
+            assert.equal(barrierError instanceof LegacySafety.AssetTrackerSnapshotError, true);
+            assert.equal(barrierError.terminalReason, 'snapshot-outcome-unknown');
+            assert.equal(h2Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+            assert.equal(h2Error.itemKind, 'save');
+            assert.equal(h2Error.clientItemId, 'load-1:save:1');
+            assert.equal(h2Error.causedByClientItemId, `snapshot-unknown-${label}`);
+            assert.equal(saveCalls.length, 0);
+            assert.equal(queue.getState().barrierState, 'outcome-unknown');
+            assert.equal(queue.getState().lastAcknowledgedHash, H0);
+            assert.deepEqual(queue.getState().snapshotRecoveryHealth, health('snapshot'));
+            assert.deepEqual(terminalCalls.map(call => call.reason), ['snapshot-outcome-unknown']);
+        });
+    }
+});
+
+test('snapshot source and session conflicts halt the lane without a primary rollback claim', async t => {
+    for (const conflict of ['source-changed', 'session-invalid']) {
+        await t.test(conflict, async () => {
+            const clock = manualClock();
+            const terminalCalls = [];
+            const queue = makeQueue({
+                clock: clock.clock,
+                snapshot: request => Promise.reject(structuredSnapshotError(request, {
+                    conflict
+                })),
+                terminalize: request => {
+                    terminalCalls.push(request);
+                    return Promise.resolve(terminalReceipt(request));
+                }
+            });
+            const barrier = queue.runBarrier({
+                clientSnapshotId: `snapshot-conflict-${conflict}`,
+                reason: 'scheduled'
+            });
+            await Promise.resolve();
+            assert.equal(queue.getState().halted, true);
+            const barrierError = await barrier.then(
+                () => assert.fail('conflict must reject'),
+                error => error
+            );
+
+            assert.equal(barrierError instanceof LegacySafety.AssetTrackerSnapshotError, true);
+            assert.equal(barrierError.terminalReason, 'snapshot-conflict');
+            assert.equal(barrierError.conflict, conflict);
+            assert.equal(queue.getState().barrierState, 'conflict');
+            assert.equal(queue.getState().primaryStatus, 'failed-readonly');
+            assert.equal(queue.getState().lastAcknowledgedHash, H0);
+            assert.deepEqual(terminalCalls.map(call => call.reason), ['snapshot-conflict']);
+        });
+    }
+});
+
+test('barrier deadline preserves durable H1, aborts H2, terminalizes, and ignores the late snapshot receipt', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const snapshot = deferred();
+    const saveCalls = [];
+    const snapshotCalls = [];
+    const terminalCalls = [];
+    const queue = makeQueue({
+        clock: clock.clock,
+        barrierDeadlineMs: 17_000,
+        write: request => {
+            saveCalls.push(request);
+            return first.promise;
+        },
+        snapshot: request => {
+            snapshotCalls.push(request);
+            return snapshot.promise;
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        }
+    });
+    const h1 = queue.enqueue({ stateJson: '{"memo":"durable-H1"}', reason: 'H1' });
+    first.resolve(nativeReceipt(saveCalls[0], H0, H1));
+    await h1;
+    const barrier = queue.runBarrier({ clientSnapshotId: 'snapshot-timeout', reason: 'scheduled' });
+    const h2 = queue.enqueue({ stateJson: '{"memo":"pending-H2"}', reason: 'H2' });
+
+    clock.runDelay(17_000);
+    assert.equal(queue.getState().halted, true);
+    const [barrierError, h2Error] = await Promise.all([
+        barrier.then(() => assert.fail('deadline must reject'), error => error),
+        h2.then(() => assert.fail('H2 must abort'), error => error)
+    ]);
+
+    assert.equal(barrierError.terminalReason, 'snapshot-outcome-unknown');
+    assert.equal(h2Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+    assert.equal(queue.getState().primaryStatus, 'native-durable');
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    assert.equal(queue.getState().barrierState, 'outcome-unknown');
+    assert.equal(saveCalls.length, 1);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['snapshot-outcome-unknown']);
+
+    snapshot.resolve(snapshotReceipt(snapshotCalls[0], H1));
+    await Promise.resolve();
+    assert.equal(queue.getState().lastAcknowledgedHash, H1);
+    assert.equal(queue.getState().barrierState, 'outcome-unknown');
+    assert.equal(saveCalls.length, 1, 'late snapshot completion cannot dispatch H2');
+});
+
+test('synchronous barrier deadline callback halts before snapshot adapter I/O', async t => {
+    for (const registrationOutcome of ['return-handle', 'throw-after-callback']) {
+        await t.test(registrationOutcome, async () => {
+            const snapshotCalls = [];
+            const terminalCalls = [];
+            const queue = makeQueue({
+                barrierDeadlineMs: 17_000,
+                clock: {
+                    setTimeout(callback, delay) {
+                        if (delay === 17_000) {
+                            callback();
+                            if (registrationOutcome === 'throw-after-callback') {
+                                throw new Error('timer registration failed after callback');
+                            }
+                            return 'barrier-handle';
+                        }
+                        return 'terminal-handle';
+                    },
+                    clearTimeout: () => undefined
+                },
+                snapshot: request => {
+                    snapshotCalls.push(request);
+                    return Promise.resolve(snapshotReceipt(request, H0));
+                },
+                terminalize: request => {
+                    terminalCalls.push(request);
+                    return Promise.resolve(terminalReceipt(request));
+                }
+            });
+
+            const error = await queue.runBarrier({
+                clientSnapshotId: `snapshot-sync-deadline-${registrationOutcome}`,
+                reason: 'manual'
+            }).then(() => assert.fail('deadline must reject'), reason => reason);
+
+            assert.equal(error instanceof LegacySafety.AssetTrackerSnapshotError, true);
+            assert.equal(error.terminalReason, 'snapshot-outcome-unknown');
+            assert.equal(queue.getState().barrierState, 'outcome-unknown');
+            assert.equal(snapshotCalls.length, 0);
+            assert.deepEqual(terminalCalls.map(call => call.reason), ['snapshot-outcome-unknown']);
+        });
+    }
+});
+
+test('barrier enqueue during an active barrier stays synchronous and reentrant snapshot ACK enqueue keeps FIFO order', async () => {
+    const clock = manualClock();
+    const snapshot = deferred();
+    const save2 = deferred();
+    const save3 = deferred();
+    const snapshotCalls = [];
+    const saveCalls = [];
+    const transitions = [];
+    let h3 = null;
+    let queue;
+    queue = makeQueue({
+        clock: clock.clock,
+        snapshot: request => {
+            snapshotCalls.push(request);
+            return snapshot.promise;
+        },
+        write: request => {
+            saveCalls.push(request);
+            return saveCalls.length === 1 ? save2.promise : save3.promise;
+        },
+        onAcknowledged: receipt => {
+            if (receipt.clientSnapshotId === 'snapshot-reentrant') {
+                h3 = queue.enqueue({ stateJson: '{"memo":"H3"}', reason: 'H3' });
+            }
+            return undefined;
+        },
+        onTransition: state => {
+            transitions.push(state);
+            return undefined;
+        }
+    });
+    const barrier = queue.runBarrier({ clientSnapshotId: 'snapshot-reentrant', reason: 'manual' });
+    const h2 = queue.enqueue({ stateJson: '{"memo":"H2"}', reason: 'H2' });
+
+    assert.equal(snapshotCalls.length, 1);
+    assert.equal(saveCalls.length, 0);
+    assert.equal(queue.getState().lanePhase, 'barrier-running');
+    assert.equal(queue.getState().activeClientSnapshotId, 'snapshot-reentrant');
+    assert.equal(queue.getState().pendingCount, 2);
+    assert.equal(transitions.at(-1).lanePhase, 'barrier-running');
+
+    snapshot.resolve(snapshotReceipt(snapshotCalls[0], H0));
+    await barrier;
+    assert.equal(saveCalls.length, 1);
+    assert.equal(saveCalls[0].stateJson, '{"memo":"H2"}');
+    assert.equal(h3 instanceof Promise, true);
+
+    save2.resolve(nativeReceipt(saveCalls[0], H0, H2));
+    await h2;
+    assert.equal(saveCalls.length, 2);
+    assert.equal(saveCalls[1].stateJson, '{"memo":"H3"}');
+    save3.resolve(nativeReceipt(saveCalls[1], H2, H1));
+    await h3;
+});
+
+test('post-operation callback faults roll provisional next-barrier state back to the completed outcome', async t => {
+    await t.test('save ACK plus pending B1 restores the prior none state', async () => {
+        const clock = manualClock();
+        const save = deferred();
+        const saveCalls = [];
+        const snapshotCalls = [];
+        const queue = makeQueue({
+            clock: clock.clock,
+            write: request => {
+                saveCalls.push(request);
+                return save.promise;
+            },
+            snapshot: request => {
+                snapshotCalls.push(request);
+                return Promise.resolve(snapshotReceipt(request));
+            },
+            terminalize: request => Promise.resolve(terminalReceipt(request)),
+            onAcknowledged: receipt => {
+                if (receipt.clientSaveId) throw new Error('save ACK callback failed');
+                return undefined;
+            }
+        });
+        const h1 = queue.enqueue({ stateJson: '{"memo":"H1"}', reason: 'H1' });
+        const b1 = queue.runBarrier({ clientSnapshotId: 'pending-B1', reason: 'manual' });
+        const b1Observed = b1.then(
+            () => assert.fail('pending B1 must abort'),
+            error => error
+        );
+
+        save.resolve(nativeReceipt(saveCalls[0], H0, H1));
+        const receipt = await h1;
+        const b1Error = await b1Observed;
+
+        assert.equal(receipt.stateHashAfter, H1);
+        assert.equal(b1Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+        assert.equal(b1Error.completedItemKind, 'save');
+        assert.equal(b1Error.completedClientItemId, receipt.clientSaveId);
+        assert.equal(snapshotCalls.length, 0);
+        assert.equal(queue.getState().barrierState, 'none');
+    });
+
+    await t.test('created B1 plus pending B2 preserves created', async () => {
+        const clock = manualClock();
+        const first = deferred();
+        const snapshotCalls = [];
+        const queue = makeQueue({
+            clock: clock.clock,
+            snapshot: request => {
+                snapshotCalls.push(request);
+                return first.promise;
+            },
+            terminalize: request => Promise.resolve(terminalReceipt(request)),
+            onAcknowledged: receipt => {
+                if (receipt.clientSnapshotId === 'created-B1') {
+                    throw new Error('created callback failed');
+                }
+                return undefined;
+            }
+        });
+        const b1 = queue.runBarrier({ clientSnapshotId: 'created-B1', reason: 'manual' });
+        const b2 = queue.runBarrier({ clientSnapshotId: 'pending-created-B2', reason: 'manual' });
+        const b2Observed = b2.then(
+            () => assert.fail('pending B2 must abort'),
+            error => error
+        );
+
+        first.resolve(snapshotReceipt(snapshotCalls[0], H0));
+        const receipt = await b1;
+        const b2Error = await b2Observed;
+
+        assert.equal(receipt.snapshotStatus, 'created');
+        assert.equal(b2Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+        assert.equal(b2Error.completedItemKind, 'snapshot');
+        assert.equal(b2Error.completedClientItemId, 'created-B1');
+        assert.equal(snapshotCalls.length, 1, 'B2 never reaches the adapter');
+        assert.equal(queue.getState().barrierState, 'created');
+    });
+
+    await t.test('known-not-created B1 plus pending B2 preserves not-created', async () => {
+        const clock = manualClock();
+        const first = deferred();
+        const snapshotCalls = [];
+        let failCompletedTransition = false;
+        const queue = makeQueue({
+            clock: clock.clock,
+            snapshot: request => {
+                snapshotCalls.push(request);
+                return first.promise;
+            },
+            terminalize: request => Promise.resolve(terminalReceipt(request)),
+            onTransition: () => {
+                if (failCompletedTransition) throw new Error('known outcome transition failed');
+                return undefined;
+            }
+        });
+        const b1 = queue.runBarrier({ clientSnapshotId: 'not-created-B1', reason: 'manual' });
+        const b1Observed = b1.then(
+            () => assert.fail('known-not-created B1 must reject'),
+            error => error
+        );
+        const b2 = queue.runBarrier({ clientSnapshotId: 'pending-not-created-B2', reason: 'manual' });
+        const b2Observed = b2.then(
+            () => assert.fail('pending B2 must abort'),
+            error => error
+        );
+
+        failCompletedTransition = true;
+        first.reject(structuredSnapshotError(snapshotCalls[0]));
+        const b1Error = await b1Observed;
+        const b2Error = await b2Observed;
+
+        assert.equal(b1Error.queueOutcome, 'not-created');
+        assert.equal(b2Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+        assert.equal(b2Error.completedOutcome, 'known-not-created');
+        assert.equal(snapshotCalls.length, 1, 'B2 never reaches the adapter');
+        assert.equal(queue.getState().barrierState, 'not-created');
+    });
+
+    await t.test('reentrant B2 enqueue followed by the outer save callback throw restores none', async () => {
+        const clock = manualClock();
+        const save = deferred();
+        const saveCalls = [];
+        const snapshotCalls = [];
+        let b2Observed = null;
+        let queue;
+        queue = makeQueue({
+            clock: clock.clock,
+            write: request => {
+                saveCalls.push(request);
+                return save.promise;
+            },
+            snapshot: request => {
+                snapshotCalls.push(request);
+                return Promise.resolve(snapshotReceipt(request));
+            },
+            terminalize: request => Promise.resolve(terminalReceipt(request)),
+            onAcknowledged: receipt => {
+                if (receipt.clientSaveId) {
+                    const b2 = queue.runBarrier({
+                        clientSnapshotId: 'reentrant-pending-B2',
+                        reason: 'manual'
+                    });
+                    b2Observed = b2.then(
+                        () => assert.fail('reentrant B2 must abort'),
+                        error => error
+                    );
+                    throw new Error('outer save callback failed');
+                }
+                return undefined;
+            }
+        });
+        const h1 = queue.enqueue({ stateJson: '{"memo":"reentrant-H1"}', reason: 'H1' });
+
+        save.resolve(nativeReceipt(saveCalls[0], H0, H1));
+        const receipt = await h1;
+        const b2Error = await b2Observed;
+
+        assert.equal(receipt.stateHashAfter, H1);
+        assert.equal(b2Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+        assert.equal(b2Error.completedClientItemId, receipt.clientSaveId);
+        assert.equal(snapshotCalls.length, 0);
+        assert.equal(queue.getState().barrierState, 'none');
+    });
+});
+
+test('pre-dispatch barrier transition failure rejects the barrier and performs zero snapshot I/O', async () => {
+    const clock = manualClock();
+    const snapshotCalls = [];
+    const faults = [];
+    const terminalCalls = [];
+    const queue = makeQueue({
+        clock: clock.clock,
+        snapshot: request => {
+            snapshotCalls.push(request);
+            return Promise.resolve(snapshotReceipt(request, H0));
+        },
+        terminalize: request => {
+            terminalCalls.push(request);
+            return Promise.resolve(terminalReceipt(request));
+        },
+        onTransition: state => {
+            if (state.lanePhase === 'barrier-running') {
+                throw new Error('barrier transition failed');
+            }
+            return undefined;
+        },
+        onFault: fault => {
+            faults.push(fault);
+            return undefined;
+        }
+    });
+    const barrier = queue.runBarrier({ clientSnapshotId: 'snapshot-pre-dispatch', reason: 'manual' });
+    const barrierObserved = barrier.then(
+        () => assert.fail('pre-dispatch callback must reject'),
+        reason => reason
+    );
+    await Promise.resolve();
+
+    assert.equal(queue.getState().halted, true);
+    const error = await barrierObserved;
+    assert.equal(error instanceof LegacySafety.AssetTrackerQueueCallbackError, true);
+    assert.equal(error.causeKind, 'pre-dispatch-callback');
+    assert.equal(error.clientItemId, 'snapshot-pre-dispatch');
+    assert.equal(error.completedItemKind, null);
+    assert.equal(snapshotCalls.length, 0);
+    assert.equal(queue.getState().barrierState, 'none');
+    assert.strictEqual(faults[0], error);
+    assert.deepEqual(terminalCalls.map(call => call.reason), ['queue-callback-failed']);
+});
+
+test('snapshot successful receipt callback faults preserve its receipt and fence H2 before the first caller reaction', async t => {
+    for (const callbackName of ['onAcknowledged', 'onTransition']) {
+        await t.test(callbackName, async () => {
+            const clock = manualClock();
+            const snapshot = deferred();
+            const snapshotCalls = [];
+            const saveCalls = [];
+            const faults = [];
+            const events = [];
+            const queue = makeQueue({
+                clock: clock.clock,
+                snapshot: request => {
+                    snapshotCalls.push(request);
+                    return snapshot.promise;
+                },
+                write: request => {
+                    saveCalls.push(request);
+                    return Promise.reject(new Error('H2 must not dispatch'));
+                },
+                terminalize: request => Promise.resolve(terminalReceipt(request)),
+                onAcknowledged: callbackName === 'onAcknowledged'
+                    ? receipt => { receipt.snapshotHash = H2; }
+                    : () => undefined,
+                onTransition: state => {
+                    if (callbackName === 'onTransition' && state.barrierState === 'created') {
+                        throw new Error('snapshot transition failed');
+                    }
+                    return undefined;
+                },
+                onFault: fault => {
+                    events.push('onFault');
+                    faults.push(fault);
+                    return undefined;
+                }
+            });
+            const barrier = queue.runBarrier({
+                clientSnapshotId: `snapshot-success-${callbackName}`,
+                reason: 'manual'
+            });
+            const callerObserved = barrier.then(receipt => {
+                events.push('first caller');
+                return { receipt, callerState: queue.getState() };
+            });
+            const h2 = queue.enqueue({ stateJson: '{"memo":"H2"}', reason: 'H2' });
+            const h2Observed = h2.then(
+                () => assert.fail('H2 must abort'),
+                error => error
+            );
+
+            snapshot.resolve(snapshotReceipt(snapshotCalls[0], H0));
+            await Promise.resolve();
+            assert.equal(queue.getState().halted, true);
+            const { receipt, callerState } = await callerObserved;
+            const h2Error = await h2Observed;
+
+            assert.equal(receipt.clientSnapshotId, `snapshot-success-${callbackName}`);
+            assert.equal(callerState.halted, true);
+            assert.equal(h2Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+            assert.equal(h2Error.causeKind, 'post-operation-callback');
+            assert.equal(h2Error.completedItemKind, 'snapshot');
+            assert.equal(h2Error.completedClientItemId, receipt.clientSnapshotId);
+            assert.equal(h2Error.completedOutcome, 'successful-receipt');
+            assert.equal(saveCalls.length, 0);
+            assert.equal(queue.getState().lastAcknowledgedHash, H0);
+            assert.equal(faults[0].completedItemKind, 'snapshot');
+            assert.equal(faults[0].completedClientItemId, receipt.clientSnapshotId);
+            assert.equal(h2Error.callbackFaultId, faults[0].callbackFaultId);
+            assert.deepEqual(events, ['onFault', 'first caller']);
+        });
+    }
+});
+
+test('known-not-created callback return variants preserve SnapshotError and fence H2 with one callback fault', async t => {
+    const variants = [
+        ['throw', () => { throw new Error('known-not-created transition failed'); }],
+        ['number', () => 1],
+        ['resolved thenable', () => Promise.resolve('invalid')],
+        ['rejected thenable', () => Promise.reject(new Error('diagnostic reject'))],
+        ['never thenable', () => new Promise(() => {})]
+    ];
+
+    for (const [label, callbackResult] of variants) {
+        await t.test(label, async () => {
+            const clock = manualClock();
+            const snapshot = deferred();
+            const snapshotCalls = [];
+            const saveCalls = [];
+            const faults = [];
+            const queue = makeQueue({
+                clock: clock.clock,
+                snapshot: request => {
+                    snapshotCalls.push(request);
+                    return snapshot.promise;
+                },
+                write: request => {
+                    saveCalls.push(request);
+                    return Promise.reject(new Error('H2 must not dispatch'));
+                },
+                terminalize: request => Promise.resolve(terminalReceipt(request)),
+                onTransition: state => state.barrierState === 'not-created'
+                    ? callbackResult()
+                    : undefined,
+                onFault: fault => {
+                    faults.push(fault);
+                    return undefined;
+                }
+            });
+            const barrier = queue.runBarrier({
+                clientSnapshotId: `snapshot-not-created-callback-${label}`,
+                reason: 'manual'
+            });
+            const barrierObserved = barrier.then(
+                () => assert.fail('known-not-created must reject'),
+                error => error
+            );
+            const h2 = queue.enqueue({ stateJson: '{"memo":"H2"}', reason: 'H2' });
+            const h2Observed = h2.then(
+                () => assert.fail('H2 must abort'),
+                error => error
+            );
+            snapshot.reject(structuredSnapshotError(snapshotCalls[0]));
+            await Promise.resolve();
+
+            assert.equal(queue.getState().halted, true);
+            const barrierError = await barrierObserved;
+            const h2Error = await h2Observed;
+            assert.equal(barrierError instanceof LegacySafety.AssetTrackerSnapshotError, true);
+            assert.equal(barrierError.queueOutcome, 'not-created');
+            assert.equal(h2Error instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+            assert.equal(h2Error.causeKind, 'post-operation-callback');
+            assert.equal(h2Error.completedItemKind, 'snapshot');
+            assert.equal(h2Error.completedClientItemId, barrierError.clientSnapshotId);
+            assert.equal(h2Error.completedOutcome, 'known-not-created');
+            assert.equal(saveCalls.length, 0);
+            assert.equal(faults.length, 1);
+            assert.equal(faults[0].terminalReason, 'queue-callback-failed');
+        });
+    }
+});
+
+test('snapshot receipt and error fields are each extracted once and exposed as detached deep-frozen values', async () => {
+    const receiptHealthValues = {
+        domain: 'snapshot',
+        status: 'healthy',
+        auditComplete: true,
+        code: null,
+        maintenancePendingCount: 0,
+        detail: null
+    };
+    const receiptHealth = oneReadRecord('snapshotReceipt.recoveryHealth', receiptHealthValues);
+    const receiptValues = {
+        ok: true,
+        clientSnapshotId: 'snapshot-one-read-receipt',
+        sourceHash: H0,
+        snapshotHash: H0,
+        ordinal: 0,
+        snapshotStatus: 'created',
+        durability: 'native-durable',
+        retainedCount: 1,
+        recoveryHealth: receiptHealth.record
+    };
+    const receiptSource = oneReadRecord('snapshotReceipt', receiptValues);
+    const receiptQueue = makeQueue({
+        snapshot: () => Promise.resolve(receiptSource.record)
+    });
+    const receipt = await receiptQueue.runBarrier({
+        clientSnapshotId: 'snapshot-one-read-receipt',
+        reason: 'manual'
+    });
+    receiptSource.assertEachReadOnce();
+    receiptHealth.assertEachReadOnce();
+    receiptValues.snapshotHash = H2;
+    receiptHealthValues.status = 'degraded';
+    assert.equal(receipt.snapshotHash, H0);
+    assert.equal(receipt.recoveryHealth.status, 'healthy');
+    assert.equal(receiptQueue.getState().snapshotRecoveryHealth.status, 'healthy');
+    assert.equal(Object.isFrozen(receipt), true);
+    assert.equal(Object.isFrozen(receipt.recoveryHealth), true);
+
+    const errorHealthValues = {
+        domain: 'snapshot',
+        status: 'degraded',
+        auditComplete: true,
+        code: 'snapshot-pending',
+        maintenancePendingCount: 1,
+        detail: 'pending cleanup'
+    };
+    const errorHealth = oneReadRecord('snapshotError.recoveryHealthEvidence', errorHealthValues);
+    const errorQueue = makeQueue({
+        snapshot: request => {
+            const oneRead = oneReadTypedSnapshotError(request, {
+                healthPersisted: true,
+                recoveryHealthEvidence: errorHealth.record
+            });
+            errorQueue.oneReadSnapshotError = oneRead;
+            return Promise.reject(oneRead.source);
+        }
+    });
+    const error = await errorQueue.runBarrier({
+        clientSnapshotId: 'snapshot-one-read-error',
+        reason: 'manual'
+    }).then(() => assert.fail('known-not-created must reject'), reason => reason);
+    errorQueue.oneReadSnapshotError.assertEachReadOnce();
+    errorHealth.assertEachReadOnce();
+    errorQueue.oneReadSnapshotError.values.sourceHashAfter = H2;
+    errorHealthValues.code = 'mutated';
+    assert.equal(error.sourceHashAfter, H0);
+    assert.equal(error.recoveryHealthEvidence.code, 'snapshot-pending');
+    assert.equal(errorQueue.getState().snapshotRecoveryHealth.code, 'snapshot-pending');
+    assert.equal(Object.isFrozen(error), true);
+    assert.equal(Object.isFrozen(error.recoveryHealthEvidence), true);
+});
+
+test('active save failure aborts a pending snapshot with its exact snapshot ID', async () => {
+    const clock = manualClock();
+    const first = deferred();
+    const saveCalls = [];
+    const snapshotCalls = [];
+    const queue = makeQueue({
+        clock: clock.clock,
+        write: request => {
+            saveCalls.push(request);
+            return first.promise;
+        },
+        snapshot: request => {
+            snapshotCalls.push(request);
+            return Promise.resolve(snapshotReceipt(request));
+        },
+        terminalize: request => Promise.resolve(terminalReceipt(request))
+    });
+    const h1 = queue.enqueue({ stateJson: '{"memo":"H1"}', reason: 'H1' });
+    const barrier = queue.runBarrier({ clientSnapshotId: 'snapshot-pending-abort', reason: 'scheduled' });
+    first.reject(structuredSaveError(saveCalls[0]));
+    await h1.then(() => assert.fail('H1 must reject'), () => undefined);
+    const barrierError = await barrier.then(() => assert.fail('snapshot must abort'), error => error);
+
+    assert.equal(barrierError instanceof LegacySafety.AssetTrackerQueueAbortError, true);
+    assert.equal(barrierError.itemKind, 'snapshot');
+    assert.equal(barrierError.clientItemId, 'snapshot-pending-abort');
+    assert.equal(barrierError.payloadHash, null);
+    assert.equal(barrierError.causedByClientItemId, saveCalls[0].clientSaveId);
+    assert.equal(snapshotCalls.length, 0);
 });
 
 test('rapid FIFO accepts 100 frozen saves with one active write and persists the exact 100th state', async () => {
