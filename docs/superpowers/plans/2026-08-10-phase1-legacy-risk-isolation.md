@@ -402,16 +402,38 @@ git commit -m "fix: protect unreadable legacy books"
 
 ## Task 3: Serialize Saves and Make Native ACK Actually Durable
 
+**Normative binding:** Task 3 is implemented from
+`docs/superpowers/specs/2026-08-10-phase1-task3-durable-save-contract.md` at exact SHA-256
+`4585996f8732bc5f3a2f119a90474610c0866817573dcd07dd4539ed4c422728`
+and the bite-sized execution plan
+`docs/superpowers/plans/2026-08-10-phase1-task3-durable-save.md` at exact
+SHA-256 `62702b0f063ebf854cdc7fe1edd6129207abf450dc4f78a6e3f725af2a6a1d91`.
+Those two documents replace the simplified examples below wherever a field,
+failure classification, durability step, recovery-index rule, or verification
+command differs. A hash mismatch stops Task 3 implementation pending review.
+The remainder of this Task 3 block is non-normative orientation only: do not
+execute one of its snippets in isolation. Execute Tasks 1–10 in the dedicated
+Task 3 plan, including each focused RED, focused GREEN, review, and full gate.
+
 **Files:**
 
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/legacy-safety.js`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/script.js`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/save-queue.test.js`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/data-recovery.test.js`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/web-storage.test.js`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/tests/macos-scaffold.test.js`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerCore/NativeDurableFileWriter.swift`
+- Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerCore/AssetTrackerRecoveryStore.swift`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerFaultHarness/main.swift`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerCore/AssetTrackerBookStore.swift`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerCore/AssetTrackerStorageCoordinator.swift`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerCore/AssetTrackerBridgeResponse.swift`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Tests/AssetTrackerCoreTests/NativeDurableFileWriterTests.swift`
+- Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Tests/AssetTrackerCoreTests/AssetTrackerRecoveryStoreTests.swift`
 - Create: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Tests/AssetTrackerCoreTests/ProcessKillRecoveryTests.swift`
+- Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Tests/AssetTrackerCoreTests/AssetTrackerBookStoreTests.swift`
 - Modify: `/Users/joshua/Desktop/Qiushan_Studio/6_Personal/可视化记账/macos-app/Package.swift`
 
 - [ ] **Step 1: Write deferred-ACK queue tests**
@@ -481,19 +503,30 @@ First use injected exceptions to cover every branch. Then add an `AssetTrackerFa
 
 Separate three concepts:
 
-1. **Ordinary save:** maintain exactly two rotating, validated `previous-1`/`previous-2` recovery slots. Rotation itself uses sibling temp, file fsync, rename, directory fsync, reread, and SHA-256. If the previous-state safety copy cannot be established, fail the new primary write closed.
+1. **Ordinary save:** maintain at most two verified, distinct prior generations; after enough history this yields logical `previous-1`/`previous-2`, but missing history is never filled by duplicating a hash. Content-addressed blobs plus one prepared/committed durable index make rotation crash-reconcilable. Rotation uses the shared mutation lock, lock-in expected-hash CAS, exact write, file fsync, `F_FULLFSYNC`, rename, directory fsync, reread, SHA-256, and canonical identity revalidation. If the previous-state safety copy or index cannot be proven, fail the new primary write closed.
 2. **Manual/scheduled native recovery point:** `storage.snapshot` creates a content-addressed version only when the live book is valid. Deduplicate identical hashes; retain at most 24 points and always retain the newest 3. Delete an older point only after the new point and current primary both reread/verify. Cleanup failure is reported as recovery-health degradation and never causes silent deletion or a false backup-success message.
-3. **Final freeze snapshot:** immutable and excluded from ordinary retention; Task 7 owns it.
+3. **Final freeze snapshot:** immutable and excluded from ordinary retention; Phase 1 Task 7 owns it.
 
-A corrupt current file is never promoted to a valid recovery point and is never overwritten. Browser localStorage does not create or advertise automatic backups; Web exposes storage status plus explicit JSON export only.
+A corrupt current file is never promoted to a valid recovery point and is never overwritten. Task 3 does not add or advertise any new browser backup; the pre-existing `assetTrackerBackup*` route remains explicit non-releaseable debt until Phase 1 Task 4 disables it and leaves Web with truthful storage status plus explicit JSON export only.
 
 - [ ] **Step 6: Verify**
 
 ```bash
+test "$(shasum -a 256 docs/superpowers/specs/2026-08-10-phase1-task3-durable-save-contract.md | awk '{print $1}')" = "4585996f8732bc5f3a2f119a90474610c0866817573dcd07dd4539ed4c422728"
+node --check legacy-safety.js
+node --check script.js
 node --test tests/macos-scaffold.test.js
 node --test tests/save-queue.test.js
+node --test tests/data-recovery.test.js tests/web-storage.test.js tests/macos-scaffold.test.js
+node --test tests/*.test.js
+swift build --package-path macos-app --product AssetTrackerFaultHarness
 swift test --package-path macos-app --filter NativeDurableFileWriterTests
-swift test --package-path macos-app --filter ProcessKillRecoveryTests
+ASSET_TRACKER_FAULT_HARNESS="$(swift build --package-path macos-app --show-bin-path)/AssetTrackerFaultHarness" \
+  swift test --package-path macos-app --filter ProcessKillRecoveryTests
+swift test --package-path macos-app
+swift build --package-path macos-app
+swift test --package-path macos-app -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+git diff --check
 ```
 
 - [ ] **Step 7: Commit**
