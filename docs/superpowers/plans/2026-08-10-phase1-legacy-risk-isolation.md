@@ -407,7 +407,7 @@ git commit -m "fix: protect unreadable legacy books"
 `4585996f8732bc5f3a2f119a90474610c0866817573dcd07dd4539ed4c422728`
 and the bite-sized execution plan
 `docs/superpowers/plans/2026-08-10-phase1-task3-durable-save.md` at exact
-SHA-256 `62702b0f063ebf854cdc7fe1edd6129207abf450dc4f78a6e3f725af2a6a1d91`.
+SHA-256 `3841e1b7094cec806f4496b8a05de1660779894528ae35c16014d0d868c0ca1b`.
 Those two documents replace the simplified examples below wherever a field,
 failure classification, durability step, recovery-index rule, or verification
 command differs. A hash mismatch stops Task 3 implementation pending review.

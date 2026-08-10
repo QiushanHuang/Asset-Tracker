@@ -815,6 +815,8 @@ protocol NativePOSIX: Sendable {
     func fstatAt(directoryFD: Int32, path: String, noFollow: Bool) throws -> stat
     func directoryEntries(directoryFD: Int32) throws -> [NativeDirectoryEntry]
     func extendedACLEntryCount(fileFD: Int32) throws -> Int
+    func hasDangerousLegacyACL(fileFD: Int32, ownerUserID: uid_t) throws -> Bool
+    func clearExtendedACL(fileFD: Int32) throws
     func unlinkAt(directoryFD: Int32, path: String) throws
     func close(fileFD: Int32)
 }
@@ -893,6 +895,32 @@ final class NativeLockedBookDirectory {
 `defer` before unlocking. Returning or retaining the capability is harmless:
 any later method call throws `leaseExpired` before a syscall.
 
+All production callers share one writer instance. The writer also keeps a
+process-local registry keyed by the opened root directory device/inode so a
+same-thread acquisition of the same root through a second writer instance
+fails before a second `flock`; different threads still serialize on the fixed
+lock, and the same thread may nest different roots. Task 7 reuses this exact
+lock scope rather than constructing a second lock implementation.
+
+The fixed lock is never exposed as a half-initialized canonical inode. When it
+is missing, the writer creates a random sibling lock temp with
+`O_CREAT|O_EXCL|O_NOFOLLOW`, clears inherited ACLs, applies and verifies `0600`,
+performs `fsync` plus `F_FULLFSYNC`, and publishes it with an exclusive rename
+before synchronizing the root directory. A loser opens the fully published
+canonical lock. Private pre-publication lock temps left by a killed process are
+ignored and preserved; no scan or speculative cleanup may delete them or any
+unknown sentinel. A pre-existing canonical lock is admitted by owner/type,
+single-link, `0600`, and zero-ACL metadata, but its bytes are opaque and are
+never rewritten merely because they are nonempty.
+
+Legacy root/primary admission and newly managed objects use different ACL
+rules. A legacy root or primary may be admitted only when it is owner-bound and
+has no dangerous non-owner write/delete/security ACL entry. Every newly
+created managed directory/file and the root once the canonical lock is held
+must have inherited ACLs explicitly cleared, then be mode-normalized and
+verified with zero ACL entries before it can contribute to a receipt. ACL
+inspection or clearing errors fail closed.
+
 `NativeSourceProof` is created only for the fixed canonical
 `AssetTrackerBook.json` basename and embeds that target identity; callers
 cannot apply it to an arbitrary relative path. `durablyVerifyUnchangedPrimary`
@@ -920,6 +948,7 @@ unlinkat
 afterRetentionUnlink
 fsync(snapshot directory)
 afterRetentionDirectoryFSync
+final no-callback canonical ENOENT proof
 ```
 
 The ordinary variant never emits snapshot-retention points. Both validate the
@@ -946,11 +975,17 @@ testManagedDirectorySyncRevalidatesBoundIdentityWithoutMutation
 testIllegalSemanticRoleAndManagedTargetPairFailsBeforeAnySyscall
 testSnapshotPendingUnlinkFaultsBracketUnlinkAndDirectorySyncExactly
 testOrdinaryPendingUnlinkNeverEmitsSnapshotRetentionFaultPoints
+testLockBootstrapPublishesOnlyInitializedDurableInodeAndFreshReopensEveryFailureBoundary
+testAuthorizedMutationClearsInheritedBenignACLFromRootAndEveryNewManagedObject
+testPreparedTempExactBytesAreReprovedAfterEveryExternalPreRenameCallback
+testFinalReceiptRejectsSameInodeContentMutationAtEveryFinalCallback
+testExistingManagedDirectoryRetryDurablySyncsChildAndParentAfterInterruptedCreation
 ```
 
 The fake POSIX adapter must record every method in `NativePOSIX`, including
 `flock`, `read`, `fstat(fd)`, `fstatat`, `fchmod`, `mkdirat`, directory
-enumeration, ACL inspection, `openat`, `write`, both sync calls,
+enumeration, dangerous-legacy-ACL inspection, zero-ACL inspection, ACL clearing,
+`openat`, `write`, both sync calls,
 `renameat`/exclusive rename, `unlinkat`, and close order. Real
 temporary-directory tests verify private `0700` managed directories, `0600`
 managed files, and that a second independent lock attempt cannot enter until
@@ -969,28 +1004,54 @@ Expected: compilation FAIL because `NativeDurableFileWriter`, its lock scope, an
 
 - [ ] **Step 3: Implement the minimal mutation lock and durable primitive**
 
-The writer anchors the canonical storage root from its parent directory file descriptor, opens the fixed lock file with no-follow semantics, takes `flock(LOCK_EX)`, and revalidates parent entry/root/lock device, inode, link count, owner, type, and mode after acquisition. A locked operation may use only relative managed basenames through the directory descriptor.
+The writer anchors the canonical storage root from its parent directory file
+descriptor. If the root was first observed missing, both the creator and an
+`EEXIST` loser reopen it with no-follow semantics and idempotently synchronize
+the root and its parent before lock admission. It then uses the crash-safe
+private-temp publication protocol above for the fixed lock, takes
+`flock(LOCK_EX)`, tightens the admitted root to `0700` with zero ACL, and
+revalidates parent entry/root/lock device, inode, link count, owner, type, mode,
+and ACL after acquisition. A locked operation may use only relative managed
+basenames through the directory descriptor. Creating a managed directory, or
+retrying after an interrupted creation when the directory already exists,
+uses one already-bound parent descriptor for the child open, both syncs, and
+both pre/post-sync proofs. Only the initial existence probe may route an
+`ENOENT` into creation; an `ENOENT` or identity change during any later proof
+fails closed and never recreates the name. Both paths idempotently synchronize
+the child directory and that same actual parent, then revalidate the child
+FD-to-name identity, `0700`/owner/link/zero-ACL metadata, the parent, and the
+complete root/lock/ancestor chain.
 
 The exact durable replace sequence is:
 
 ```text
 openat sibling temp with O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC mode 0600
-fchmod(temp, 0600) and verify it, independent of umask
+clear inherited ACLs, fchmod(temp, 0600), and verify zero ACL, independent of umask
 write exact bytes, retry EINTR and short writes
 fsync(temp)
 fcntl(temp, F_FULLFSYNC)
+run all declared pre-rename fault callbacks
+silently reopen/re-read and prove the temp FD, canonical temp name, exact bytes, byte count, SHA-256, owner, mode, and zero ACL still agree
 revalidate root/lock/managed-directory identities
-for primary replace, reread immediately and prove missing or exact initial hash, byte count, device, and inode from NativeSourceProof
-trigger afterSourceRevalidation only after that proof succeeds
+for primary replace, prove missing or exact initial hash, byte count, device, and inode from NativeSourceProof, trigger afterSourceRevalidation, then repeat a silent final source proof
+after the final source-name fstat proof, make rename the immediately following syscall, with no callback or unrelated syscall between them
 rename atomically (create-only uses an exclusive no-follow rename)
 fsync(parent directory)
 reopen final with O_NOFOLLOW
 verify regular file, owner, 0600, exact bytes, byte count, and SHA-256
-revalidate canonical directory/lock identities
+run declared post-rename/final fault callbacks, then silently repeat exact bytes/hash/stat, FD-to-name identity, zero-ACL, and canonical directory/lock/root proofs
 return NativeDurableFileReceipt
 ```
 
 Each descriptor uses `defer`-backed close. Never resolve a target through a string path after the directory descriptor is bound. Cleanup removes only a temp name created by the current operation and never scans or deletes an unknown entry.
+
+Every cleanup/unlink first proves that the still-open owned FD is the current
+canonical leaf by device/inode/type/owner/link count. If a callback or another
+process replaced the name, the replacement is preserved. The retention unlink
+path performs its final ENOENT proof only after all retention callbacks, and a
+final receipt is issued only after the last callback is followed by a silent
+authoritative re-read and canonical proof. Fault injection is never itself the
+last proof.
 
 Emit the shared throwing fault event at every writer/lock checkpoint owned by
 this file, with the exact role and managed target name. Unit tests install a
