@@ -266,7 +266,8 @@ function loadAssetTracker({
     localStorageSeed = {},
     nativeHandler = null,
     lockManager = null,
-    confirmResult = true
+    confirmResult = true,
+    receiverSensitiveTimers = false
 } = {}) {
     const scriptPath = path.join(__dirname, '..', '..', 'script.js');
     const safetyPath = path.join(__dirname, '..', '..', 'legacy-safety.js');
@@ -481,6 +482,38 @@ function loadAssetTracker({
     context.URL = window.URL;
 
     vm.createContext(context);
+    if (receiverSensitiveTimers) {
+        context.__trackedSetTimeout = trackedSetTimeout;
+        context.__trackedClearTimeout = trackedClearTimeout;
+        context.__trackedSetInterval = trackedSetInterval;
+        context.__trackedClearInterval = trackedClearInterval;
+        vm.runInContext(`
+            globalThis.setTimeout = window.setTimeout = function (...args) {
+                if (this !== globalThis && this !== window) {
+                    throw new TypeError('Can only call Window.setTimeout on instances of Window');
+                }
+                return globalThis.__trackedSetTimeout(...args);
+            };
+            globalThis.clearTimeout = window.clearTimeout = function (...args) {
+                if (this !== globalThis && this !== window) {
+                    throw new TypeError('Can only call Window.clearTimeout on instances of Window');
+                }
+                return globalThis.__trackedClearTimeout(...args);
+            };
+            globalThis.setInterval = window.setInterval = function (...args) {
+                if (this !== globalThis && this !== window) {
+                    throw new TypeError('Can only call Window.setInterval on instances of Window');
+                }
+                return globalThis.__trackedSetInterval(...args);
+            };
+            globalThis.clearInterval = window.clearInterval = function (...args) {
+                if (this !== globalThis && this !== window) {
+                    throw new TypeError('Can only call Window.clearInterval on instances of Window');
+                }
+                return globalThis.__trackedClearInterval(...args);
+            };
+        `, context);
+    }
     vm.runInContext(`${safetyContent}\n${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
 
     return {

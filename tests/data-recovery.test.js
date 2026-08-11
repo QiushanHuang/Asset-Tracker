@@ -3555,6 +3555,88 @@ test('performAutoBackup always returns a consumable Promise and native forwards 
     });
 });
 
+test('native activation backup reaches storage.save with WebKit receiver-sensitive timers', async (t) => {
+    const raw = JSON.stringify(validLegacy({
+        settings: {
+            baseCurrency: 'CNY',
+            exchangeRates: { CNY: 1 },
+            autoBackup: true,
+            backupInterval: 24
+        }
+    }));
+    const rawHash = sourceHash(raw);
+    const requests = [];
+    let app;
+    const nativeHost = {
+        messageHandlers: {
+            assetTrackerHost: {
+                postMessage(request) {
+                    requests.push(request);
+                    queueMicrotask(() => {
+                        let result;
+                        if (request.type === 'storage.load') {
+                            result = {
+                                protocolVersion: 2,
+                                loadId: 'webkit-timer-load',
+                                status: 'readableBytes',
+                                reason: null,
+                                stateJson: raw,
+                                stateHash: rawHash,
+                                rawHash,
+                                hashAlgorithm: 'sha256',
+                                storagePath: '/native/AssetTrackerBook.json',
+                                canExportRaw: true,
+                                canRevealFolder: true,
+                                ...completeNativeLoadHealth()
+                            };
+                        } else if (request.type === 'storage.confirmLoad') {
+                            result = { ok: true, writeSessionToken: 'webkit-timer-token' };
+                        } else if (request.type === 'storage.save') {
+                            result = {
+                                ok: true,
+                                clientSaveId: request.payload.clientSaveId,
+                                payloadHash: request.payload.payloadHash,
+                                sourceHashBefore: request.payload.expectedHash,
+                                stateHashAfter: request.payload.payloadHash,
+                                stateHash: request.payload.payloadHash,
+                                byteCount: Buffer.byteLength(request.payload.stateJson),
+                                durability: 'native-durable',
+                                updatedAt: '2026-08-11T17:00:00.000Z',
+                                storagePath: '/native/AssetTrackerBook.json',
+                                recoveryHealth: recoveryHealth('ordinary')
+                            };
+                        } else {
+                            result = {
+                                ok: true,
+                                protocolVersion: 2,
+                                loadId: 'webkit-timer-load',
+                                reason: request.payload.reason,
+                                gateState: 'terminal-locked'
+                            };
+                        }
+                        app.context.window.AssetTrackerHost.__handleResponse({
+                            id: request.id,
+                            ok: true,
+                            result
+                        });
+                    });
+                }
+            }
+        }
+    };
+    app = loadAssetTracker({ nativeHost, receiverSensitiveTimers: true });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+
+    await tracker.initialize();
+
+    assert.equal(requests.filter(request => request.type === 'storage.save').length, 1);
+    assert.equal(tracker.appState, 'writable');
+    assert.equal(tracker.persistenceFault, null);
+    assert.equal(app.elements.get('normal-app-shell').inert, false);
+});
+
 test('D3-C status substrate leaves legacy Web assetTrackerBackup routing as a Task4 non-release debt', async (t) => {
     const app = loadAssetTracker();
     t.after(app.dispose);

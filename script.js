@@ -18,6 +18,8 @@ const adapterNumberIsSafeInteger = Number.isSafeInteger;
 const adapterStringCharCodeAt = String.prototype.charCodeAt;
 const adapterDate = Date;
 const adapterDateToISOString = Date.prototype.toISOString;
+const adapterWindowSetTimeout = window.setTimeout;
+const adapterWindowClearTimeout = window.clearTimeout;
 const adapterTypedArrayByteLengthGetter = adapterObjectGetOwnPropertyDescriptor(
     adapterObjectGetPrototypeOf(Uint8Array.prototype),
     'byteLength'
@@ -1668,7 +1670,14 @@ class AssetTracker {
             barrierDeadlineMs: 29_000,
             transportDeadlineMs: 30_000,
             generationToken: generation,
-            clock: { setTimeout, clearTimeout },
+            clock: {
+                setTimeout(callback, delay) {
+                    return adapterReflectApply(adapterWindowSetTimeout, window, [callback, delay]);
+                },
+                clearTimeout(handle) {
+                    return adapterReflectApply(adapterWindowClearTimeout, window, [handle]);
+                }
+            },
             onTransition: queueState => {
                 if (!isCurrentGeneration()) return undefined;
                 if (queueState.transitionKind === 'preparation-rejected') {

@@ -5,7 +5,7 @@
 
 Asset Tracker is a local-first personal asset ledger and visualization application with multi-currency balances, hierarchical categories, transaction history, recurring bookkeeping, import/export, and analytics.
 
-The current formal release is **v3.1.0**. It adds durable native macOS saves, crash recovery, versioned snapshots, dual-domain recovery health, and strict bridge receipts. See the [changelog](./CHANGELOG.md) and [v3.1.0 release notes](./docs/releases/v3.1.0.md).
+The current formal release is **v3.1.1**. This hotfix prevents the macOS app from falsely entering unknown-save protection during startup auto-backup, while retaining v3.1.0's durable saves, crash recovery, snapshots, dual-domain health, and strict bridge receipts. See the [changelog](./CHANGELOG.md) and [v3.1.1 release notes](./docs/releases/v3.1.1.md).
 
 ## Main capabilities
 
@@ -83,4 +83,4 @@ MIT License. See [LICENSE](./LICENSE).
 
 **Last updated**: 2026-08-11
 
-**Version**: v3.1.0
+**Version**: v3.1.1

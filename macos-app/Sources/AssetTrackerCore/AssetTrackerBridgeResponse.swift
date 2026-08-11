@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 public indirect enum AssetTrackerBridgeJSONValue: Equatable, Sendable {
@@ -152,7 +153,10 @@ public enum AssetTrackerNativeBridgeRequestParser {
     }
 
     private static func integer(_ payload: [String: Any], key: String) throws -> Int {
-        guard let value = payload[key], !(value is Bool), let integer = value as? Int else {
+        guard let value = payload[key], let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let integer = Int(exactly: number.doubleValue)
+        else {
             throw invalid("无效的 \(key)")
         }
         return integer

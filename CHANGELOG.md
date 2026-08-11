@@ -2,6 +2,25 @@
 
 All notable product changes are recorded here.
 
+## [3.1.1] - 2026-08-11
+
+### Fixed
+
+- Fixed the macOS app entering `save-outcome-unknown` protection immediately after opening a ledger with automatic backup enabled.
+- Preserved the required `Window` receiver when the save queue schedules and clears WebKit durability deadlines.
+- Fixed the strict native bridge treating WKScriptMessage numeric `schemaVersion: 1` as a Boolean and rejecting a valid save request.
+- Restored the normal writable shell and button interaction after the startup durability save succeeds.
+
+### Tested
+
+- Added a receiver-sensitive WebKit timer regression harness and a full native activation-backup test.
+- Added Swift coverage for WKScriptMessage `NSNumber` integers, real CFBoolean rejection, and fractional-number rejection.
+- Performed an actual packaged-app startup against the existing local ledger and confirmed `账本已安全打开` / `已安全写入本机` plus working navigation.
+
+### Distribution note
+
+The macOS artifact remains unsigned and not notarized. Apple signing and notarization are intentionally outside this release.
+
 ## [3.1.0] - 2026-08-11
 
 ### Added

@@ -1007,6 +1007,33 @@ final class AssetTrackerBookStoreTests: XCTestCase {
         XCTAssertThrowsError(try AssetTrackerNativeBridgeRequestParser.snapshot(payload: extraSnapshot))
     }
 
+    func testNativeBridgeRequestParserAcceptsWKScriptMessageNumbersButRejectsBooleans() throws {
+        let stateJSON = #"{"memo":"webkit number bridge"}"#
+        let payloadHash = sha256(Data(stateJSON.utf8))
+        let sourceHash = String(repeating: "a", count: 64)
+        var payload: [String: Any] = [
+            "protocolVersion": NSNumber(value: 2),
+            "loadId": "webkit-load",
+            "writeSessionToken": "webkit-token",
+            "clientSaveId": "webkit-save",
+            "stateJson": stateJSON,
+            "payloadHash": payloadHash,
+            "reason": "auto-backup",
+            "expectedHash": sourceHash,
+            "validatedSourceHash": sourceHash,
+            "schemaVersion": NSNumber(value: 1),
+        ]
+
+        let parsed = try AssetTrackerNativeBridgeRequestParser.durableSave(payload: payload)
+        XCTAssertEqual(parsed.authorization.protocolVersion, 2)
+        XCTAssertEqual(parsed.schemaVersion, 1)
+
+        payload["schemaVersion"] = NSNumber(value: true)
+        XCTAssertThrowsError(try AssetTrackerNativeBridgeRequestParser.durableSave(payload: payload))
+        payload["schemaVersion"] = NSNumber(value: 1.5)
+        XCTAssertThrowsError(try AssetTrackerNativeBridgeRequestParser.durableSave(payload: payload))
+    }
+
     func testLoadBridgeResponseCarriesCompleteDualHealthWithoutDefaults() {
         let ordinary = NativeRecoveryHealth(
             domain: .ordinary,
