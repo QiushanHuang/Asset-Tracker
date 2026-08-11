@@ -235,6 +235,98 @@ function isAdapterPlainRecord(value) {
     }
 }
 
+const PERSISTENCE_STATUS_NEUTRAL = adapterObjectFreeze({
+    stable: false,
+    copy: '',
+    tone: 'neutral'
+});
+const PERSISTENCE_STATUS_BROWSER = adapterObjectFreeze({
+    stable: true,
+    copy: '已存入此浏览器',
+    tone: 'success'
+});
+const PERSISTENCE_STATUS_NATIVE = adapterObjectFreeze({
+    stable: true,
+    copy: '已安全写入本机',
+    tone: 'success'
+});
+const PERSISTENCE_STATUS_MAINTENANCE = adapterObjectFreeze({
+    stable: true,
+    copy: '已耐久保存；恢复维护需处理',
+    tone: 'warning'
+});
+
+function isPersistenceRecoveryHealth(value, expectedDomain, allowNotApplicable) {
+    if (!isAdapterRecord(value)
+        || value.domain !== expectedDomain
+        || (value.status !== 'healthy'
+            && value.status !== 'degraded'
+            && !(allowNotApplicable && value.status === 'not-applicable'))
+        || typeof value.auditComplete !== 'boolean'
+        || !adapterNumberIsSafeInteger(value.maintenancePendingCount)
+        || value.maintenancePendingCount < 0
+        || (value.detail !== null && typeof value.detail !== 'string')) {
+        return false;
+    }
+    if (value.status === 'degraded') {
+        return typeof value.code === 'string' && value.code.length > 0;
+    }
+    return value.auditComplete === true
+        && value.code === null
+        && value.maintenancePendingCount === 0;
+}
+
+function isStablePersistenceBarrierState(value) {
+    return value === 'none'
+        || value === 'created'
+        || value === 'deduplicated'
+        || value === 'degraded'
+        || value === 'not-created';
+}
+
+function projectPersistenceStatus(queueState) {
+    if (!isAdapterRecord(queueState)
+        || queueState.lanePhase !== 'idle'
+        || queueState.pendingCount !== 0
+        || queueState.activeClientSaveId !== null
+        || queueState.activeClientSnapshotId !== null
+        || queueState.accepting !== true
+        || queueState.halted !== false
+        || !isStablePersistenceBarrierState(queueState.barrierState)) {
+        return PERSISTENCE_STATUS_NEUTRAL;
+    }
+    if (queueState.primaryStatus === 'browser-local-committed') {
+        return PERSISTENCE_STATUS_BROWSER;
+    }
+    if (queueState.primaryStatus !== 'native-durable'
+        || !isPersistenceRecoveryHealth(
+            queueState.ordinaryRecoveryHealth,
+            'ordinary',
+            false
+        )
+        || !isPersistenceRecoveryHealth(
+            queueState.snapshotRecoveryHealth,
+            'snapshot',
+            true
+        )) {
+        return PERSISTENCE_STATUS_NEUTRAL;
+    }
+    return queueState.ordinaryRecoveryHealth.status === 'degraded'
+        || queueState.snapshotRecoveryHealth.status === 'degraded'
+        ? PERSISTENCE_STATUS_MAINTENANCE
+        : PERSISTENCE_STATUS_NATIVE;
+}
+
+function renderPersistenceStatus(queueState) {
+    const projection = projectPersistenceStatus(queueState);
+    const node = document.getElementById('data-safety-status');
+    if (node) {
+        node.textContent = projection.copy;
+        node.dataset.persistenceTone = projection.tone;
+    }
+    return projection;
+}
+
 function isAdapterHash(value) {
     if (typeof value !== 'string' || value.length !== 64) return false;
     for (let index = 0; index < value.length; index += 1) {

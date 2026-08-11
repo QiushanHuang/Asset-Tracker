@@ -2555,6 +2555,152 @@ test('the Web protocol-v2 gate rejects fabricated, stale, repeated, and unknown 
     assert.equal(app.readLocalStorage('assetTrackerData'), raw);
 });
 
+test('persistence projection maps stable browser and native states to fixed copy', (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const project = app.context.projectPersistenceStatus;
+    const stableState = {
+        lanePhase: 'idle',
+        pendingCount: 0,
+        activeClientSaveId: null,
+        activeClientSnapshotId: null,
+        accepting: true,
+        halted: false,
+        barrierState: 'none',
+        primaryStatus: 'none',
+        ordinaryRecoveryHealth: recoveryHealth('ordinary'),
+        snapshotRecoveryHealth: recoveryHealth('snapshot')
+    };
+
+    const browser = project({ ...stableState, primaryStatus: 'browser-local-committed' });
+    assert.equal(browser.stable, true);
+    assert.equal(browser.copy, '已存入此浏览器');
+    assert.equal(browser.tone, 'success');
+    assert.equal(Object.isFrozen(browser), true);
+    assert.doesNotMatch(browser.copy, /安全|磁盘|本机文件|备份/);
+
+    for (const snapshotStatus of ['healthy', 'not-applicable']) {
+        const native = project({
+            ...stableState,
+            primaryStatus: 'native-durable',
+            snapshotRecoveryHealth: recoveryHealth('snapshot', snapshotStatus)
+        });
+        assert.equal(native.stable, true, snapshotStatus);
+        assert.equal(native.copy, '已安全写入本机', snapshotStatus);
+        assert.equal(native.tone, 'success', snapshotStatus);
+        assert.equal(Object.isFrozen(native), true, snapshotStatus);
+    }
+
+    for (const [label, ordinaryRecoveryHealth, snapshotRecoveryHealth] of [
+        ['ordinary', recoveryHealth('ordinary', 'degraded'), recoveryHealth('snapshot')],
+        ['snapshot', recoveryHealth('ordinary'), recoveryHealth('snapshot', 'degraded')]
+    ]) {
+        const native = project({
+            ...stableState,
+            primaryStatus: 'native-durable',
+            ordinaryRecoveryHealth,
+            snapshotRecoveryHealth
+        });
+        assert.equal(native.stable, true, label);
+        assert.equal(native.copy, '已耐久保存；恢复维护需处理', label);
+        assert.equal(native.tone, 'warning', label);
+        assert.equal(Object.isFrozen(native), true, label);
+    }
+});
+
+test('persistence projection is neutral until lane and health evidence are complete', (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const project = app.context.projectPersistenceStatus;
+    const stableNative = {
+        lanePhase: 'idle',
+        pendingCount: 0,
+        activeClientSaveId: null,
+        activeClientSnapshotId: null,
+        accepting: true,
+        halted: false,
+        barrierState: 'created',
+        primaryStatus: 'native-durable',
+        ordinaryRecoveryHealth: recoveryHealth('ordinary'),
+        snapshotRecoveryHealth: recoveryHealth('snapshot')
+    };
+    const neutralFixtures = [
+        ['lane', { lanePhase: 'saving' }],
+        ['pending', { pendingCount: 1 }],
+        ['active save', { activeClientSaveId: 'save-1' }],
+        ['active snapshot', { activeClientSnapshotId: 'snapshot-1' }],
+        ['accepting', { accepting: false }],
+        ['halted', { halted: true }],
+        ['barrier', { barrierState: 'running' }],
+        ['barrier unknown', { barrierState: 'outcome-unknown' }],
+        ['barrier conflict', { barrierState: 'conflict' }],
+        ['barrier invalid', { barrierState: 'unexpected' }],
+        ['primary none', { primaryStatus: 'none' }],
+        ['primary failed', { primaryStatus: 'failed-readonly' }],
+        ['primary unknown', { primaryStatus: 'durability-unknown' }],
+        ['ordinary missing', { ordinaryRecoveryHealth: null }],
+        ['snapshot missing', { snapshotRecoveryHealth: null }],
+        ['ordinary domain', { ordinaryRecoveryHealth: recoveryHealth('snapshot') }],
+        ['snapshot domain', { snapshotRecoveryHealth: recoveryHealth('ordinary') }],
+        ['ordinary status', { ordinaryRecoveryHealth: recoveryHealth('ordinary', 'not-applicable') }],
+        ['healthy tuple', {
+            ordinaryRecoveryHealth: recoveryHealth('ordinary', 'healthy', {
+                maintenancePendingCount: 1
+            })
+        }],
+        ['degraded tuple', {
+            snapshotRecoveryHealth: recoveryHealth('snapshot', 'degraded', { code: null })
+        }]
+    ];
+
+    for (const [label, override] of neutralFixtures) {
+        const projection = project({ ...stableNative, ...override });
+        assert.equal(projection.stable, false, label);
+        assert.equal(projection.copy, '', label);
+        assert.equal(projection.tone, 'neutral', label);
+        assert.equal(Object.isFrozen(projection), true, label);
+    }
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(project(null))),
+        { stable: false, copy: '', tone: 'neutral' }
+    );
+});
+
+test('persistence renderer writes only the dedicated status sink and clears stale success', (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const render = app.context.renderPersistenceStatus;
+    const status = app.context.document.getElementById('data-safety-status');
+    const appStatus = app.context.document.getElementById('app-status');
+    const recoveryTitle = app.context.document.getElementById('recovery-title');
+    appStatus.textContent = 'app sentinel';
+    recoveryTitle.textContent = 'recovery sentinel';
+    const stableBrowser = {
+        lanePhase: 'idle',
+        pendingCount: 0,
+        activeClientSaveId: null,
+        activeClientSnapshotId: null,
+        accepting: true,
+        halted: false,
+        barrierState: 'none',
+        primaryStatus: 'browser-local-committed',
+        ordinaryRecoveryHealth: null,
+        snapshotRecoveryHealth: null
+    };
+
+    const success = render(stableBrowser);
+    assert.equal(success.copy, '已存入此浏览器');
+    assert.equal(status.textContent, success.copy);
+    assert.equal(status.dataset.persistenceTone, 'success');
+
+    const neutral = render({ ...stableBrowser, pendingCount: 1 });
+    assert.equal(neutral.stable, false);
+    assert.equal(status.textContent, '');
+    assert.equal(status.dataset.persistenceTone, 'neutral');
+    assert.equal(appStatus.textContent, 'app sentinel');
+    assert.equal(recoveryTitle.textContent, 'recovery sentinel');
+});
+
 test('the static shell starts hidden, inert, and labelled recovery/status hooks exist', () => {
     const indexHtml = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
     const styles = fs.readFileSync(path.join(__dirname, '..', 'styles.css'), 'utf8');
@@ -3409,7 +3555,7 @@ test('performAutoBackup always returns a consumable Promise and native forwards 
     });
 });
 
-test('legacy Web assetTrackerBackup routing remains a Task4 non-release debt', async (t) => {
+test('D3-C status substrate leaves legacy Web assetTrackerBackup routing as a Task4 non-release debt', async (t) => {
     const app = loadAssetTracker();
     t.after(app.dispose);
     const tracker = new app.AssetTracker();
