@@ -5,6 +5,9 @@ const ASSET_BOOK_PROTOCOL_VERSION = 2;
 const LegacySafety = globalThis.AssetTrackerLegacySafety;
 const adapterReflectGet = Reflect.get;
 const adapterReflectApply = Reflect.apply;
+const adapterPromiseThen = Promise.prototype.then;
+const adapterJSONParse = JSON.parse;
+const adapterJSONStringify = JSON.stringify;
 const adapterObjectCreate = Object.create;
 const adapterObjectDefineProperty = Object.defineProperty;
 const adapterObjectFreeze = Object.freeze;
@@ -1353,6 +1356,9 @@ class AssetTracker {
         this.writeSessionToken = null;
         this.validatedSourceHash = null;
         this.openAttemptEpoch = 0;
+        this.saveQueue = null;
+        this.persistenceGeneration = 0;
+        this.persistenceFault = null;
         this.retryInFlight = null;
         this.appState = 'booting';
         this.recoveryMode = {
@@ -1408,6 +1414,7 @@ class AssetTracker {
             rendering: '账本已验证，正在准备界面…',
             confirming: '正在确认本次安全打开…',
             writable: '账本已安全打开',
+            persistenceProtected: '账本已进入保存保护模式',
             readOnlyRecovery: '只读保护已开启',
             terminalRecovery: '本次启动已进入终止性只读保护'
         };
@@ -1504,6 +1511,8 @@ class AssetTracker {
     }
 
     async openBook({ retry }) {
+        const persistenceGeneration = ++this.persistenceGeneration;
+        this.saveQueue = null;
         if (retry && this.recoveryMode.terminal) {
             throw new Error('TERMINAL_RECOVERY');
         }
@@ -1611,10 +1620,12 @@ class AssetTracker {
         try {
             this.validatedSourceHash = loadResult.status === 'valid' ? loadResult.rawHash : null;
             this.storageMeta.stateHash = this.validatedSourceHash || '';
+            this.createSaveQueue(loadResult, persistenceGeneration);
             this.recoveryMode = { active: false, reason: null, phase: null, terminal: false };
             document.getElementById('recovery-surface').hidden = true;
             this.setAppState('writable');
             this.renderDataSafetyState();
+            renderPersistenceStatus(this.saveQueue.getState());
             this.revealNormalShell();
             document.getElementById('section-title')?.focus();
             await this.setupAutoBackup();
@@ -1624,6 +1635,124 @@ class AssetTracker {
             await this.terminalizeAndEnterRecovery('internalError', loadResult, {
                 writeSessionToken: acknowledgedToken
             });
+        }
+    }
+
+    createSaveQueue(loadResult, generation) {
+        const stateJson = adapterReflectApply(adapterJSONStringify, JSON, [this.data]);
+        const expectedDurability = this.storageAdapter.supportsNative
+            ? 'native-durable'
+            : 'browser-local-committed';
+        const initialRecoveryHealth = {
+            ordinary: loadResult.ordinaryRecoveryHealth,
+            snapshot: loadResult.snapshotRecoveryHealth
+        };
+        let queue = null;
+        const isCurrentGeneration = () => this.persistenceGeneration === generation;
+        queue = new LegacySafety.AssetTrackerSaveQueue({
+            write: request => this.storageAdapter.save(request),
+            snapshot: request => this.storageAdapter.snapshot(request),
+            terminalize: request => this.storageAdapter.terminalize(request),
+            sessionContext: {
+                protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
+                loadId: loadResult.loadId,
+                writeSessionToken: this.writeSessionToken
+            },
+            initialAcknowledged: {
+                stateJson,
+                stateHash: this.validatedSourceHash
+            },
+            initialRecoveryHealth,
+            expectedDurability,
+            durabilityDeadlineMs: 29_000,
+            barrierDeadlineMs: 29_000,
+            transportDeadlineMs: 30_000,
+            generationToken: generation,
+            clock: { setTimeout, clearTimeout },
+            onTransition: queueState => {
+                if (!isCurrentGeneration()) return undefined;
+                if (queueState.transitionKind === 'preparation-rejected') {
+                    this.data = adapterReflectApply(adapterJSONParse, JSON, [queueState.visibleStateJson]);
+                    this.refreshDataViews();
+                }
+                renderPersistenceStatus(queueState);
+                return undefined;
+            },
+            onAcknowledged: receipt => {
+                if (!isCurrentGeneration()) return undefined;
+                if (typeof receipt.stateHashAfter !== 'string') return undefined;
+                this.validatedSourceHash = receipt.stateHashAfter;
+                this.storageMeta.stateHash = receipt.stateHashAfter;
+                this.storageMeta.updatedAt = receipt.updatedAt;
+                this.storageMeta.storagePath = receipt.storagePath;
+                this.lastError = null;
+                this.refreshStorageDisplay();
+                return undefined;
+            },
+            onFault: fault => {
+                if (!isCurrentGeneration()) return undefined;
+                try {
+                    const terminalReason = fault.terminalReason;
+                    const stateJson = terminalReason === 'save-not-committed'
+                        || terminalReason === 'candidate-invalid'
+                        || terminalReason === 'queue-callback-failed'
+                        || terminalReason === 'snapshot-outcome-unknown'
+                        ? fault.lastAcknowledgedStateJson
+                        : terminalReason === 'save-outcome-unknown'
+                            ? fault.attemptedStateJson
+                            : null;
+                    if (typeof stateJson === 'string') {
+                        this.data = adapterReflectApply(adapterJSONParse, JSON, [stateJson]);
+                        this.refreshDataViews();
+                    }
+                } finally {
+                    this.enterPersistenceProtection(fault);
+                }
+                return undefined;
+            }
+        });
+        this.saveQueue = queue;
+        return queue;
+    }
+
+    enterPersistenceProtection(fault) {
+        try {
+            clearInterval(this.autoBackupTimer);
+        } catch (_error) {
+            // The queue owns native terminalization; local protection must still complete.
+        }
+        this.autoBackupTimer = null;
+        this.writeSessionToken = null;
+        this.persistenceFault = fault;
+        this.lastError = fault;
+        this.recoveryMode = { active: false, reason: null, phase: null, terminal: true };
+        const shell = document.getElementById('normal-app-shell');
+        if (shell) {
+            shell.hidden = false;
+            shell.inert = true;
+            shell.removeAttribute('hidden');
+            shell.setAttribute('inert', '');
+            shell.removeAttribute('aria-hidden');
+        }
+        this.setAppState('persistenceProtected');
+        const copy = {
+            'save-outcome-unknown': '保存结果未知，请重新启动以核对账本；系统不会自动重试',
+            'snapshot-outcome-unknown': '账本已保存，但恢复点结果未知；请重新启动以核对账本；系统不会自动重试',
+            'save-conflict': '检测到账本冲突；当前画面不代表磁盘账本。请重新启动以核对账本。',
+            'snapshot-conflict': '检测到恢复点冲突；当前画面不代表磁盘账本。请重新启动以核对账本。',
+            'save-not-committed': '本次未确认的更改已恢复至最近确认状态；账本进入保护。',
+            'candidate-invalid': '本次未确认的更改已恢复至最近确认状态；账本进入保护。',
+            'queue-callback-failed': '本次未确认的更改已恢复至最近确认状态；账本进入保护。'
+        }[fault?.terminalReason] || '保存保护已开启；请重新启动以核对账本。';
+        const node = document.getElementById('data-safety-status');
+        if (node) {
+            node.textContent = copy;
+            node.dataset.persistenceTone = 'error';
+        }
+        try {
+            this.storageAdapter.lockTerminal?.();
+        } catch (_error) {
+            // A local adapter lock is diagnostic only after the queue has halted.
         }
     }
 
@@ -1660,6 +1789,7 @@ class AssetTracker {
         metadata = {},
         { writeSessionToken = this.writeSessionToken } = {}
     ) {
+        if (this.appState === 'persistenceProtected') return null;
         const loadId = metadata?.loadId || this.lastLoadResult?.loadId || null;
         const capturedToken = typeof writeSessionToken === 'string' && writeSessionToken
             ? writeSessionToken
@@ -2241,44 +2371,52 @@ class AssetTracker {
     }
 
     // 数据持久化
-    async saveData({ reason = 'manual' } = {}) {
+    saveData(options = {}) {
         this.assertWritable();
         try {
-            this.data = this.normalizeLoadedData(this.data);
-            const stateJson = JSON.stringify(this.data);
-            const result = await this.storageAdapter.save(stateJson, {
-                protocolVersion: ASSET_BOOK_PROTOCOL_VERSION,
-                loadId: this.lastLoadResult?.loadId || null,
-                writeSessionToken: this.writeSessionToken,
-                expectedHash: this.validatedSourceHash,
-                validatedSourceHash: this.validatedSourceHash,
-                reason
-            });
-
-            if (result && result.ok) {
-                this.storageMeta.stateHash = result.stateHash || safeComputeHash(stateJson);
-                this.validatedSourceHash = this.storageMeta.stateHash;
-                this.storageMeta.updatedAt = result.updatedAt || new Date().toISOString();
-                this.storageMeta.storagePath = result.storagePath || this.storageMeta.storagePath;
-                this.lastError = null;
-                this.refreshStorageDisplay();
-                return result;
+            const { reason = 'manual' } = options;
+            const normalized = this.normalizeLoadedData(this.data);
+            const stateJson = adapterReflectApply(adapterJSONStringify, JSON, [normalized]);
+            const validation = LegacySafety.validateBookText(stateJson);
+            if (validation.status !== 'valid') {
+                throw new Error('SAVE_CANDIDATE_INVALID');
             }
-
-            const saveError = result && result.error ? result.error : '未知错误';
-            throw new Error(saveError);
+            this.data = normalized;
+            return this.observePersistencePromise(
+                this.saveQueue.enqueue({ stateJson, reason }),
+                this.persistenceGeneration
+            );
         } catch (error) {
-            const errorMessage = error instanceof Error && error.message
-                ? error.message
-                : '请检查数据文件写入权限。';
-            this.showMessage(`保存失败：${errorMessage}`, 'error');
-            this.lastError = error;
-            throw error;
+            return this.observePersistencePromise(
+                this.saveQueue.failPreparation(error),
+                this.persistenceGeneration
+            );
         }
     }
 
     persistData(options = {}) {
         return this.saveData(options);
+    }
+
+    observePersistencePromise(promise, generation) {
+        try {
+            const observed = adapterReflectApply(adapterPromiseThen, promise, [undefined, error => {
+                try {
+                    if (this.persistenceGeneration === generation) this.lastError = error;
+                } catch (_error) {
+                    // The diagnostic observer must never alter the caller's promise.
+                }
+                return undefined;
+            }]);
+            try {
+                adapterReflectApply(adapterPromiseThen, observed, [undefined, () => undefined]);
+            } catch (_error) {
+                // The derived diagnostic branch is best effort only.
+            }
+        } catch (_error) {
+            // A diagnostic attachment failure must not replace the caller's promise.
+        }
+        return promise;
     }
 
     assertWritable() {
@@ -2370,6 +2508,9 @@ class AssetTracker {
                 storagePath: this.storageMeta.storagePath,
                 canExportRaw: false,
                 canRevealFolder: Boolean(rawResult.canRevealFolder),
+                ordinaryRecoveryHealth: rawResult.ordinaryRecoveryHealth,
+                snapshotRecoveryHealth: rawResult.snapshotRecoveryHealth,
+                recoveryHealthComplete: rawResult.recoveryHealthComplete,
                 requiresConfirmation: true
             };
         }
@@ -2461,6 +2602,9 @@ class AssetTracker {
             storagePath: this.storageMeta.storagePath,
             canExportRaw: Boolean(rawResult.canExportRaw),
             canRevealFolder: Boolean(rawResult.canRevealFolder),
+            ordinaryRecoveryHealth: rawResult.ordinaryRecoveryHealth,
+            snapshotRecoveryHealth: rawResult.snapshotRecoveryHealth,
+            recoveryHealthComplete: rawResult.recoveryHealthComplete,
             requiresConfirmation: true
         };
     }

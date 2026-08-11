@@ -524,25 +524,22 @@ test('normalizeLoadedData fills settings, memo, templates, and backup fields', (
     assert.equal(elements.get('backup-interval').value, 24);
 });
 
-test('saveData rejects when storage adapter reports a business failure', async (t) => {
+test('saveData routes a post-confirmation adapter rejection through the queue', async (t) => {
     const app = loadAssetTracker();
     t.after(app.dispose);
     const { AssetTracker } = app;
     const tracker = new AssetTracker();
 
-    tracker.appState = 'writable';
-    tracker.writeSessionToken = 'test-token';
-    tracker.validatedSourceHash = null;
-    tracker.lastLoadResult = { loadId: 'test-load' };
-
-    tracker.storageAdapter = {
-        supportsNative: true,
-        save: async () => ({ ok: false, error: 'disk failed' })
-    };
+    tracker.initializeApp = () => {};
+    tracker.refreshStorageDisplay = () => {};
+    tracker.setupAutoBackup = () => {};
+    await tracker.initialize();
+    tracker.refreshDataViews = () => {};
+    tracker.storageAdapter.save = async () => { throw new Error('disk failed'); };
 
     await assert.rejects(
-        async () => tracker.saveData(),
-        /disk failed/
+        () => tracker.saveData(),
+        error => error?.terminalReason === 'save-outcome-unknown'
     );
 });
 

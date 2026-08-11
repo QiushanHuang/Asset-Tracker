@@ -3712,9 +3712,16 @@ test('native interval backup rejection terminalizes the bound session even when 
                                             ok: true,
                                             result: {
                                                 ok: true,
+                                                clientSaveId: request.payload.clientSaveId,
+                                                payloadHash: request.payload.payloadHash,
+                                                sourceHashBefore: request.payload.expectedHash,
+                                                stateHashAfter: String('c').repeat(64),
                                                 stateHash: String('c').repeat(64),
+                                                byteCount: Buffer.byteLength(request.payload.stateJson),
+                                                durability: 'native-durable',
                                                 updatedAt: '2026-08-10T00:00:00.000Z',
-                                                storagePath: '/native/AssetTrackerBook.json'
+                                                storagePath: '/native/AssetTrackerBook.json',
+                                                recoveryHealth: recoveryHealth('ordinary')
                                             }
                                         }
                                         : {
@@ -3726,7 +3733,17 @@ test('native interval backup rejection terminalizes the bound session even when 
                                 }
                                 if (request.type === 'storage.terminalize') {
                                     app.context.window.AssetTrackerHost.__handleResponse(terminalOutcome === 'ack'
-                                        ? { id: request.id, ok: true, result: { ok: true, reason: 'internalError.postRender' } }
+                                        ? {
+                                            id: request.id,
+                                            ok: true,
+                                            result: {
+                                                ok: true,
+                                                protocolVersion: 2,
+                                                loadId: `interval-load-${terminalOutcome}`,
+                                                reason: request.payload.reason,
+                                                gateState: 'terminal-locked'
+                                            }
+                                        }
                                         : { id: request.id, ok: false, error: 'unknown terminalization result' });
                                 }
                             });
@@ -3760,8 +3777,7 @@ test('native interval backup rejection terminalizes the bound session even when 
                 await intervalRun;
             }
 
-            assert.equal(tracker.recoveryMode.reason, 'internalError');
-            assert.equal(tracker.recoveryMode.phase, 'postRender');
+            assert.equal(tracker.appState, 'persistenceProtected');
             assert.equal(tracker.recoveryMode.terminal, true);
             assert.equal(tracker.storageAdapter.webGateState, 'terminalLocked');
             assert.equal(tracker.writeSessionToken, null);
@@ -3771,9 +3787,9 @@ test('native interval backup rejection terminalizes the bound session even when 
                 protocolVersion: 2,
                 loadId: `interval-load-${terminalOutcome}`,
                 writeSessionToken: `interval-token-${terminalOutcome}`,
-                reason: 'internalError.postRender'
+                reason: 'save-outcome-unknown'
             });
-            await assert.rejects(() => tracker.retryBookLoad(), /TERMINAL_RECOVERY/);
+            await assert.rejects(() => tracker.retryBookLoad(), /RECOVERY_NOT_ACTIVE/);
             await assert.rejects(() => tracker.storageAdapter.save('{}', {
                 protocolVersion: 2,
                 loadId: `interval-load-${terminalOutcome}`,
@@ -3856,8 +3872,8 @@ test('read-only recovery blocks all write paths and automatic backup work', asyn
     await tracker.initialize();
 
     assert.throws(() => tracker.assertWritable(), /READ_ONLY_RECOVERY/);
-    await assert.rejects(() => tracker.saveData(), /READ_ONLY_RECOVERY/);
-    await assert.rejects(() => tracker.persistData(), /READ_ONLY_RECOVERY/);
+    assert.throws(() => tracker.saveData(), /READ_ONLY_RECOVERY/);
+    assert.throws(() => tracker.persistData(), /READ_ONLY_RECOVERY/);
     tracker.setupAutoBackup();
     tracker.performAutoBackup();
     await assert.rejects(() => tracker.saveBackupSettings(), /READ_ONLY_RECOVERY/);
@@ -4105,7 +4121,7 @@ test('terminal render/internal recovery rejects retry without a new load', async
     assert.equal(tracker.recoveryMode.reason, 'renderError');
 });
 
-test('protocol-v2 load confirmation token and hashes accompany native saves', async (t) => {
+test('protocol-v2 load confirmation token and strict queue fields accompany native saves', async (t) => {
     const raw = JSON.stringify(validLegacy({ memo: 'before' }));
     const rawHash = sourceHash(raw);
     const app = loadAssetTracker();
@@ -4135,9 +4151,21 @@ test('protocol-v2 load confirmation token and hashes accompany native saves', as
             calls.push({ type: 'confirm', request });
             return { ok: true, writeSessionToken: 'opaque-token' };
         },
-        async save(stateJson, options) {
-            calls.push({ type: 'save', stateJson, options });
-            return { ok: true, stateHash: 'c'.repeat(64) };
+        async save(request) {
+            calls.push({ type: 'save', request });
+            return {
+                ok: true,
+                clientSaveId: request.clientSaveId,
+                payloadHash: request.payloadHash,
+                sourceHashBefore: request.expectedHash,
+                stateHashAfter: 'c'.repeat(64),
+                stateHash: 'c'.repeat(64),
+                byteCount: Buffer.byteLength(request.stateJson),
+                durability: 'native-durable',
+                updatedAt: '2026-08-10T00:00:00.000Z',
+                storagePath: '/tmp/book.json',
+                recoveryHealth: recoveryHealth('ordinary')
+            };
         }
     };
 
@@ -4155,12 +4183,385 @@ test('protocol-v2 load confirmation token and hashes accompany native saves', as
             validatedSourceHash: rawHash
         }
     });
-    assert.deepEqual(JSON.parse(JSON.stringify(calls[1].options)), {
-        protocolVersion: 2,
-        loadId: 'load-v2',
-        writeSessionToken: 'opaque-token',
+    assert.deepEqual(JSON.parse(JSON.stringify(calls[1].request)), {
+        clientSaveId: 'load-v2:save:1',
+        stateJson: JSON.stringify(tracker.data),
+        payloadHash: sourceHash(JSON.stringify(tracker.data)),
+        reason: 'test',
         expectedHash: rawHash,
-        validatedSourceHash: rawHash,
-        reason: 'test'
+        sessionContext: {
+            protocolVersion: 2,
+            loadId: 'load-v2',
+            writeSessionToken: 'opaque-token'
+        }
     });
+});
+
+test('successful confirmed web opening owns a queue with verified load evidence', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'queue-start' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+
+    await tracker.initialize();
+
+    assert.ok(tracker.saveQueue, 'queue is created only after confirmation and critical render');
+    assert.equal(tracker.persistenceGeneration, 1);
+    assert.equal(tracker.saveQueue.queueConfiguration.expectedDurability, 'browser-local-committed');
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(tracker.saveQueue.queueConfiguration.initialAcknowledged)),
+        { stateJson: JSON.stringify(tracker.data), stateHash: sourceHash(raw) }
+    );
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(tracker.saveQueue.queueConfiguration.initialRecoveryHealth)),
+        {
+            ordinary: recoveryHealth('ordinary', 'not-applicable'),
+            snapshot: recoveryHealth('snapshot', 'not-applicable')
+        }
+    );
+    assert.deepEqual(
+        JSON.parse(JSON.stringify(tracker.saveQueue.queueConfiguration.sessionContext)),
+        {
+            protocolVersion: 2,
+            loadId: tracker.lastLoadResult.loadId,
+            writeSessionToken: tracker.writeSessionToken
+        }
+    );
+});
+
+test('candidate preparation failure performs no adapter I/O and restores the accepted queue snapshot', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'accepted-snapshot' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+    await tracker.initialize();
+    const writesBefore = app.localStorageWrites.length;
+    let refreshes = 0;
+    tracker.refreshDataViews = () => { refreshes += 1; };
+    const activeSave = deferred();
+    const originalSave = tracker.storageAdapter.save.bind(tracker.storageAdapter);
+    const requests = [];
+    tracker.storageAdapter.save = request => {
+        requests.push(request);
+        return requests.length === 1 ? activeSave.promise : originalSave(request);
+    };
+    tracker.data.memo = 'accepted-H1';
+    const h1 = tracker.saveData({ reason: 'H1' });
+    tracker.data.memo = 'accepted-H2';
+    const h2 = tracker.saveData({ reason: 'H2' });
+    tracker.normalizeLoadedData = () => { throw new Error('candidate cannot be normalized'); };
+
+    const rejected = tracker.saveData({ reason: 'invalid-candidate' });
+
+    assert.equal(app.localStorageWrites.length, writesBefore, 'preparation never reaches adapter I/O');
+    assert.equal(tracker.data.memo, 'accepted-H2', 'preparation restores the accepted tail before its promise settles');
+    assert.equal(refreshes, 1, 'preparation transition restores synchronously');
+
+    activeSave.resolve(originalSave(requests[0]));
+    await h1;
+    await h2;
+    const error = await rejected.then(
+        () => assert.fail('invalid candidate must reject'),
+        reason => reason
+    );
+
+    assert.equal(error.terminalReason, 'candidate-invalid');
+    assert.equal(tracker.data.memo, 'accepted-H2');
+    assert.equal(refreshes, 2, 'preparation transition and terminal fault both restore the snapshot');
+    assert.equal(tracker.appState, 'persistenceProtected');
+});
+
+test('snapshot acknowledgement never overwrites canonical save metadata', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'snapshot-ack' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+    await tracker.initialize();
+    const before = { ...tracker.storageMeta, validatedSourceHash: tracker.validatedSourceHash };
+
+    tracker.saveQueue.queueConfiguration.onAcknowledged({
+        clientSnapshotId: 'snapshot-1',
+        sourceHash: before.stateHash,
+        snapshotHash: before.stateHash,
+        snapshotStatus: 'created'
+    });
+
+    assert.deepEqual(
+        { ...tracker.storageMeta, validatedSourceHash: tracker.validatedSourceHash },
+        before
+    );
+});
+
+test('bare persistence returns the queue promise and observes rejection without leaking across generations', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'observer' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+    await tracker.initialize();
+    const pending = deferred();
+    tracker.saveQueue.enqueue = () => pending.promise;
+
+    const returned = tracker.persistData({ reason: 'bare-observer' });
+    assert.strictEqual(returned, pending.promise, 'callers receive the original queue promise');
+
+    const previousGeneration = tracker.persistenceGeneration;
+    tracker.persistenceGeneration += 1;
+    tracker.lastError = 'new-generation-error';
+    pending.reject(new Error('old-generation-rejection'));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(tracker.lastError, 'new-generation-error', 'old queue observation cannot change the new generation');
+    await assert.rejects(returned, /old-generation-rejection/);
+    assert.equal(previousGeneration + 1, tracker.persistenceGeneration);
+});
+
+test('writable preflight runs before a hostile save reason is read', async (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    let reads = 0;
+    const options = Object.create(null, {
+        reason: {
+            enumerable: true,
+            get() {
+                reads += 1;
+                throw new Error('reason getter must not run');
+            }
+        }
+    });
+
+    assert.throws(() => tracker.saveData(options), /READ_ONLY_RECOVERY/);
+    assert.equal(reads, 0);
+});
+
+test('queue keeps FIFO saving status until Web acknowledgements and then updates exact metadata', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'fifo-start' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+    await tracker.initialize();
+    const first = deferred();
+    const originalSave = tracker.storageAdapter.save.bind(tracker.storageAdapter);
+    const requests = [];
+    tracker.storageAdapter.save = request => {
+        requests.push(request);
+        return requests.length === 1 ? first.promise : originalSave(request);
+    };
+
+    tracker.data.memo = 'fifo-H1';
+    const h1 = tracker.saveData({ reason: 'fifo-H1' });
+    tracker.data.memo = 'fifo-H2';
+    const h2 = tracker.saveData({ reason: 'fifo-H2' });
+    assert.equal(tracker.saveQueue.getState().lanePhase, 'saving');
+    assert.equal(tracker.saveQueue.getState().primaryStatus, 'none');
+    assert.equal(app.elements.get('data-safety-status').textContent.includes('已保存'), false);
+
+    first.resolve(originalSave(requests[0]));
+    await h1;
+    await h2;
+
+    const finalJson = JSON.stringify(tracker.data);
+    const finalHash = sourceHash(finalJson);
+    assert.equal(requests.length, 2);
+    assert.equal(tracker.saveQueue.getState().lanePhase, 'idle');
+    assert.equal(tracker.saveQueue.getState().primaryStatus, 'browser-local-committed');
+    assert.equal(tracker.storageMeta.stateHash, finalHash);
+    assert.equal(tracker.validatedSourceHash, finalHash);
+    assert.match(app.elements.get('data-safety-status').textContent, /已存入此浏览器/);
+});
+
+test('fault restoration resists a poisoned live Set implementation', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'poison-fault' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+    await tracker.initialize();
+    vm.runInContext('Set.prototype.has = () => false;', app.context);
+    const acknowledged = JSON.stringify(validLegacy({ memo: 'poison-restored' }));
+
+    tracker.saveQueue.queueConfiguration.onFault({
+        terminalReason: 'save-not-committed',
+        lastAcknowledgedStateJson: acknowledged,
+        attemptedStateJson: null
+    });
+
+    assert.equal(tracker.data.memo, 'poison-restored');
+    assert.equal(tracker.appState, 'persistenceProtected');
+});
+
+test('old queue callbacks are inert after a new persistence generation begins', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'old-generation' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+    await tracker.initialize();
+    const callbacks = tracker.saveQueue.queueConfiguration;
+    const before = {
+        data: JSON.stringify(tracker.data),
+        meta: JSON.stringify(tracker.storageMeta),
+        status: app.elements.get('data-safety-status').textContent,
+        appState: tracker.appState
+    };
+    tracker.persistenceGeneration += 1;
+
+    callbacks.onTransition({ transitionKind: 'preparation-rejected', visibleStateJson: '{bad' });
+    callbacks.onAcknowledged({ stateHashAfter: 'f'.repeat(64), updatedAt: 'changed', storagePath: '/changed' });
+    callbacks.onFault({ terminalReason: 'save-outcome-unknown', attemptedStateJson: '{bad' });
+
+    assert.equal(JSON.stringify(tracker.data), before.data);
+    assert.equal(JSON.stringify(tracker.storageMeta), before.meta);
+    assert.equal(app.elements.get('data-safety-status').textContent, before.status);
+    assert.equal(tracker.appState, before.appState);
+});
+
+test('unconfirmed and rejected confirmations never create a queue or start auto backup', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'confirm-gate' }));
+    const pendingApp = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(pendingApp.dispose);
+    const pendingTracker = new pendingApp.AssetTracker();
+    installCriticalRenderStubs(pendingTracker);
+    const pendingConfirmation = deferred();
+    const originalConfirm = pendingTracker.storageAdapter.confirmLoad.bind(pendingTracker.storageAdapter);
+    let pendingBackups = 0;
+    pendingTracker.setupAutoBackup = () => { pendingBackups += 1; };
+    pendingTracker.storageAdapter.confirmLoad = async request => {
+        await pendingConfirmation.promise;
+        return originalConfirm(request);
+    };
+    const opening = pendingTracker.initialize();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(pendingTracker.saveQueue, null);
+    assert.equal(pendingBackups, 0);
+    pendingConfirmation.resolve();
+    await opening;
+
+    const rejectedApp = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(rejectedApp.dispose);
+    const rejectedTracker = new rejectedApp.AssetTracker();
+    installCriticalRenderStubs(rejectedTracker);
+    let rejectedBackups = 0;
+    rejectedTracker.setupAutoBackup = () => { rejectedBackups += 1; };
+    rejectedTracker.storageAdapter.confirmLoad = async () => ({ ok: false, error: 'rejected confirmation' });
+    await rejectedTracker.initialize();
+    assert.equal(rejectedTracker.saveQueue, null);
+    assert.equal(rejectedBackups, 0);
+});
+
+test('confirmed missing source seeds a null-hash queue from normalized default state', async (t) => {
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+
+    await tracker.initialize();
+
+    assert.equal(tracker.lastLoadResult.status, 'missing');
+    assert.equal(tracker.saveQueue.queueConfiguration.initialAcknowledged.stateHash, null);
+    assert.equal(
+        tracker.saveQueue.queueConfiguration.initialAcknowledged.stateJson,
+        JSON.stringify(tracker.data)
+    );
+});
+
+test('native load health evidence reaches a native-durable queue without defaulting', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'native-health-to-queue' }));
+    const rawHash = sourceHash(raw);
+    const ordinary = recoveryHealth('ordinary', 'healthy');
+    const snapshot = recoveryHealth('snapshot', 'degraded');
+    const app = loadAssetTracker();
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+    tracker.storageAdapter = {
+        supportsNative: true,
+        async load() {
+            return {
+                protocolVersion: 2,
+                loadId: 'native-health-queue',
+                status: 'readableBytes',
+                stateJson: raw,
+                stateHash: rawHash,
+                rawHash,
+                hashAlgorithm: 'sha256',
+                storagePath: '/native/AssetTrackerBook.json',
+                canExportRaw: true,
+                canRevealFolder: true,
+                recoveryHealthComplete: true,
+                ordinaryRecoveryHealth: ordinary,
+                snapshotRecoveryHealth: snapshot
+            };
+        },
+        async confirmLoad() {
+            return { ok: true, writeSessionToken: 'native-health-token' };
+        }
+    };
+
+    await tracker.initialize();
+
+    assert.equal(tracker.lastLoadResult.recoveryHealthComplete, true);
+    assert.equal(tracker.saveQueue.queueConfiguration.expectedDurability, 'native-durable');
+    assert.deepEqual(JSON.parse(JSON.stringify(tracker.saveQueue.queueConfiguration.initialRecoveryHealth)), {
+        ordinary,
+        snapshot
+    });
+});
+
+test('queue faults map the authoritative snapshot and always enter persistence protection', async (t) => {
+    const raw = JSON.stringify(validLegacy({ memo: 'acknowledged' }));
+    const app = loadAssetTracker({ localStorageSeed: { assetTrackerData: raw } });
+    t.after(app.dispose);
+    const tracker = new app.AssetTracker();
+    installCriticalRenderStubs(tracker);
+    tracker.setupAutoBackup = () => {};
+    await tracker.initialize();
+    const acknowledged = JSON.stringify(validLegacy({ memo: 'acknowledged-state' }));
+    const attempted = JSON.stringify(validLegacy({ memo: 'attempted-state' }));
+    const onFault = tracker.saveQueue.queueConfiguration.onFault;
+
+    for (const [reason, expectedMemo] of [
+        ['save-not-committed', 'acknowledged-state'],
+        ['candidate-invalid', 'acknowledged-state'],
+        ['queue-callback-failed', 'acknowledged-state'],
+        ['snapshot-outcome-unknown', 'acknowledged-state'],
+        ['save-outcome-unknown', 'attempted-state']
+    ]) {
+        tracker.data = validLegacy({ memo: 'live-before-fault' });
+        tracker.refreshDataViews = () => {};
+        onFault({ terminalReason: reason, lastAcknowledgedStateJson: acknowledged, attemptedStateJson: attempted });
+        assert.equal(tracker.data.memo, expectedMemo, reason);
+        assert.equal(tracker.appState, 'persistenceProtected');
+    }
+
+    for (const reason of ['save-conflict', 'snapshot-conflict']) {
+        tracker.data = validLegacy({ memo: 'retain-memory' });
+        tracker.refreshDataViews = () => { throw new Error('must not refresh conflict memory'); };
+        onFault({ terminalReason: reason, lastAcknowledgedStateJson: acknowledged, attemptedStateJson: attempted });
+        assert.equal(tracker.data.memo, 'retain-memory');
+        assert.match(app.elements.get('data-safety-status').textContent, /当前画面不代表磁盘账本/);
+    }
+
+    tracker.data = validLegacy({ memo: 'refresh-throws' });
+    tracker.refreshDataViews = () => { throw new Error('refresh failed'); };
+    assert.throws(
+        () => onFault({ terminalReason: 'save-not-committed', lastAcknowledgedStateJson: acknowledged, attemptedStateJson: attempted }),
+        /refresh failed/
+    );
+    assert.equal(tracker.appState, 'persistenceProtected', 'finally closes the writable state even after refresh failure');
+    assert.equal(app.elements.get('normal-app-shell').hidden, false);
+    assert.equal(app.elements.get('normal-app-shell').inert, true);
 });
