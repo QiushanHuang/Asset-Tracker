@@ -21,6 +21,14 @@ function mustExist(relativePath) {
     return fs.readFileSync(fullPath, 'utf8');
 }
 
+function sourceBetween(source, startToken, endToken) {
+    const start = source.indexOf(startToken);
+    const end = source.indexOf(endToken, start + startToken.length);
+    assert.notEqual(start, -1, `${startToken} should exist`);
+    assert.notEqual(end, -1, `${endToken} should follow ${startToken}`);
+    return source.slice(start, end);
+}
+
 function readBytes(relativePath) {
     return fs.readFileSync(path.join(root, relativePath));
 }
@@ -143,7 +151,6 @@ test('the macOS bridge owns the Core protocol-v2 gate and receives an explicit f
     assert.match(bridgeSource, /case "storage\.save":\s*handleStorageSave/);
     assert.match(bridgeSource, /case "file\.saveRawBook":\s*handleRawBookExport/);
     assert.match(bridgeSource, /protocolVersion:\s*protocolVersion/);
-    assert.match(bridgeSource, /writeSessionToken:\s*writeSessionToken/);
     assert.match(bridgeSource, /storageCoordinator\.startLoad/);
     assert.match(bridgeSource, /storageCoordinator\.startSave/);
     assert.match(bridgeSource, /storageCoordinator\.startRawExport/);
@@ -159,6 +166,191 @@ test('the macOS bridge owns the Core protocol-v2 gate and receives an explicit f
     assert.match(appSource, /appendingPathComponent\(\s*"com\.qiushan\.AssetTracker",\s*isDirectory:\s*true\s*\)/);
     assert.match(appSource, /AssetTrackerBookStore\(storageDirectoryURL:\s*storageDirectoryURL\)/);
     assert.match(appSource, /bookStore:\s*bookStore/);
+});
+
+test('macOS bridge routes strict durable save and snapshot requests through the coordinator', () => {
+    const bridgeSource = mustExist('macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift');
+
+    assert.match(bridgeSource, /case "storage\.save":\s*handleStorageSave/);
+    assert.match(bridgeSource, /case "storage\.snapshot":\s*handleStorageSnapshot/);
+    assert.match(bridgeSource, /AssetTrackerNativeBridgeRequestParser\.durableSave/);
+    assert.match(bridgeSource, /AssetTrackerNativeBridgeRequestParser\.snapshot/);
+    assert.match(bridgeSource, /storageCoordinator\.startSave\(request:\s*request\)/);
+    assert.match(bridgeSource, /storageCoordinator\.startSnapshot\(request:\s*request\)/);
+    assert.match(bridgeSource, /AssetTrackerNativeBridgeDTOMapper\.saveReceipt/);
+    assert.match(bridgeSource, /AssetTrackerNativeBridgeDTOMapper\.snapshotReceipt/);
+    assert.match(bridgeSource, /\.saveFailure\(/);
+    assert.match(bridgeSource, /\.snapshotFailure\(/);
+    assert.doesNotMatch(bridgeSource, /storageSaveRequest\(/);
+    assert.doesNotMatch(bridgeSource, /schemaVersion.*\?\?\s*1/);
+    assert.doesNotMatch(bridgeSource, /case\s+\.final/);
+});
+
+test('macOS bridge routes storage.snapshot through the shared coordinator', () => {
+    const host = mustExist('macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift');
+    const coordinator = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerStorageCoordinator.swift');
+    const snapshotHandler = sourceBetween(
+        host,
+        'private func handleStorageSnapshot',
+        'private func handleStorageTerminalize'
+    );
+
+    assert.match(host, /case "storage\.snapshot":\s*handleStorageSnapshot/);
+    assert.equal((host.match(/AssetTrackerStorageCoordinator\(/g) || []).length, 1);
+    assert.match(snapshotHandler, /AssetTrackerNativeBridgeRequestParser\.snapshot/);
+    assert.match(snapshotHandler, /storageCoordinator\.startSnapshot\(request:\s*request\)/);
+    assert.doesNotMatch(snapshotHandler, /bookStore\.snapshot|AssetTrackerStorageCoordinator\(/);
+    assert.match(coordinator, /public func startSnapshot\(/);
+    assert.match(coordinator, /let result = try store\.snapshot\(request\)/);
+    assert.doesNotMatch(host, /case\s+\.final\b/);
+});
+
+test('macOS bridge maps save snapshot health and terminal DTOs without defaults', () => {
+    const bridge = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerBridgeResponse.swift');
+    const host = mustExist('macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift');
+
+    assert.match(bridge, /public static func saveReceipt\(/);
+    assert.match(bridge, /public static func snapshotReceipt\(/);
+    assert.match(bridge, /public static func saveFailure\(/);
+    assert.match(bridge, /public static func snapshotFailure\(/);
+    assert.match(bridge, /public static func loadSuccess\(/);
+    assert.match(bridge, /public static func terminalizationSuccess\(/);
+    for (const field of [
+        'domain',
+        'status',
+        'auditComplete',
+        'code',
+        'maintenancePendingCount',
+        'detail'
+    ]) {
+        assert.match(bridge, new RegExp(`"${field}"`));
+    }
+    assert.match(host, /AssetTrackerNativeBridgeDTOMapper\.saveReceipt/);
+    assert.match(host, /AssetTrackerNativeBridgeDTOMapper\.snapshotReceipt/);
+    assert.match(host, /\.loadSuccess\(requestID:\s*requestID,\s*loaded:\s*loaded\)/s);
+    assert.match(
+        host,
+        /\.terminalizationSuccess\(\s*requestID:\s*requestID,\s*request:\s*request,\s*acknowledgement:/s
+    );
+    assert.doesNotMatch(host, /schemaVersion.*\?\?\s*1/);
+    assert.doesNotMatch(host, /NativeSnapshotReason[^\n]*\?\?/);
+});
+
+test('macOS bridge preserves updatedAt and canonical storagePath as metadata only', () => {
+    const bridge = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerBridgeResponse.swift');
+    const coreTests = mustExist('macos-app/Tests/AssetTrackerCoreTests/AssetTrackerBookStoreTests.swift');
+    const jsTests = mustExist('tests/data-recovery.test.js');
+    const saveMapper = sourceBetween(
+        bridge,
+        'public static func saveReceipt',
+        'public static func snapshotReceipt'
+    );
+
+    assert.match(saveMapper, /"updatedAt":\s*\.string\(verifiedTimestamp\(receipt\.updatedAt\)\)/);
+    assert.match(saveMapper, /"storagePath":\s*\.string\(receipt\.storagePath\)/);
+    assert.match(saveMapper, /"sourceHashBefore":\s*receipt\.sourceHashBefore/);
+    assert.match(saveMapper, /"stateHashAfter":\s*\.string\(receipt\.stateHashAfter\)/);
+    assert.doesNotMatch(saveMapper, /Date\(\)|storagePath[^\n]*\?\?|updatedAt[^\n]*\?\?/);
+    assert.match(coreTests, /testNativeBridgeDTOMapperPreservesReceiptsAndStructuredErrorProofsWithoutDefaults/);
+    assert.match(jsTests, /native strict save maps only queue-owned fields and returns a protected exact receipt without fallback/);
+    assert.match(jsTests, /updatedAt:\s*'native-wire-time'/);
+    assert.match(jsTests, /storagePath:\s*'\/native\/wire\/path'/);
+});
+
+test('snapshot classification uses operation-specific index commit points rather than primary rename', () => {
+    const writer = mustExist('macos-app/Sources/AssetTrackerCore/NativeDurableFileWriter.swift');
+    const recovery = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerRecoveryStore.swift');
+    const host = mustExist('macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift');
+    const snapshotImplementation = sourceBetween(
+        recovery,
+        'public func createSnapshot',
+        'public func auditSnapshot'
+    );
+
+    assert.match(writer, /case afterSnapshotIndexDurable/);
+    assert.match(writer, /case snapshotEmptyIndex, snapshotFinalIndex, snapshotHealthIndex/);
+    assert.match(snapshotImplementation, /\.afterSnapshotBlobDurable/);
+    assert.match(snapshotImplementation, /\.afterSnapshotIndexDurable/);
+    assert.match(snapshotImplementation, /role:\s*\.snapshotFinalIndex/);
+    assert.match(snapshotImplementation, /targetName:\s*Self\.snapshotIndexPath/);
+    assert.doesNotMatch(snapshotImplementation, /primaryRenamed|afterPrimaryRename/);
+    assert.doesNotMatch(host, /primaryRenamed|afterPrimaryRename/);
+});
+
+test('cross-layer item 55 binds terminal ACK delivery to the already-locked gate', () => {
+    const jsTests = mustExist('tests/data-recovery.test.js');
+    const coreTests = mustExist('macos-app/Tests/AssetTrackerCoreTests/AssetTrackerBookStoreTests.swift');
+    const bookStore = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerBookStore.swift');
+    const coordinator = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerStorageCoordinator.swift');
+    const bridge = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerBridgeResponse.swift');
+    const host = mustExist('macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift');
+    const terminalFinish = sourceBetween(
+        coordinator,
+        'private func finishPendingTerminalizationIfPossible',
+        'private func isActive'
+    );
+
+    assert.match(jsTests, /queue strict terminalize maps session fields and returns only the protected exact receipt/);
+    assert.match(jsTests, /strict terminal receipt binds load and stable reason taxonomy without requiring current reason equality/);
+    assert.match(coreTests, /testTerminalizeDuringSaveWritingWaitsForSuccessfulWriteThenACKsFirstReason/);
+    for (const reason of [
+        'save-not-committed',
+        'save-outcome-unknown',
+        'save-conflict',
+        'snapshot-outcome-unknown',
+        'snapshot-conflict',
+        'candidate-invalid',
+        'queue-callback-failed'
+    ]) {
+        assert.match(bookStore, new RegExp(`"${reason}"`));
+    }
+    assert.ok(
+        terminalFinish.indexOf('writeGate.terminalize(pending.request)')
+            < terminalFinish.indexOf('completion(.success(acknowledgement))')
+    );
+    for (const field of ['protocolVersion', 'loadId', 'reason', 'gateState']) {
+        assert.match(bridge, new RegExp(`"${field}"`));
+    }
+    assert.match(bridge, /"gateState":\s*\.string\("terminal-locked"\)/);
+    assert.match(host, /\.terminalizationSuccess\(/);
+});
+
+test('cross-layer item 56 binds dual audited native load health to strict JS confirmation', () => {
+    const jsTests = mustExist('tests/data-recovery.test.js');
+    const coreTests = mustExist('macos-app/Tests/AssetTrackerCoreTests/AssetTrackerBookStoreTests.swift');
+    const bridge = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerBridgeResponse.swift');
+    const host = mustExist('macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift');
+
+    assert.match(jsTests, /native load round-trips complete dual health and exact hash time and path evidence/);
+    assert.match(jsTests, /native load permits false plus both null and rejects missing malformed or contradictory health/);
+    assert.match(coreTests, /testLoadReturnsBothAuditedHealthDomainsOrMarksBothUnavailable/);
+    assert.match(coreTests, /testLoadBridgeResponseCarriesCompleteDualHealthWithoutDefaults/);
+    assert.match(bridge, /"recoveryHealthComplete":\s*\.bool\(book\.recoveryHealthComplete\)/);
+    assert.match(bridge, /"ordinaryRecoveryHealth":\s*book\.ordinaryRecoveryHealth/);
+    assert.match(bridge, /"snapshotRecoveryHealth":\s*book\.snapshotRecoveryHealth/);
+    assert.match(host, /responsePipeline\.send\(\.loadSuccess\(requestID:\s*requestID,\s*loaded:\s*loaded\)\)/);
+});
+
+test('cross-layer item 57 binds Core receipt metadata through Bridge to JS without defaults', () => {
+    const jsTests = mustExist('tests/data-recovery.test.js');
+    const coreTests = mustExist('macos-app/Tests/AssetTrackerCoreTests/AssetTrackerBookStoreTests.swift');
+    const bridge = mustExist('macos-app/Sources/AssetTrackerCore/AssetTrackerBridgeResponse.swift');
+    const host = mustExist('macos-app/Sources/AssetTrackerMac/AssetTrackerHostBridge.swift');
+    const saveMapper = sourceBetween(
+        bridge,
+        'public static func saveReceipt',
+        'public static func snapshotReceipt'
+    );
+
+    assert.match(jsTests, /native strict save maps only queue-owned fields and returns a protected exact receipt without fallback/);
+    assert.match(jsTests, /native adapter rejects success receipts that are not correlated to their strict request/);
+    assert.match(coreTests, /testNativeBridgeDTOMapperPreservesReceiptsAndStructuredErrorProofsWithoutDefaults/);
+    assert.match(coreTests, /"updatedAt":\s*\.string\("2024-08-30T06:40:00\.125Z"\)/);
+    assert.match(coreTests, /"storagePath":\s*\.string\("\/tmp\/AssetTrackerBook\.json"\)/);
+    assert.match(saveMapper, /"updatedAt":\s*\.string\(verifiedTimestamp\(receipt\.updatedAt\)\)/);
+    assert.match(saveMapper, /"storagePath":\s*\.string\(receipt\.storagePath\)/);
+    assert.match(host, /AssetTrackerNativeBridgeDTOMapper\.saveReceipt\(saved\)/);
+    assert.doesNotMatch(saveMapper, /updatedAt[^\n]*\?\?|storagePath[^\n]*\?\?|Date\(\)/);
 });
 
 test('the Web asset manifest is explicit, unique, relative, and complete', () => {

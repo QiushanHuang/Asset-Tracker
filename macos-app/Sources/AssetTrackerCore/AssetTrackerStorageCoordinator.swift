@@ -22,6 +22,7 @@ public enum AssetTrackerStorageActivity: Equatable, Sendable {
     case loading(operationID: String)
     case saveReading(operationID: String)
     case saveWriting(operationID: String)
+    case snapshotting(operationID: String)
     case exporting(operationID: String)
 }
 
@@ -104,7 +105,9 @@ private struct AssetTrackerStorageOperation: Sendable {
 @MainActor
 public final class AssetTrackerStorageCoordinator {
     public typealias LoadCompletion = @MainActor (Result<AssetTrackerStorageLoadResult, Error>) -> Void
-    public typealias SaveCompletion = @MainActor (Result<AssetTrackerBookSaveResult, Error>) -> Void
+    public typealias SaveCompletion = @MainActor (Result<NativeDurableSaveReceipt, Error>) -> Void
+    public typealias LegacySaveCompletion = @MainActor (Result<AssetTrackerBookSaveResult, Error>) -> Void
+    public typealias SnapshotCompletion = @MainActor (Result<NativeSnapshotReceipt, Error>) -> Void
     public typealias ExportCompletion = @MainActor (Result<AssetTrackerRawExportResult, Error>) -> Void
     public typealias TerminalizationCompletion = @MainActor (
         Result<AssetTrackerTerminalizationAcknowledgement, Error>
@@ -113,14 +116,16 @@ public final class AssetTrackerStorageCoordinator {
     public private(set) var activity: AssetTrackerStorageActivity = .idle
     public let writeGate: AssetTrackerLegacyWriteGate
 
-    private let store: AssetTrackerBookStoreIO
+    private let store: any AssetTrackerDurableBookStoreIO
     private let rawIOExecutor: AssetTrackerRawIOExecuting
+    private let faultHandler: NativeDurabilityFaultHandler
     private let operationIDGenerator: () -> String
     private var operationGeneration: UInt64
     private var activeOperationGeneration: UInt64?
 
     private var loadCompletion: LoadCompletion?
     private var saveCompletion: SaveCompletion?
+    private var snapshotCompletion: SnapshotCompletion?
     private var exportCompletion: ExportCompletion?
     private struct PendingTerminalization {
         let request: AssetTrackerTerminalizationRequest
@@ -129,17 +134,19 @@ public final class AssetTrackerStorageCoordinator {
     private var pendingTerminalization: PendingTerminalization?
 
     public init(
-        store: AssetTrackerBookStoreIO,
+        store: any AssetTrackerDurableBookStoreIO,
         rawIOExecutor: AssetTrackerRawIOExecuting = AssetTrackerSerialRawIOExecutor(),
         writeGate: AssetTrackerLegacyWriteGate = AssetTrackerLegacyWriteGate(),
         operationIDGenerator: @escaping () -> String = { UUID().uuidString.lowercased() },
-        initialOperationGeneration: UInt64 = 0
+        initialOperationGeneration: UInt64 = 0,
+        faultHandler: @escaping NativeDurabilityFaultHandler = { _ in }
     ) {
         self.store = store
         self.rawIOExecutor = rawIOExecutor
         self.writeGate = writeGate
         self.operationIDGenerator = operationIDGenerator
         self.operationGeneration = initialOperationGeneration
+        self.faultHandler = faultHandler
     }
 
     @discardableResult
@@ -204,31 +211,94 @@ public final class AssetTrackerStorageCoordinator {
             cancelLoadForPendingTerminalization()
         case .saveReading:
             cancelSaveReadForPendingTerminalization()
-        case .saveWriting, .exporting:
+        case .saveWriting, .snapshotting, .exporting:
             break
         }
     }
 
     @discardableResult
     public func startSave(
-        request: AssetTrackerStorageSaveRequest,
+        request: DurableBookSaveRequest,
         completion: @escaping SaveCompletion
     ) throws -> String {
         try requireAvailableForNewOperation()
+        try NativeDurableDTOValidator.validate(request)
         try writeGate.preflightSave(request.authorization)
-        let operation = try beginOperation()
+        let operation = try beginOperation(operationID: request.clientSaveID)
         saveCompletion = completion
-        activity = .saveReading(operationID: operation.operationID)
+        activity = .saveWriting(operationID: operation.operationID)
 
         let store = self.store
         rawIOExecutor.execute { [weak self] in
-            let currentSource = store.load()
-            Task { @MainActor [weak self] in
-                self?.receiveSaveRead(
-                    currentSource,
-                    request: request,
-                    operation: operation
+            do {
+                let result = try store.saveDurably(request)
+                Task { @MainActor [weak self] in
+                    self?.receiveSaveSuccess(result, operation: operation)
+                }
+            } catch {
+                let error = AssetTrackerUncheckedError(value: error)
+                Task { @MainActor [weak self] in
+                    self?.receiveSaveFailure(error.value, operation: operation)
+                }
+            }
+        }
+        return operation.operationID
+    }
+
+    @discardableResult
+    public func startSave(
+        request: AssetTrackerStorageSaveRequest,
+        completion: @escaping LegacySaveCompletion
+    ) throws -> String {
+        try requireAvailableForNewOperation()
+        try writeGate.preflightSave(request.authorization)
+        let operationID = operationIDGenerator()
+        let expectedSource: ExpectedBookSource = request.authorization.expectedHash
+            .map(ExpectedBookSource.sha256) ?? .missing
+        let durableRequest = DurableBookSaveRequest(
+            clientSaveID: operationID,
+            expectedSource: expectedSource,
+            payloadHash: AssetTrackerBookStore.sha256Hex(Data(request.stateJson.utf8)),
+            stateJSON: request.stateJson,
+            schemaVersion: request.schemaVersion,
+            reason: request.reason,
+            authorization: request.authorization
+        )
+        return try startSave(request: durableRequest) { result in
+            completion(result.map { receipt in
+                AssetTrackerBookSaveResult(
+                    rawHash: receipt.stateHashAfter,
+                    updatedAt: receipt.updatedAt,
+                    storagePath: receipt.storagePath
                 )
+            })
+        }
+    }
+
+    @discardableResult
+    public func startSnapshot(
+        request: NativeSnapshotRequest,
+        completion: @escaping SnapshotCompletion
+    ) throws -> String {
+        try requireAvailableForNewOperation()
+        try NativeDurableDTOValidator.validate(request)
+        try writeGate.preflightSave(request.authorization)
+        let operation = try beginOperation(operationID: request.clientSnapshotID)
+        snapshotCompletion = completion
+        activity = .snapshotting(operationID: operation.operationID)
+
+        let store = self.store
+        rawIOExecutor.execute { [weak self] in
+            do {
+                let result = try store.snapshot(request)
+                Task { @MainActor [weak self] in
+                    self?.receiveSnapshotSuccess(result, operation: operation)
+                }
+            } catch {
+                let error = AssetTrackerUncheckedError(value: error)
+                Task { @MainActor [weak self] in
+                    self?.receiveSnapshotFailure(error.value, operation: operation)
+                }
             }
         }
         return operation.operationID
@@ -279,6 +349,7 @@ public final class AssetTrackerStorageCoordinator {
             activity = .idle
             completion?(.failure(AssetTrackerStorageCoordinatorError.cancelled))
         case .saveWriting(let currentID) where currentID == operationID,
+             .snapshotting(let currentID) where currentID == operationID,
              .exporting(let currentID) where currentID == operationID:
             throw AssetTrackerStorageCoordinatorError.busy
         default:
@@ -300,48 +371,15 @@ public final class AssetTrackerStorageCoordinator {
         completion?(.success(AssetTrackerStorageLoadResult(loadID: loadID, book: result)))
     }
 
-    private func receiveSaveRead(
-        _ currentSource: AssetTrackerRawBookLoadResult,
-        request: AssetTrackerStorageSaveRequest,
-        operation: AssetTrackerStorageOperation
-    ) {
-        guard isActive(operation, activity: .saveReading(operationID: operation.operationID)) else { return }
-
-        do {
-            try writeGate.authorizeSave(request.authorization, currentSource: currentSource)
-        } catch {
-            finishSaveFailure(error, operation: operation)
-            return
-        }
-
-        activity = .saveWriting(operationID: operation.operationID)
-        let store = self.store
-        rawIOExecutor.execute { [weak self] in
-            do {
-                let result = try store.save(
-                    stateJson: request.stateJson,
-                    schemaVersion: request.schemaVersion,
-                    reason: request.reason
-                )
-                Task { @MainActor [weak self] in
-                    self?.receiveSaveSuccess(result, operation: operation)
-                }
-            } catch {
-                let error = AssetTrackerUncheckedError(value: error)
-                Task { @MainActor [weak self] in
-                    self?.receiveSaveFailure(error.value, operation: operation)
-                }
-            }
-        }
-    }
-
     private func receiveSaveSuccess(
-        _ result: AssetTrackerBookSaveResult,
+        _ result: NativeDurableSaveReceipt,
         operation: AssetTrackerStorageOperation
     ) {
         guard isActive(operation, activity: .saveWriting(operationID: operation.operationID)) else { return }
         do {
-            try writeGate.recordSuccessfulSave(newRawHash: result.rawHash)
+            try emit(.afterDurableReceiptReturned, targetName: result.clientSaveID)
+            try writeGate.recordSuccessfulSave(newRawHash: result.stateHashAfter)
+            try emit(.beforeACK, targetName: result.clientSaveID)
         } catch {
             finishSaveFailure(error, operation: operation)
             return
@@ -378,6 +416,51 @@ public final class AssetTrackerStorageCoordinator {
         finishPendingTerminalizationIfPossible()
     }
 
+    private func receiveSnapshotSuccess(
+        _ result: NativeSnapshotReceipt,
+        operation: AssetTrackerStorageOperation
+    ) {
+        guard isActive(
+            operation,
+            activity: .snapshotting(operationID: operation.operationID)
+        ) else { return }
+        do {
+            try emit(.afterDurableReceiptReturned, targetName: result.clientSnapshotID)
+            try emit(.beforeACK, targetName: result.clientSnapshotID)
+        } catch {
+            finishSnapshotFailure(error, operation: operation)
+            return
+        }
+
+        let completion = snapshotCompletion
+        snapshotCompletion = nil
+        activeOperationGeneration = nil
+        activity = .idle
+        completion?(.success(result))
+        finishPendingTerminalizationIfPossible()
+    }
+
+    private func receiveSnapshotFailure(_ error: Error, operation: AssetTrackerStorageOperation) {
+        guard isActive(
+            operation,
+            activity: .snapshotting(operationID: operation.operationID)
+        ) else { return }
+        finishSnapshotFailure(error, operation: operation)
+    }
+
+    private func finishSnapshotFailure(_ error: Error, operation: AssetTrackerStorageOperation) {
+        guard isActive(
+            operation,
+            activity: .snapshotting(operationID: operation.operationID)
+        ) else { return }
+        let completion = snapshotCompletion
+        snapshotCompletion = nil
+        activeOperationGeneration = nil
+        activity = .idle
+        completion?(.failure(error))
+        finishPendingTerminalizationIfPossible()
+    }
+
     private func receiveRawExportSuccess(
         _ result: AssetTrackerRawExportResult,
         operation: AssetTrackerStorageOperation
@@ -402,6 +485,7 @@ public final class AssetTrackerStorageCoordinator {
     }
 
     private func beginOperation(
+        operationID fixedOperationID: String? = nil,
         allowTerminalLock: Bool = false
     ) throws -> AssetTrackerStorageOperation {
         if allowTerminalLock {
@@ -409,7 +493,7 @@ public final class AssetTrackerStorageCoordinator {
         } else {
             try requireAvailableForNewOperation()
         }
-        let operationID = operationIDGenerator()
+        let operationID = fixedOperationID ?? operationIDGenerator()
         guard !operationID.isEmpty else {
             throw AssetTrackerStorageCoordinatorError.invalidOperationID
         }
@@ -493,5 +577,16 @@ public final class AssetTrackerStorageCoordinator {
         activity expectedActivity: AssetTrackerStorageActivity
     ) -> Bool {
         activity == expectedActivity && activeOperationGeneration == operation.generation
+    }
+
+    private func emit(
+        _ point: NativeDurabilityFaultPoint,
+        targetName: String
+    ) throws {
+        try faultHandler(NativeDurabilityFaultEvent(
+            point: point,
+            role: .coordinator,
+            targetName: targetName
+        ))
     }
 }

@@ -54,6 +54,35 @@ private func swapDirectoryForFault(
     }
 }
 
+private struct WriterTestFileIdentity: Equatable {
+    let device: UInt64
+    let inode: UInt64
+}
+
+private func writerTestFileIdentity(of url: URL) throws -> WriterTestFileIdentity {
+    var value = stat()
+    guard Darwin.lstat(url.path, &value) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+    return WriterTestFileIdentity(
+        device: UInt64(value.st_dev),
+        inode: UInt64(value.st_ino)
+    )
+}
+
+private func setWriterTestUserImmutable(_ url: URL) throws {
+    guard Darwin.chflags(url.path, UInt32(UF_IMMUTABLE)) == 0 else {
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+}
+
+private func clearWriterTestFileFlags(_ url: URL) throws {
+    guard Darwin.chflags(url.path, 0) == 0 else {
+        if errno == ENOENT { return }
+        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+}
+
 final class NativeDurableFileWriterTests: XCTestCase {
     private let fileManager = FileManager.default
 
@@ -83,6 +112,103 @@ final class NativeDurableFileWriterTests: XCTestCase {
         try makeDirectory(ordinary)
         try makeDirectory(blobs)
         return blobs
+    }
+
+    private func makeOrdinaryPendingFixture(
+        _ name: String,
+        sourceBytes: Data,
+        indexBytes: Data,
+        blobBytes: Data,
+        blobPresent: Bool = true
+    ) throws -> (
+        base: URL,
+        root: URL,
+        ordinary: URL,
+        blobs: URL,
+        slots: URL,
+        primary: URL,
+        blob: URL,
+        relativePath: String
+    ) {
+        let (base, root) = try makeScratch(name)
+        let blobs = try makeOrdinaryBlobs(in: root)
+        let ordinary = blobs.deletingLastPathComponent()
+        let slots = ordinary.appendingPathComponent("slots.json")
+        let primary = root.appendingPathComponent("AssetTrackerBook.json")
+        let blobName = "\(hash(blobBytes)).json"
+        let blob = blobs.appendingPathComponent(blobName)
+        try writePrivate(indexBytes, to: slots)
+        try writePrivate(sourceBytes, to: primary)
+        if blobPresent {
+            try writePrivate(blobBytes, to: blob)
+        }
+        return (
+            base,
+            root,
+            ordinary,
+            blobs,
+            slots,
+            primary,
+            blob,
+            "Recovery/ordinary/blobs/\(blobName)"
+        )
+    }
+
+    private func makeIndexlessOrdinary(in root: URL) throws -> URL {
+        let recovery = root.appendingPathComponent("Recovery", isDirectory: true)
+        let ordinary = recovery.appendingPathComponent("ordinary", isDirectory: true)
+        try makeDirectory(recovery)
+        try makeDirectory(ordinary)
+        return ordinary
+    }
+
+    private func ordinaryEmptyIndexTempName(_ uuid: String) -> String {
+        ".AssetTracker.tmp.\(uuid)"
+    }
+
+    private func assertReadOnlyWriterCalls(
+        _ calls: [String],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let mutationPrefixes = [
+            "makeDirectoryAt:", "write:", "syncFile:", "fullSyncFile:",
+            "changeMode:", "renameAt:", "syncDirectory:", "clearExtendedACL:",
+            "unlinkAt:",
+        ]
+        XCTAssertFalse(
+            calls.contains { call in mutationPrefixes.contains { call.hasPrefix($0) } },
+            "audit issued a mutating syscall: \(calls)",
+            file: file,
+            line: line
+        )
+    }
+
+    private func assertZeroWriteAuditCalls(
+        _ calls: [String],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        assertReadOnlyWriterCalls(calls, file: file, line: line)
+        for call in calls where call.hasPrefix("openAt:") {
+            guard let rawFlags = Int32(call.split(separator: ":").last ?? "") else {
+                XCTFail("could not parse open flags: \(call)", file: file, line: line)
+                continue
+            }
+            XCTAssertEqual(
+                rawFlags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC),
+                0,
+                "read-only audit used write-capable open flags: \(call)",
+                file: file,
+                line: line
+            )
+        }
+        XCTAssertFalse(
+            calls.contains { $0.contains(".AssetTracker.lock.tmp.") },
+            "read-only audit touched a lock temp: \(calls)",
+            file: file,
+            line: line
+        )
     }
 
     private func makeSnapshots(in root: URL) throws -> URL {
@@ -1633,6 +1759,120 @@ final class NativeDurableFileWriterTests: XCTestCase {
         }
     }
 
+    func testGenericDurableWriteRejectsProofRequiredOrdinaryHealthIndexBeforeAnyMutation() throws {
+        let (_, root) = try makeScratch("proof-required-health-index")
+        let blobs = try makeOrdinaryBlobs(in: root)
+        let ordinary = blobs.deletingLastPathComponent()
+        let slots = ordinary.appendingPathComponent("slots.json")
+        let originalBytes = Data("newer-index-must-survive".utf8)
+        let attemptedBytes = Data("proofless-health-clear-must-not-write".utf8)
+        try writePrivate(originalBytes, to: slots)
+        let entriesBefore = try fileManager.contentsOfDirectory(atPath: ordinary.path).sorted()
+        var statBefore = stat()
+        XCTAssertEqual(Darwin.lstat(slots.path, &statBefore), 0)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(
+            rootURL: root,
+            posix: posix,
+            faultHandler: { _ in }
+        )
+
+        try writer.withExclusiveMutationLock { locked in
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(
+                try locked.durableWrite(
+                    attemptedBytes,
+                    relativePath: "Recovery/ordinary/slots.json",
+                    disposition: .replace,
+                    role: .ordinaryHealthIndex
+                )
+            ) { error in
+                XCTAssertEqual(error as? NativeDurableFileWriterError, .invalidRoleTarget)
+            }
+            XCTAssertEqual(
+                Array(posix.snapshotCalls().dropFirst(before)),
+                [],
+                "proof-required roles must be rejected before temp creation or any POSIX validation"
+            )
+        }
+
+        XCTAssertEqual(try Data(contentsOf: slots), originalBytes)
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: ordinary.path).sorted(), entriesBefore)
+        var statAfter = stat()
+        XCTAssertEqual(Darwin.lstat(slots.path, &statAfter), 0)
+        XCTAssertEqual(UInt64(statBefore.st_dev), UInt64(statAfter.st_dev))
+        XCTAssertEqual(UInt64(statBefore.st_ino), UInt64(statAfter.st_ino))
+    }
+
+    func testSnapshotIndexCreateFinalAndHealthWritesAreSourceBoundProofCAS() throws {
+        let (_, root) = try makeScratch("snapshot-index-proof-cas")
+        let snapshots = try makeSnapshots(in: root)
+        let primaryBytes = Data("snapshot-index-proof-source".utf8)
+        let emptyBytes = Data("snapshot-empty-index".utf8)
+        let finalBytes = Data("snapshot-final-index".utf8)
+        let healthyBytes = Data("snapshot-healthy-index".utf8)
+        try writePrivate(primaryBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(primaryBytes))
+            )
+            let emptyProof = try locked.durableCreateSnapshotIndex(
+                emptyBytes,
+                sourceProof: sourceProof
+            )
+            XCTAssertEqual(emptyProof.bytes, emptyBytes)
+            try locked.revalidate(emptyProof)
+
+            let finalProof = try locked.durableCompareAndSwapManaged(
+                finalBytes,
+                replacing: emptyProof,
+                sourceProof: sourceProof,
+                role: .snapshotFinalIndex
+            )
+            XCTAssertEqual(finalProof.bytes, finalBytes)
+            try locked.revalidate(finalProof)
+
+            let healthyProof = try locked.durableCompareAndSwapManaged(
+                healthyBytes,
+                replacing: finalProof,
+                sourceProof: sourceProof,
+                role: .snapshotHealthIndex
+            )
+            XCTAssertEqual(healthyProof.bytes, healthyBytes)
+            try locked.revalidate(healthyProof)
+
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(try locked.durableCompareAndSwapManaged(
+                Data("stale-must-not-overwrite".utf8),
+                replacing: emptyProof,
+                sourceProof: sourceProof,
+                role: .snapshotFinalIndex
+            ))
+            XCTAssertFalse(
+                posix.snapshotCalls().dropFirst(before).contains { $0.hasPrefix("renameAt:") }
+            )
+
+            let beforeProofless = posix.snapshotCalls().count
+            XCTAssertThrowsError(try locked.durableWrite(
+                Data("proofless-must-not-overwrite".utf8),
+                relativePath: "Recovery/snapshots/index.json",
+                disposition: .replace,
+                role: .snapshotHealthIndex
+            )) { error in
+                XCTAssertEqual(error as? NativeDurableFileWriterError, .invalidRoleTarget)
+            }
+            XCTAssertEqual(posix.snapshotCalls().count, beforeProofless)
+        }
+
+        XCTAssertEqual(
+            try Data(contentsOf: snapshots.appendingPathComponent("index.json")),
+            healthyBytes
+        )
+    }
+
     func testSnapshotPendingUnlinkFaultsBracketUnlinkAndDirectorySyncExactly() throws {
         let (_, root) = try makeScratch()
         let snapshots = try makeSnapshots(in: root)
@@ -1658,6 +1898,75 @@ final class NativeDurableFileWriterTests: XCTestCase {
         let unlinkIndex = try XCTUnwrap(calls.firstIndex { $0.hasPrefix("unlinkAt:") })
         let syncIndex = try XCTUnwrap(calls.lastIndex { $0.hasPrefix("syncDirectory:") })
         XCTAssertLessThan(unlinkIndex, syncIndex)
+    }
+
+    func testSnapshotPendingCleanupUsesLatestIndexAuthorizationAndHandlesAbsentOrRescued() throws {
+        let (_, root) = try makeScratch("snapshot-authorized-cleanup")
+        let snapshots = try makeSnapshots(in: root)
+        let sourceBytes = Data("snapshot-cleanup-source".utf8)
+        let blobBytes = Data("snapshot-cleanup-blob".utf8)
+        let blobHash = hash(blobBytes)
+        let blobPath = "Recovery/snapshots/\(blobHash).json"
+        let indexBytes = Data("authoritative-snapshot-index".utf8)
+        try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+        try writePrivate(indexBytes, to: snapshots.appendingPathComponent("index.json"))
+        try writePrivate(blobBytes, to: snapshots.appendingPathComponent("\(blobHash).json"))
+        let events = FaultEventRecorder()
+        let writer = NativeDurableFileWriter(rootURL: root) { events.record($0) }
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let rescued = try locked.unlinkSnapshotPendingAndSync(
+                relativePath: blobPath,
+                sourceProof: sourceProof,
+                authorizeLatestIndex: { proof in
+                    XCTAssertEqual(proof.bytes, indexBytes)
+                    return .preserveReferenced
+                }
+            )
+            XCTAssertEqual(rescued.disposition, .preservedReferenced)
+            XCTAssertEqual(rescued.latestIndexProof.bytes, indexBytes)
+            XCTAssertTrue(fileManager.fileExists(atPath: snapshots.appendingPathComponent("\(blobHash).json").path))
+
+            let removed = try locked.unlinkSnapshotPendingAndSync(
+                relativePath: blobPath,
+                sourceProof: sourceProof,
+                authorizeLatestIndex: { proof in
+                    XCTAssertEqual(proof.bytes, indexBytes)
+                    return .unlinkPending
+                }
+            )
+            XCTAssertEqual(removed.disposition, .unlinked)
+            XCTAssertEqual(removed.latestIndexProof.bytes, indexBytes)
+
+            let absent = try locked.unlinkSnapshotPendingAndSync(
+                relativePath: blobPath,
+                sourceProof: sourceProof,
+                authorizeLatestIndex: { _ in .unlinkPending }
+            )
+            XCTAssertEqual(absent.disposition, .alreadyAbsent)
+
+            let notPending = try locked.unlinkSnapshotPendingAndSync(
+                relativePath: blobPath,
+                sourceProof: sourceProof,
+                authorizeLatestIndex: { _ in .notPending }
+            )
+            XCTAssertEqual(notPending.disposition, .notPending)
+        }
+
+        XCTAssertFalse(fileManager.fileExists(atPath: snapshots.appendingPathComponent("\(blobHash).json").path))
+        XCTAssertEqual(try Data(contentsOf: snapshots.appendingPathComponent("index.json")), indexBytes)
+        XCTAssertEqual(events.snapshot().filter {
+            $0.point == .beforeRetentionUnlink
+                || $0.point == .afterRetentionUnlink
+                || $0.point == .afterRetentionDirectoryFSync
+        }.map(\.point), [
+            .beforeRetentionUnlink,
+            .afterRetentionUnlink,
+            .afterRetentionDirectoryFSync,
+        ])
     }
 
     func testSnapshotPendingUnlinkNeverDeletesAReplacementCanonicalLeaf() throws {
@@ -1712,22 +2021,3138 @@ final class NativeDurableFileWriterTests: XCTestCase {
     }
 
     func testOrdinaryPendingUnlinkNeverEmitsSnapshotRetentionFaultPoints() throws {
-        let (_, root) = try makeScratch()
-        let blobs = try makeOrdinaryBlobs(in: root)
-        let bytes = Data("ordinary".utf8)
-        let relativePath = "Recovery/ordinary/blobs/\(hash(bytes)).json"
-        try writePrivate(bytes, to: blobs.appendingPathComponent("\(hash(bytes)).json"))
+        let sourceBytes = Data("source".utf8)
+        let indexBytes = Data("latest slots".utf8)
+        let blobBytes = Data("ordinary pending".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: indexBytes,
+            blobBytes: blobBytes
+        )
         let events = FaultEventRecorder()
-        let writer = NativeDurableFileWriter(rootURL: root) { events.record($0) }
+        let writer = NativeDurableFileWriter(rootURL: fixture.root) { events.record($0) }
 
         try writer.withExclusiveMutationLock { locked in
-            try locked.unlinkOrdinaryPendingAndSync(relativePath: relativePath)
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let result = try locked.unlinkOrdinaryPendingAndSync(
+                relativePath: fixture.relativePath,
+                sourceProof: sourceProof,
+                authorizeLatestIndex: { proof in
+                    XCTAssertEqual(proof.bytes, indexBytes)
+                    return .unlinkPending
+                }
+            )
+            XCTAssertEqual(result.disposition, .unlinked)
         }
 
-        XCTAssertFalse(fileManager.fileExists(atPath: blobs.appendingPathComponent("\(hash(bytes)).json").path))
+        XCTAssertFalse(fileManager.fileExists(atPath: fixture.blob.path))
         XCTAssertTrue(events.snapshot().allSatisfy {
-            ![.beforeRetentionUnlink, .afterRetentionUnlink, .afterRetentionDirectoryFSync].contains($0.point)
+            ![
+                .beforeRetentionUnlink,
+                .afterRetentionUnlink,
+                .afterRetentionDirectoryFSync,
+                .beforeRecoveryHealthClear,
+                .afterRecoveryHealthClear,
+            ].contains($0.point)
         })
+    }
+
+    func testOrdinaryPendingCleanupUnlinkFailureIsTypedAndSkipsDirectorySync() throws {
+        let sourceBytes = Data("typed-unlink-source".utf8)
+        let indexBytes = Data("typed-unlink-index".utf8)
+        let blobBytes = Data("typed-unlink-pending".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: indexBytes,
+            blobBytes: blobBytes
+        )
+        defer { try? clearWriterTestFileFlags(fixture.blob) }
+        let blobIdentityBefore = try writerTestFileIdentity(of: fixture.blob)
+        try setWriterTestUserImmutable(fixture.blob)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(
+            rootURL: fixture.root,
+            posix: posix,
+            faultHandler: { _ in }
+        )
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(
+                try locked.unlinkOrdinaryPendingAndSync(
+                    relativePath: fixture.relativePath,
+                    sourceProof: sourceProof,
+                    authorizeLatestIndex: { _ in .unlinkPending }
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? NativeOrdinaryPendingCleanupIOError,
+                    .unlinkFailed
+                )
+            }
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            XCTAssertEqual(
+                calls.filter { $0 == "unlinkAt:\(fixture.blob.lastPathComponent)" }.count,
+                1
+            )
+            XCTAssertFalse(
+                calls.contains { $0.hasPrefix("syncDirectory:") },
+                "an unlink failure must not claim or attempt blobs-directory synchronization"
+            )
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fixture.blob), blobBytes)
+        XCTAssertEqual(try writerTestFileIdentity(of: fixture.blob), blobIdentityBefore)
+        XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+    }
+
+    func testOrdinaryPendingCleanupDirectorySyncFailureIsTypedAfterUnlink() throws {
+        let sourceBytes = Data("typed-directory-sync-source".utf8)
+        let indexBytes = Data("typed-directory-sync-index".utf8)
+        let blobBytes = Data("typed-directory-sync-pending".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: indexBytes,
+            blobBytes: blobBytes
+        )
+        let posix = RecordingNativePOSIX(syncDirectoryFailurePath: "blobs")
+        let writer = NativeDurableFileWriter(
+            rootURL: fixture.root,
+            posix: posix,
+            faultHandler: { _ in }
+        )
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(
+                try locked.unlinkOrdinaryPendingAndSync(
+                    relativePath: fixture.relativePath,
+                    sourceProof: sourceProof,
+                    authorizeLatestIndex: { _ in .unlinkPending }
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? NativeOrdinaryPendingCleanupIOError,
+                    .directorySyncFailed
+                )
+            }
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            XCTAssertEqual(
+                calls.filter { $0 == "unlinkAt:\(fixture.blob.lastPathComponent)" }.count,
+                1
+            )
+            XCTAssertEqual(calls.filter { $0.hasPrefix("syncDirectory:") }.count, 1)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.blob.path))
+        XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.primary), sourceBytes)
+    }
+
+    func testOrdinaryPendingCleanupProofIndexSourceMetadataAndCallbackErrorsAreNotTypedIO() throws {
+        enum Failure: CaseIterable {
+            case proof, index, source, metadata, callback
+        }
+
+        for failure in Failure.allCases {
+            let sourceBytes = Data("non-io-\(failure)-source".utf8)
+            let indexBytes = Data("non-io-\(failure)-index".utf8)
+            let blobBytes = Data("non-io-\(failure)-pending".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-\(failure)",
+                sourceBytes: sourceBytes,
+                indexBytes: indexBytes,
+                blobBytes: blobBytes
+            )
+            let detached = fixture.base.appendingPathComponent("detached-\(failure)")
+            let replacement = Data("non-io-\(failure)-replacement".utf8)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(
+                rootURL: fixture.root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+            var staleProof: NativeSourceProof?
+            if case .proof = failure {
+                try writer.withExclusiveMutationLock { locked in
+                    staleProof = try locked.verifyPrimarySource(
+                        expectedSource: .sha256(hash(sourceBytes))
+                    )
+                }
+            }
+            if case .metadata = failure {
+                XCTAssertEqual(Darwin.chmod(fixture.blob.path, 0o644), 0)
+            }
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof: NativeSourceProof
+                if case .proof = failure {
+                    sourceProof = try XCTUnwrap(staleProof)
+                } else {
+                    sourceProof = try locked.verifyPrimarySource(
+                        expectedSource: .sha256(hash(sourceBytes))
+                    )
+                }
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.unlinkOrdinaryPendingAndSync(
+                        relativePath: fixture.relativePath,
+                        sourceProof: sourceProof,
+                        authorizeLatestIndex: { _ in
+                            switch failure {
+                            case .index:
+                                try FileManager.default.moveItem(
+                                    at: fixture.slots,
+                                    to: detached
+                                )
+                                try writePrivateForFault(replacement, to: fixture.slots)
+                            case .source:
+                                try FileManager.default.moveItem(
+                                    at: fixture.primary,
+                                    to: detached
+                                )
+                                try writePrivateForFault(replacement, to: fixture.primary)
+                            case .callback:
+                                throw InjectedWriterFault.stop
+                            case .proof, .metadata:
+                                break
+                            }
+                            return .unlinkPending
+                        }
+                    ),
+                    "failure=\(failure)"
+                ) { error in
+                    XCTAssertNil(
+                        error as? NativeOrdinaryPendingCleanupIOError,
+                        "proof/authority/metadata/callback failures must remain unknown, failure=\(failure)"
+                    )
+                }
+                let calls = Array(posix.snapshotCalls().dropFirst(before))
+                XCTAssertFalse(
+                    calls.contains { $0.hasPrefix("unlinkAt:") },
+                    "failure=\(failure)"
+                )
+                XCTAssertFalse(
+                    calls.contains { $0.hasPrefix("syncDirectory:") },
+                    "failure=\(failure)"
+                )
+            }
+
+            XCTAssertEqual(try Data(contentsOf: fixture.blob), blobBytes)
+        }
+    }
+
+    func testOrdinaryPendingCleanupCallbackThrowPreservesBlobWithoutUnlinkOrSync() throws {
+        let sourceBytes = Data("source-before-callback-throw".utf8)
+        let indexBytes = Data("slots-before-callback-throw".utf8)
+        let blobBytes = Data("pending-before-callback-throw".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: indexBytes,
+            blobBytes: blobBytes
+        )
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(
+            rootURL: fixture.root,
+            posix: posix,
+            faultHandler: { _ in }
+        )
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let before = posix.snapshotCalls().count
+            var callbackCount = 0
+            XCTAssertThrowsError(
+                try locked.unlinkOrdinaryPendingAndSync(
+                    relativePath: fixture.relativePath,
+                    sourceProof: sourceProof,
+                    authorizeLatestIndex: { proof in
+                        callbackCount += 1
+                        XCTAssertEqual(proof.bytes, indexBytes)
+                        XCTAssertEqual(proof.sha256, hash(indexBytes))
+                        XCTAssertEqual(proof.byteCount, indexBytes.count)
+                        throw InjectedWriterFault.stop
+                    }
+                )
+            )
+            XCTAssertEqual(callbackCount, 1)
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            XCTAssertFalse(calls.contains { $0.hasPrefix("unlinkAt:") })
+            XCTAssertFalse(calls.contains { $0.hasPrefix("syncDirectory:") })
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fixture.blob), blobBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+    }
+
+    func testOrdinaryPendingCleanupPreserveDecisionsAreDistinctAndNeverDelete() throws {
+        for preserveReferenced in [true, false] {
+            let sourceBytes = Data("source-preserve-\(preserveReferenced)".utf8)
+            let indexBytes = Data("slots-preserve-\(preserveReferenced)".utf8)
+            let blobBytes = Data("pending-preserve-\(preserveReferenced)".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-\(preserveReferenced)",
+                sourceBytes: sourceBytes,
+                indexBytes: indexBytes,
+                blobBytes: blobBytes
+            )
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(
+                rootURL: fixture.root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                let before = posix.snapshotCalls().count
+                let result = try locked.unlinkOrdinaryPendingAndSync(
+                    relativePath: fixture.relativePath,
+                    sourceProof: sourceProof,
+                    authorizeLatestIndex: { proof in
+                        XCTAssertEqual(proof.bytes, indexBytes)
+                        return preserveReferenced ? .preserveReferenced : .notPending
+                    }
+                )
+                XCTAssertEqual(
+                    result.disposition,
+                    preserveReferenced ? .preservedReferenced : .notPending
+                )
+                XCTAssertEqual(result.latestIndexProof.bytes, indexBytes)
+                try locked.revalidate(result.latestIndexProof)
+                let calls = Array(posix.snapshotCalls().dropFirst(before))
+                XCTAssertFalse(calls.contains { $0.hasPrefix("unlinkAt:") })
+                XCTAssertFalse(calls.contains { $0.hasPrefix("syncDirectory:") })
+            }
+
+            XCTAssertEqual(try Data(contentsOf: fixture.blob), blobBytes)
+            XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+        }
+    }
+
+    func testOrdinaryPendingCleanupAlreadyAbsentStillAuthorizesLatestIndexAndRejectsLateAppearance() throws {
+        for preserveReferenced in [true, false] {
+            let sourceBytes = Data("source-absent-preserve-\(preserveReferenced)".utf8)
+            let indexBytes = Data("slots-absent-preserve-\(preserveReferenced)".utf8)
+            let blobBytes = Data("pending-absent-preserve-\(preserveReferenced)".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-preserve-\(preserveReferenced)",
+                sourceBytes: sourceBytes,
+                indexBytes: indexBytes,
+                blobBytes: blobBytes,
+                blobPresent: false
+            )
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(
+                rootURL: fixture.root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                let before = posix.snapshotCalls().count
+                var callbackProof: NativeManagedFileProof?
+                let result = try locked.unlinkOrdinaryPendingAndSync(
+                    relativePath: fixture.relativePath,
+                    sourceProof: sourceProof,
+                    authorizeLatestIndex: { proof in
+                        callbackProof = proof
+                        XCTAssertEqual(proof.bytes, indexBytes)
+                        return preserveReferenced ? .preserveReferenced : .notPending
+                    }
+                )
+                XCTAssertEqual(
+                    result.disposition,
+                    preserveReferenced ? .preservedReferenced : .notPending
+                )
+                XCTAssertEqual(result.latestIndexProof, try XCTUnwrap(callbackProof))
+                try locked.revalidate(result.latestIndexProof)
+                let calls = Array(posix.snapshotCalls().dropFirst(before))
+                XCTAssertFalse(calls.contains { $0.hasPrefix("unlinkAt:") })
+                XCTAssertFalse(calls.contains { $0.hasPrefix("syncDirectory:") })
+            }
+            XCTAssertFalse(fileManager.fileExists(atPath: fixture.blob.path))
+            XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+        }
+
+        do {
+            let sourceBytes = Data("source-already-absent".utf8)
+            let indexBytes = Data("slots-already-absent".utf8)
+            let blobBytes = Data("pending-already-absent".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-stable",
+                sourceBytes: sourceBytes,
+                indexBytes: indexBytes,
+                blobBytes: blobBytes,
+                blobPresent: false
+            )
+            let writer = NativeDurableFileWriter(rootURL: fixture.root)
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                var callbackProof: NativeManagedFileProof?
+                let result = try locked.unlinkOrdinaryPendingAndSync(
+                    relativePath: fixture.relativePath,
+                    sourceProof: sourceProof,
+                    authorizeLatestIndex: { proof in
+                        callbackProof = proof
+                        XCTAssertEqual(proof.bytes, indexBytes)
+                        return .unlinkPending
+                    }
+                )
+                XCTAssertEqual(result.disposition, .alreadyAbsent)
+                XCTAssertEqual(result.latestIndexProof, try XCTUnwrap(callbackProof))
+                try locked.revalidate(result.latestIndexProof)
+            }
+            XCTAssertFalse(fileManager.fileExists(atPath: fixture.blob.path))
+        }
+
+        do {
+            let sourceBytes = Data("source-late-appearance".utf8)
+            let indexBytes = Data("slots-late-appearance".utf8)
+            let blobBytes = Data("pending-late-appearance".utf8)
+            let replacement = Data("late replacement must survive".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-late",
+                sourceBytes: sourceBytes,
+                indexBytes: indexBytes,
+                blobBytes: blobBytes,
+                blobPresent: false
+            )
+            let writer = NativeDurableFileWriter(rootURL: fixture.root)
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                var callbackCount = 0
+                XCTAssertThrowsError(
+                    try locked.unlinkOrdinaryPendingAndSync(
+                        relativePath: fixture.relativePath,
+                        sourceProof: sourceProof,
+                        authorizeLatestIndex: { _ in
+                            callbackCount += 1
+                            try writePrivateForFault(replacement, to: fixture.blob)
+                            return .unlinkPending
+                        }
+                    )
+                )
+                XCTAssertEqual(callbackCount, 1)
+            }
+            XCTAssertEqual(try Data(contentsOf: fixture.blob), replacement)
+            XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+        }
+    }
+
+    func testOrdinaryPendingCleanupAlreadyAbsentSyncsBoundBlobsDirectoryBeforeFinalReproof() throws {
+        let sourceBytes = Data("source-already-absent-sync-order".utf8)
+        let indexBytes = Data("slots-already-absent-sync-order".utf8)
+        let blobBytes = Data("pending-already-absent-sync-order".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: indexBytes,
+            blobBytes: blobBytes,
+            blobPresent: false
+        )
+        let events = FaultEventRecorder()
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(
+            rootURL: fixture.root,
+            posix: posix,
+            faultHandler: { events.record($0) }
+        )
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let before = posix.snapshotCalls().count
+            var callbackCount = 0
+            var callbackOffset: Int?
+            let result = try locked.unlinkOrdinaryPendingAndSync(
+                relativePath: fixture.relativePath,
+                sourceProof: sourceProof,
+                authorizeLatestIndex: { proof in
+                    callbackCount += 1
+                    callbackOffset = posix.snapshotCalls().count - before
+                    XCTAssertEqual(proof.bytes, indexBytes)
+                    return .unlinkPending
+                }
+            )
+
+            XCTAssertEqual(callbackCount, 1)
+            XCTAssertEqual(result.disposition, .alreadyAbsent)
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            XCTAssertFalse(calls.contains { $0.hasPrefix("unlinkAt:") })
+            XCTAssertEqual(calls.filter { $0.hasPrefix("syncDirectory:") }.count, 1)
+            guard let syncIndex = calls.firstIndex(where: { $0.hasPrefix("syncDirectory:") }) else {
+                XCTFail("the bound blobs directory must be synchronized before alreadyAbsent returns")
+                return
+            }
+            XCTAssertLessThan(try XCTUnwrap(callbackOffset), syncIndex)
+            let afterSync = calls.dropFirst(syncIndex + 1)
+            XCTAssertTrue(afterSync.contains {
+                $0 == "fstatAt:\(fixture.blob.lastPathComponent):true"
+            }, "final absence proof must follow the blobs-directory sync")
+            XCTAssertTrue(afterSync.contains { $0.hasPrefix("openAt:slots.json:") })
+            XCTAssertTrue(afterSync.contains { $0.hasPrefix("openAt:AssetTrackerBook.json:") })
+            XCTAssertTrue(afterSync.contains { $0.hasPrefix("fstat:") })
+        }
+
+        XCTAssertFalse(fileManager.fileExists(atPath: fixture.blob.path))
+        XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+        XCTAssertFalse(events.snapshot().contains {
+            $0.point == .beforeRecoveryHealthClear || $0.point == .afterRecoveryHealthClear
+        })
+    }
+
+    func testOrdinaryPendingCleanupAlreadyAbsentDirectorySyncFailureIsTypedWithoutUnlinkOrHealthEvents() throws {
+        let sourceBytes = Data("source-already-absent-sync-failure".utf8)
+        let indexBytes = Data("slots-already-absent-sync-failure".utf8)
+        let blobBytes = Data("pending-already-absent-sync-failure".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: indexBytes,
+            blobBytes: blobBytes,
+            blobPresent: false
+        )
+        let events = FaultEventRecorder()
+        let posix = RecordingNativePOSIX(syncDirectoryFailurePath: "blobs")
+        let writer = NativeDurableFileWriter(
+            rootURL: fixture.root,
+            posix: posix,
+            faultHandler: { events.record($0) }
+        )
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let before = posix.snapshotCalls().count
+            var callbackCount = 0
+            XCTAssertThrowsError(
+                try locked.unlinkOrdinaryPendingAndSync(
+                    relativePath: fixture.relativePath,
+                    sourceProof: sourceProof,
+                    authorizeLatestIndex: { proof in
+                        callbackCount += 1
+                        XCTAssertEqual(proof.bytes, indexBytes)
+                        return .unlinkPending
+                    }
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? NativeOrdinaryPendingCleanupIOError,
+                    .directorySyncFailed
+                )
+            }
+            XCTAssertEqual(callbackCount, 1)
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            XCTAssertFalse(calls.contains { $0.hasPrefix("unlinkAt:") })
+            XCTAssertEqual(calls.filter { $0.hasPrefix("syncDirectory:") }.count, 1)
+        }
+
+        XCTAssertFalse(fileManager.fileExists(atPath: fixture.blob.path))
+        XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+        XCTAssertEqual(try Data(contentsOf: fixture.primary), sourceBytes)
+        XCTAssertFalse(events.snapshot().contains {
+            $0.point == .beforeRecoveryHealthClear || $0.point == .afterRecoveryHealthClear
+        })
+    }
+
+    func testOrdinaryPendingCleanupAlreadyAbsentPostSyncProofFailuresRemainUntyped() throws {
+        enum Failure: CaseIterable { case sourceProof, indexMetadata }
+
+        for failure in Failure.allCases {
+            let sourceBytes = Data("source-already-absent-post-sync-\(failure)".utf8)
+            let indexBytes = Data("slots-already-absent-post-sync-\(failure)".utf8)
+            let blobBytes = Data("pending-already-absent-post-sync-\(failure)".utf8)
+            let replacement = Data("replacement-already-absent-post-sync-\(failure)".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-\(failure)",
+                sourceBytes: sourceBytes,
+                indexBytes: indexBytes,
+                blobBytes: blobBytes,
+                blobPresent: false
+            )
+            let action: @Sendable () throws -> Void = {
+                switch failure {
+                case .sourceProof:
+                    try overwriteInPlaceForFault(replacement, at: fixture.primary)
+                case .indexMetadata:
+                    guard Darwin.chmod(fixture.slots.path, 0o644) == 0 else {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                }
+            }
+            let posix = RecordingNativePOSIX(
+                afterSyncDirectoryPath: "blobs",
+                afterSyncDirectoryAction: action
+            )
+            let writer = NativeDurableFileWriter(
+                rootURL: fixture.root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                let before = posix.snapshotCalls().count
+                var callbackCount = 0
+                XCTAssertThrowsError(
+                    try locked.unlinkOrdinaryPendingAndSync(
+                        relativePath: fixture.relativePath,
+                        sourceProof: sourceProof,
+                        authorizeLatestIndex: { _ in
+                            callbackCount += 1
+                            return .unlinkPending
+                        }
+                    ),
+                    "failure=\(failure)"
+                ) { error in
+                    XCTAssertNil(
+                        error as? NativeOrdinaryPendingCleanupIOError,
+                        "post-sync proof/metadata failures are not cleanup I/O, failure=\(failure)"
+                    )
+                }
+                XCTAssertEqual(callbackCount, 1, "failure=\(failure)")
+                let calls = Array(posix.snapshotCalls().dropFirst(before))
+                XCTAssertFalse(calls.contains { $0.hasPrefix("unlinkAt:") }, "failure=\(failure)")
+                XCTAssertEqual(
+                    calls.filter { $0.hasPrefix("syncDirectory:") }.count,
+                    1,
+                    "failure=\(failure)"
+                )
+            }
+
+            XCTAssertFalse(fileManager.fileExists(atPath: fixture.blob.path))
+        }
+    }
+
+    func testOrdinaryPendingCleanupSuccessUsesFreshIndexProofAndFinalProofOrder() throws {
+        let sourceBytes = Data("source-cleanup-success".utf8)
+        let indexBytes = Data("slots-cleanup-success".utf8)
+        let blobBytes = Data("pending-cleanup-success".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: indexBytes,
+            blobBytes: blobBytes
+        )
+        let events = FaultEventRecorder()
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(
+            rootURL: fixture.root,
+            posix: posix,
+            faultHandler: { events.record($0) }
+        )
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let before = posix.snapshotCalls().count
+            var callbackOffset: Int?
+            var callbackProof: NativeManagedFileProof?
+            let result = try locked.unlinkOrdinaryPendingAndSync(
+                relativePath: fixture.relativePath,
+                sourceProof: sourceProof,
+                authorizeLatestIndex: { proof in
+                    callbackOffset = posix.snapshotCalls().count - before
+                    callbackProof = proof
+                    XCTAssertEqual(proof.bytes, indexBytes)
+                    XCTAssertEqual(proof.sha256, hash(indexBytes))
+                    XCTAssertEqual(proof.byteCount, indexBytes.count)
+                    return .unlinkPending
+                }
+            )
+            XCTAssertEqual(result.disposition, .unlinked)
+            XCTAssertEqual(result.latestIndexProof, try XCTUnwrap(callbackProof))
+            try locked.revalidate(result.latestIndexProof)
+            try locked.revalidatePrimarySource(sourceProof)
+
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            let callbackIndex = try XCTUnwrap(callbackOffset)
+            let unlinkIndex = try XCTUnwrap(calls.firstIndex { $0 == "unlinkAt:\(fixture.blob.lastPathComponent)" })
+            let syncIndex = try XCTUnwrap(
+                calls[unlinkIndex...].firstIndex { $0.hasPrefix("syncDirectory:") }
+            )
+            let finalSlotsProofIndex = try XCTUnwrap(
+                calls[..<unlinkIndex].lastIndex { $0 == "fstatAt:slots.json:true" }
+            )
+            let finalSourceReadIndex = try XCTUnwrap(
+                calls[callbackIndex..<finalSlotsProofIndex].lastIndex {
+                    $0.hasPrefix("openAt:AssetTrackerBook.json:")
+                }
+            )
+            let finalBlobProofIndex = try XCTUnwrap(
+                calls[callbackIndex..<finalSlotsProofIndex].lastIndex {
+                    $0 == "fstatAt:\(fixture.blob.lastPathComponent):true"
+                }
+            )
+            XCTAssertLessThan(callbackIndex, unlinkIndex)
+            XCTAssertTrue(calls[..<callbackIndex].contains { $0.hasPrefix("openAt:\(fixture.blob.lastPathComponent):") })
+            XCTAssertTrue(calls[..<callbackIndex].contains { $0.hasPrefix("openAt:slots.json:") })
+            XCTAssertLessThan(callbackIndex, finalSourceReadIndex)
+            XCTAssertLessThan(callbackIndex, finalBlobProofIndex)
+            XCTAssertLessThan(finalSourceReadIndex, finalSlotsProofIndex)
+            XCTAssertLessThan(finalBlobProofIndex, finalSlotsProofIndex)
+            XCTAssertEqual(
+                finalSlotsProofIndex + 1,
+                unlinkIndex,
+                "the final exact slots bytes/inode leaf proof must be the syscall immediately before unlink"
+            )
+            XCTAssertGreaterThanOrEqual(
+                calls[(unlinkIndex + 1)...].filter { $0 == "fstatAt:\(fixture.blob.lastPathComponent):true" }.count,
+                2
+            )
+            XCTAssertTrue(calls[(syncIndex + 1)...].contains { $0.hasPrefix("openAt:slots.json:") })
+            XCTAssertTrue(calls[(syncIndex + 1)...].contains { $0.hasPrefix("openAt:AssetTrackerBook.json:") })
+        }
+
+        XCTAssertFalse(fileManager.fileExists(atPath: fixture.blob.path))
+        XCTAssertEqual(try Data(contentsOf: fixture.slots), indexBytes)
+        XCTAssertTrue(events.snapshot().allSatisfy {
+            ![
+                .beforeRetentionUnlink,
+                .afterRetentionUnlink,
+                .afterRetentionDirectoryFSync,
+                .beforeRecoveryHealthClear,
+                .afterRecoveryHealthClear,
+            ].contains($0.point)
+        })
+    }
+
+    func testOrdinaryPendingCleanupRejectsPreUnlinkIndexSourceAndBlobReplacement() throws {
+        enum Fixture: CaseIterable { case index, indexSameInode, source, blob }
+
+        for race in Fixture.allCases {
+            let sourceBytes = Data("source-pre-unlink-\(race)".utf8)
+            let indexBytes = Data("slots-pre-unlink-\(race)".utf8)
+            let blobBytes = Data("pending-pre-unlink-\(race)".utf8)
+            let replacement = Data("replacement-pre-unlink-\(race)".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-\(race)",
+                sourceBytes: sourceBytes,
+                indexBytes: indexBytes,
+                blobBytes: blobBytes
+            )
+            let detached = fixture.base.appendingPathComponent("detached-\(race)")
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(
+                rootURL: fixture.root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.unlinkOrdinaryPendingAndSync(
+                        relativePath: fixture.relativePath,
+                        sourceProof: sourceProof,
+                        authorizeLatestIndex: { _ in
+                            let target: URL
+                            switch race {
+                            case .index: target = fixture.slots
+                            case .indexSameInode:
+                                try overwriteInPlaceForFault(replacement, at: fixture.slots)
+                                return .unlinkPending
+                            case .source: target = fixture.primary
+                            case .blob: target = fixture.blob
+                            }
+                            try FileManager.default.moveItem(at: target, to: detached)
+                            try writePrivateForFault(replacement, to: target)
+                            return .unlinkPending
+                        }
+                    ),
+                    "race=\(race)"
+                )
+                XCTAssertFalse(
+                    posix.snapshotCalls().dropFirst(before).contains {
+                        $0 == "unlinkAt:\(fixture.blob.lastPathComponent)"
+                    },
+                    "race=\(race)"
+                )
+            }
+
+            switch race {
+            case .index, .indexSameInode:
+                XCTAssertEqual(try Data(contentsOf: fixture.slots), replacement)
+                XCTAssertEqual(try Data(contentsOf: fixture.blob), blobBytes)
+            case .source:
+                XCTAssertEqual(try Data(contentsOf: fixture.primary), replacement)
+                XCTAssertEqual(try Data(contentsOf: fixture.blob), blobBytes)
+            case .blob:
+                XCTAssertEqual(try Data(contentsOf: fixture.blob), replacement)
+            }
+        }
+    }
+
+    func testOrdinaryPendingCleanupRejectsPostUnlinkBlobIndexAndSourceRaces() throws {
+        enum Fixture: CaseIterable { case blobRecreated, indexReplaced, sourceReplaced }
+
+        for race in Fixture.allCases {
+            let sourceBytes = Data("source-post-unlink-\(race)".utf8)
+            let indexBytes = Data("slots-post-unlink-\(race)".utf8)
+            let blobBytes = Data("pending-post-unlink-\(race)".utf8)
+            let replacement = Data("replacement-post-unlink-\(race)".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-\(race)",
+                sourceBytes: sourceBytes,
+                indexBytes: indexBytes,
+                blobBytes: blobBytes
+            )
+            let detached = fixture.base.appendingPathComponent("detached-\(race)")
+            let action: @Sendable () throws -> Void
+            switch race {
+            case .blobRecreated:
+                action = { try writePrivateForFault(replacement, to: fixture.blob) }
+            case .indexReplaced:
+                action = {
+                    try FileManager.default.moveItem(at: fixture.slots, to: detached)
+                    try writePrivateForFault(replacement, to: fixture.slots)
+                }
+            case .sourceReplaced:
+                action = {
+                    try FileManager.default.moveItem(at: fixture.primary, to: detached)
+                    try writePrivateForFault(replacement, to: fixture.primary)
+                }
+            }
+            let posix = RecordingNativePOSIX(
+                afterSyncDirectoryPath: "blobs",
+                afterSyncDirectoryAction: action
+            )
+            let writer = NativeDurableFileWriter(
+                rootURL: fixture.root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+            var returnedSuccess = false
+
+            XCTAssertThrowsError(
+                try writer.withExclusiveMutationLock { locked in
+                    let sourceProof = try locked.verifyPrimarySource(
+                        expectedSource: .sha256(hash(sourceBytes))
+                    )
+                    _ = try locked.unlinkOrdinaryPendingAndSync(
+                        relativePath: fixture.relativePath,
+                        sourceProof: sourceProof,
+                        authorizeLatestIndex: { _ in .unlinkPending }
+                    )
+                    returnedSuccess = true
+                },
+                "race=\(race)"
+            )
+            XCTAssertFalse(returnedSuccess, "race=\(race)")
+            switch race {
+            case .blobRecreated:
+                XCTAssertEqual(try Data(contentsOf: fixture.blob), replacement)
+            case .indexReplaced:
+                XCTAssertEqual(try Data(contentsOf: fixture.slots), replacement)
+            case .sourceReplaced:
+                XCTAssertEqual(try Data(contentsOf: fixture.primary), replacement)
+            }
+        }
+    }
+
+    func testOrdinaryPendingCleanupRejectsOldSourceProofAfterPrimaryRenameAndAcceptsFreshProof() throws {
+        let sourceBytes = Data("source-before-primary-rename".utf8)
+        let candidateBytes = Data("candidate-after-primary-rename".utf8)
+        let indexBytes = Data("slots-across-primary-rename".utf8)
+        let blobBytes = Data("pending-across-primary-rename".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: indexBytes,
+            blobBytes: blobBytes
+        )
+        let writer = NativeDurableFileWriter(rootURL: fixture.root)
+
+        try writer.withExclusiveMutationLock { locked in
+            let oldProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            _ = try locked.durableReplacePrimary(candidateBytes, sourceProof: oldProof)
+            XCTAssertThrowsError(
+                try locked.unlinkOrdinaryPendingAndSync(
+                    relativePath: fixture.relativePath,
+                    sourceProof: oldProof,
+                    authorizeLatestIndex: { _ in .unlinkPending }
+                )
+            )
+            XCTAssertEqual(try Data(contentsOf: fixture.blob), blobBytes)
+
+            let freshProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(candidateBytes))
+            )
+            let result = try locked.unlinkOrdinaryPendingAndSync(
+                relativePath: fixture.relativePath,
+                sourceProof: freshProof,
+                authorizeLatestIndex: { proof in
+                    XCTAssertEqual(proof.bytes, indexBytes)
+                    return .unlinkPending
+                }
+            )
+            XCTAssertEqual(result.disposition, .unlinked)
+        }
+        XCTAssertFalse(fileManager.fileExists(atPath: fixture.blob.path))
+    }
+
+    func testManagedIndexCASRejectsStaleReplacementAndLastPreRenameRaceWithoutOverwrite() throws {
+        do {
+            let sourceBytes = Data("source-pre-cas".utf8)
+            let oldIndex = Data("old-index-pre-cas".utf8)
+            let newerIndex = Data("newer-index-pre-cas".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-before-call",
+                sourceBytes: sourceBytes,
+                indexBytes: oldIndex,
+                blobBytes: Data("unused-pending".utf8),
+                blobPresent: false
+            )
+            let detached = fixture.base.appendingPathComponent("detached-old-index")
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(
+                rootURL: fixture.root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                let expectedProof = try XCTUnwrap(
+                    locked.readManagedFileProof(
+                        relativePath: "Recovery/ordinary/slots.json",
+                        role: .ordinaryHealthIndex
+                    )
+                )
+                try FileManager.default.moveItem(at: fixture.slots, to: detached)
+                try writePrivate(newerIndex, to: fixture.slots)
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.durableCompareAndSwapManaged(
+                        Data("health-cleared".utf8),
+                        replacing: expectedProof,
+                        sourceProof: sourceProof,
+                        role: .ordinaryHealthIndex
+                    )
+                )
+                XCTAssertFalse(
+                    posix.snapshotCalls().dropFirst(before).contains { $0.hasPrefix("renameAt:") }
+                )
+            }
+            XCTAssertEqual(try Data(contentsOf: fixture.slots), newerIndex)
+        }
+
+        do {
+            let sourceBytes = Data("source-same-inode-pre-cas".utf8)
+            let oldIndex = Data("old-index-same-inode-pre-cas".utf8)
+            let newerIndex = Data("newer-index-same-inode-pre-cas".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-same-inode",
+                sourceBytes: sourceBytes,
+                indexBytes: oldIndex,
+                blobBytes: Data("unused-pending".utf8),
+                blobPresent: false
+            )
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(
+                rootURL: fixture.root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                let expectedProof = try XCTUnwrap(
+                    locked.readManagedFileProof(
+                        relativePath: "Recovery/ordinary/slots.json",
+                        role: .ordinaryHealthIndex
+                    )
+                )
+                var beforeStat = stat()
+                XCTAssertEqual(Darwin.lstat(fixture.slots.path, &beforeStat), 0)
+                try overwriteInPlace(newerIndex, at: fixture.slots)
+                var afterStat = stat()
+                XCTAssertEqual(Darwin.lstat(fixture.slots.path, &afterStat), 0)
+                XCTAssertEqual(UInt64(beforeStat.st_dev), UInt64(afterStat.st_dev))
+                XCTAssertEqual(UInt64(beforeStat.st_ino), UInt64(afterStat.st_ino))
+
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(try locked.revalidate(expectedProof))
+                XCTAssertThrowsError(
+                    try locked.durableCompareAndSwapManaged(
+                        Data("must-not-overwrite-same-inode".utf8),
+                        replacing: expectedProof,
+                        sourceProof: sourceProof,
+                        role: .ordinaryHealthIndex
+                    )
+                )
+                XCTAssertFalse(
+                    posix.snapshotCalls().dropFirst(before).contains { $0.hasPrefix("renameAt:") }
+                )
+            }
+            XCTAssertEqual(try Data(contentsOf: fixture.slots), newerIndex)
+        }
+
+        do {
+            let sourceBytes = Data("source-last-pre-rename".utf8)
+            let oldIndex = Data("old-index-last-pre-rename".utf8)
+            let newerIndex = Data("newer-index-last-pre-rename".utf8)
+            let newBytes = Data("health-clear-last-pre-rename".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-before-rename",
+                sourceBytes: sourceBytes,
+                indexBytes: oldIndex,
+                blobBytes: Data("unused-pending".utf8),
+                blobPresent: false
+            )
+            let detached = fixture.base.appendingPathComponent("detached-old-index")
+            let writer = NativeDurableFileWriter(rootURL: fixture.root) { event in
+                guard event.point == .beforeRename, event.role == .ordinaryHealthIndex else { return }
+                try FileManager.default.moveItem(at: fixture.slots, to: detached)
+                try writePrivateForFault(newerIndex, to: fixture.slots)
+            }
+
+            try writer.withExclusiveMutationLock { locked in
+                let sourceProof = try locked.verifyPrimarySource(
+                    expectedSource: .sha256(hash(sourceBytes))
+                )
+                let expectedProof = try XCTUnwrap(
+                    locked.readManagedFileProof(
+                        relativePath: "Recovery/ordinary/slots.json",
+                        role: .ordinaryHealthIndex
+                    )
+                )
+                XCTAssertThrowsError(
+                    try locked.durableCompareAndSwapManaged(
+                        newBytes,
+                        replacing: expectedProof,
+                        sourceProof: sourceProof,
+                        role: .ordinaryHealthIndex
+                    )
+                )
+            }
+            XCTAssertEqual(try Data(contentsOf: fixture.slots), newerIndex)
+        }
+    }
+
+    func testManagedIndexCASProofIsLeasePathRoleBoundAndExpires() throws {
+        let sourceBytes = Data("source-proof-binding".utf8)
+        let oldIndex = Data("old-index-proof-binding".utf8)
+        let newIndex = Data("new-index-proof-binding".utf8)
+        let fixture = try makeOrdinaryPendingFixture(
+            #function,
+            sourceBytes: sourceBytes,
+            indexBytes: oldIndex,
+            blobBytes: Data("unused-pending".utf8),
+            blobPresent: false
+        )
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(
+            rootURL: fixture.root,
+            posix: posix,
+            faultHandler: { _ in }
+        )
+        var escapedLocked: NativeLockedBookDirectory?
+        var escapedProof: NativeManagedFileProof?
+
+        try writer.withExclusiveMutationLock { locked in
+            let sourceProof = try locked.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let expectedProof = try XCTUnwrap(
+                locked.readManagedFileProof(
+                    relativePath: "Recovery/ordinary/slots.json",
+                    role: .ordinaryHealthIndex
+                )
+            )
+            let beforeWrongRole = posix.snapshotCalls().count
+            XCTAssertThrowsError(
+                try locked.durableCompareAndSwapManaged(
+                    newIndex,
+                    replacing: expectedProof,
+                    sourceProof: sourceProof,
+                    role: .ordinaryCommittedIndex
+                )
+            )
+            XCTAssertFalse(
+                posix.snapshotCalls().dropFirst(beforeWrongRole).contains { $0.hasPrefix("renameAt:") }
+            )
+
+            let proof = try locked.durableCompareAndSwapManaged(
+                newIndex,
+                replacing: expectedProof,
+                sourceProof: sourceProof,
+                role: .ordinaryHealthIndex
+            )
+            XCTAssertEqual(proof.bytes, newIndex)
+            XCTAssertEqual(proof.sha256, hash(newIndex))
+            XCTAssertEqual(proof.byteCount, newIndex.count)
+            try locked.revalidate(proof)
+            try locked.revalidatePrimarySource(sourceProof)
+            escapedLocked = locked
+            escapedProof = proof
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fixture.slots), newIndex)
+        XCTAssertThrowsError(
+            try XCTUnwrap(escapedLocked).revalidate(try XCTUnwrap(escapedProof))
+        ) { error in
+            XCTAssertEqual(error as? NativeDurableFileWriterError, .leaseExpired)
+        }
+
+        try writer.withExclusiveMutationLock { secondLease in
+            let staleProof = try XCTUnwrap(escapedProof)
+            let freshSource = try secondLease.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(try secondLease.revalidate(staleProof))
+            XCTAssertThrowsError(
+                try secondLease.durableCompareAndSwapManaged(
+                    Data("must-not-overwrite".utf8),
+                    replacing: staleProof,
+                    sourceProof: freshSource,
+                    role: .ordinaryHealthIndex
+                )
+            )
+            XCTAssertFalse(
+                posix.snapshotCalls().dropFirst(before).contains { $0.hasPrefix("renameAt:") }
+            )
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.slots), newIndex)
+    }
+
+    func testManagedIndexCASPostRenameRacesNeverReturnSuccess() throws {
+        enum Fixture: CaseIterable { case index, source, ordinaryDirectory }
+
+        for race in Fixture.allCases {
+            let sourceBytes = Data("source-post-cas-\(race)".utf8)
+            let oldIndex = Data("old-index-post-cas-\(race)".utf8)
+            let newIndex = Data("new-index-post-cas-\(race)".utf8)
+            let replacement = Data("replacement-post-cas-\(race)".utf8)
+            let fixture = try makeOrdinaryPendingFixture(
+                "\(#function)-\(race)",
+                sourceBytes: sourceBytes,
+                indexBytes: oldIndex,
+                blobBytes: Data("unused-pending".utf8),
+                blobPresent: false
+            )
+            let detached = fixture.base.appendingPathComponent("detached-\(race)")
+            let writer = NativeDurableFileWriter(rootURL: fixture.root) { event in
+                switch race {
+                case .index where event.point == .afterRename && event.role == .ordinaryHealthIndex:
+                    try FileManager.default.moveItem(at: fixture.slots, to: detached)
+                    try writePrivateForFault(replacement, to: fixture.slots)
+                case .source where event.point == .afterParentDirectoryFSync
+                    && event.role == .ordinaryHealthIndex:
+                    try FileManager.default.moveItem(at: fixture.primary, to: detached)
+                    try writePrivateForFault(replacement, to: fixture.primary)
+                case .ordinaryDirectory where event.point == .afterHashVerified
+                    && event.role == .ordinaryHealthIndex:
+                    try swapDirectoryForFault(
+                        canonical: fixture.ordinary,
+                        detached: detached,
+                        replacementChildren: ["blobs"]
+                    )
+                default:
+                    break
+                }
+            }
+            var returnedSuccess = false
+
+            XCTAssertThrowsError(
+                try writer.withExclusiveMutationLock { locked in
+                    let sourceProof = try locked.verifyPrimarySource(
+                        expectedSource: .sha256(hash(sourceBytes))
+                    )
+                    let expectedProof = try XCTUnwrap(
+                        locked.readManagedFileProof(
+                            relativePath: "Recovery/ordinary/slots.json",
+                            role: .ordinaryHealthIndex
+                        )
+                    )
+                    _ = try locked.durableCompareAndSwapManaged(
+                        newIndex,
+                        replacing: expectedProof,
+                        sourceProof: sourceProof,
+                        role: .ordinaryHealthIndex
+                    )
+                    returnedSuccess = true
+                },
+                "race=\(race)"
+            )
+            XCTAssertFalse(returnedSuccess, "race=\(race)")
+            switch race {
+            case .index:
+                XCTAssertEqual(try Data(contentsOf: fixture.slots), replacement)
+            case .source:
+                XCTAssertEqual(try Data(contentsOf: fixture.primary), replacement)
+            case .ordinaryDirectory:
+                XCTAssertTrue(fileManager.fileExists(atPath: fixture.ordinary.path))
+                XCTAssertTrue(fileManager.fileExists(atPath: detached.path))
+            }
+        }
+    }
+
+    func testEnumerateIfPresentBindsEveryComponentNoFollowAndValidatesPresentDirectory() throws {
+        let (_, root) = try makeScratch("enumerate-if-present")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        try writePrivate(Data("temp".utf8), to: ordinary.appendingPathComponent("marker"))
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        let entries = try writer.withExclusiveMutationLock { locked in
+            try locked.enumerateIfPresent(relativePath: "Recovery/ordinary")
+        }
+
+        XCTAssertEqual(entries, [NativeDirectoryEntry(name: "marker", fileType: .regular)])
+        let directoryFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let calls = posix.snapshotCalls()
+        XCTAssertTrue(calls.contains("openAt:Recovery:\(directoryFlags)"))
+        XCTAssertTrue(calls.contains("openAt:ordinary:\(directoryFlags)"))
+        XCTAssertGreaterThanOrEqual(calls.filter { $0 == "fstatAt:Recovery:true" }.count, 2)
+        XCTAssertGreaterThanOrEqual(calls.filter { $0 == "fstatAt:ordinary:true" }.count, 2)
+        XCTAssertTrue(calls.contains { $0.hasPrefix("directoryEntries:") })
+    }
+
+    func testEnumerateIfPresentReturnsNilOnlyAfterSameNameENOENTReproof() throws {
+        let (_, root) = try makeScratch("enumerate-if-present-missing")
+        let recovery = root.appendingPathComponent("Recovery", isDirectory: true)
+        try makeDirectory(recovery)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        let entries = try writer.withExclusiveMutationLock { locked in
+            try locked.enumerateIfPresent(relativePath: "Recovery/ordinary")
+        }
+
+        XCTAssertNil(entries)
+        let calls = posix.snapshotCalls()
+        XCTAssertEqual(calls.filter { $0 == "fstatAt:ordinary:true" }.count, 2)
+        XCTAssertGreaterThanOrEqual(calls.filter { $0 == "fstatAt:Recovery:true" }.count, 2)
+        XCTAssertFalse(calls.contains { $0.hasPrefix("openAt:ordinary:") })
+        XCTAssertFalse(calls.contains { $0.hasPrefix("directoryEntries:") })
+    }
+
+    func testEnumerateIfPresentReturnsNilOnlyAfterTopLevelRecoveryENOENTReproof() throws {
+        let (_, root) = try makeScratch("enumerate-if-present-top-level-missing")
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        let entries = try writer.withExclusiveMutationLock { locked in
+            try locked.enumerateIfPresent(relativePath: "Recovery/ordinary")
+        }
+
+        XCTAssertNil(entries)
+        let calls = posix.snapshotCalls()
+        XCTAssertEqual(calls.filter { $0 == "fstatAt:Recovery:true" }.count, 2)
+        XCTAssertFalse(calls.contains { $0.hasPrefix("openAt:Recovery:") })
+        XCTAssertFalse(calls.contains { $0 == "fstatAt:ordinary:true" })
+        XCTAssertFalse(calls.contains { $0.hasPrefix("directoryEntries:") })
+    }
+
+    func testEnumerateIfPresentTopLevelRecoveryAppearanceDuringReproofThrows() throws {
+        let (_, root) = try makeScratch("enumerate-if-present-top-level-appearance-race")
+        let recovery = root.appendingPathComponent("Recovery", isDirectory: true)
+        let posix = RecordingNativePOSIX(
+            beforeFstatAtPath: "Recovery",
+            beforeFstatAtOccurrence: 2,
+            beforeFstatAtAction: {
+                try FileManager.default.createDirectory(at: recovery, withIntermediateDirectories: false)
+                guard Darwin.chmod(recovery.path, 0o700) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+        )
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+        var returnedNil = false
+
+        XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+            returnedNil = try locked.enumerateIfPresent(
+                relativePath: "Recovery/ordinary"
+            ) == nil
+        })
+        XCTAssertFalse(returnedNil)
+        XCTAssertTrue(fileManager.fileExists(atPath: recovery.path))
+    }
+
+    func testEnumerateIfPresentMissingNameAppearanceDuringReproofThrows() throws {
+        let (_, root) = try makeScratch("enumerate-if-present-appearance-race")
+        let recovery = root.appendingPathComponent("Recovery", isDirectory: true)
+        let ordinary = recovery.appendingPathComponent("ordinary", isDirectory: true)
+        try makeDirectory(recovery)
+        let posix = RecordingNativePOSIX(
+            beforeFstatAtPath: "ordinary",
+            beforeFstatAtOccurrence: 2,
+            beforeFstatAtAction: {
+                try FileManager.default.createDirectory(at: ordinary, withIntermediateDirectories: false)
+                guard Darwin.chmod(ordinary.path, 0o700) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+            }
+        )
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+        var returned = false
+
+        XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+            _ = try locked.enumerateIfPresent(relativePath: "Recovery/ordinary")
+            returned = true
+        })
+        XCTAssertFalse(returned)
+        XCTAssertTrue(fileManager.fileExists(atPath: ordinary.path))
+    }
+
+    func testReadValidatedNeverReturnsNilWhenLeafAppearsAfterOpenENOENT() throws {
+        let (_, root) = try makeScratch("read-validated-appearance-race")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let slots = ordinary.appendingPathComponent("slots.json")
+        let bytes = Data("appeared-index".utf8)
+        let posix = RecordingNativePOSIX(
+            afterMissingOpenAtPath: "slots.json",
+            afterMissingOpenAtAction: {
+                try writePrivateForFault(bytes, to: slots)
+            }
+        )
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+        var returnedNil = false
+
+        do {
+            let result = try writer.withExclusiveMutationLock { locked in
+                try locked.readValidated(relativePath: "Recovery/ordinary/slots.json")
+            }
+            returnedNil = result == nil
+        } catch {
+            // Failing closed is allowed; only a false absent result is forbidden.
+        }
+
+        XCTAssertFalse(returnedNil)
+        XCTAssertEqual(try Data(contentsOf: slots), bytes)
+    }
+
+    func testEnumerateIfPresentRejectsPostEnumerationIdentitySwap() throws {
+        let (base, root) = try makeScratch("enumerate-if-present-swap")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let detached = base.appendingPathComponent("detached-ordinary", isDirectory: true)
+        let posix = RecordingNativePOSIX(
+            beforeFstatAtPath: "ordinary",
+            beforeFstatAtOccurrence: 3,
+            beforeFstatAtAction: {
+                try swapDirectoryForFault(canonical: ordinary, detached: detached)
+            }
+        )
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+        var returned = false
+
+        XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+            _ = try locked.enumerateIfPresent(relativePath: "Recovery/ordinary")
+            returned = true
+        })
+        XCTAssertFalse(returned)
+        XCTAssertTrue(fileManager.fileExists(atPath: ordinary.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: detached.path))
+    }
+
+    func testEnumerateIfPresentRejectsInvalidTypeOwnerModeAndACL() throws {
+        do {
+            let (base, root) = try makeScratch("enumerate-if-present-symlink")
+            let recovery = root.appendingPathComponent("Recovery", isDirectory: true)
+            let outside = base.appendingPathComponent("outside", isDirectory: true)
+            try makeDirectory(recovery)
+            try makeDirectory(outside)
+            try fileManager.createSymbolicLink(
+                at: recovery.appendingPathComponent("ordinary"),
+                withDestinationURL: outside
+            )
+            XCTAssertThrowsError(try NativeDurableFileWriter(rootURL: root).withExclusiveMutationLock {
+                _ = try $0.enumerateIfPresent(relativePath: "Recovery/ordinary")
+            })
+        }
+
+        do {
+            let (_, root) = try makeScratch("enumerate-if-present-file")
+            let recovery = root.appendingPathComponent("Recovery", isDirectory: true)
+            try makeDirectory(recovery)
+            try writePrivate(Data(), to: recovery.appendingPathComponent("ordinary"))
+            XCTAssertThrowsError(try NativeDurableFileWriter(rootURL: root).withExclusiveMutationLock {
+                _ = try $0.enumerateIfPresent(relativePath: "Recovery/ordinary")
+            })
+        }
+
+        do {
+            let (_, root) = try makeScratch("enumerate-if-present-mode")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            XCTAssertEqual(Darwin.chmod(ordinary.path, 0o755), 0)
+            XCTAssertThrowsError(try NativeDurableFileWriter(rootURL: root).withExclusiveMutationLock {
+                _ = try $0.enumerateIfPresent(relativePath: "Recovery/ordinary")
+            })
+        }
+
+        do {
+            let (_, root) = try makeScratch("enumerate-if-present-owner")
+            _ = try makeIndexlessOrdinary(in: root)
+            let posix = RecordingNativePOSIX(wrongOwnerPath: "ordinary")
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock {
+                _ = try $0.enumerateIfPresent(relativePath: "Recovery/ordinary")
+            })
+        }
+
+        do {
+            let (_, root) = try makeScratch("enumerate-if-present-acl")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            try addACL("user:\(NSUserName()) allow read", to: ordinary)
+            XCTAssertThrowsError(try NativeDurableFileWriter(rootURL: root).withExclusiveMutationLock {
+                _ = try $0.enumerateIfPresent(relativePath: "Recovery/ordinary")
+            })
+        }
+    }
+
+    func testOrdinaryEmptyIndexCleanupUnlinksOnlyExactEmptyPartialAndFullPrefixesDurably() throws {
+        let (_, root) = try makeScratch("ordinary-empty-index-prefix-temps")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let expected = Data("{\"committed\":{\"maintenance\":{\"lastHealthCode\":null}}}".utf8)
+        let namesAndBytes = [
+            (ordinaryEmptyIndexTempName("00000000-0000-0000-0000-000000000000"), Data()),
+            (
+                ordinaryEmptyIndexTempName("11111111-1111-1111-1111-111111111111"),
+                Data(expected.prefix(expected.count / 2))
+            ),
+            (ordinaryEmptyIndexTempName("22222222-2222-2222-2222-222222222222"), expected),
+        ]
+        for (name, bytes) in namesAndBytes {
+            try writePrivate(bytes, to: ordinary.appendingPathComponent(name))
+        }
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            try locked.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+        }
+
+        for (name, _) in namesAndBytes {
+            XCTAssertFalse(fileManager.fileExists(atPath: ordinary.appendingPathComponent(name).path))
+        }
+        let calls = posix.snapshotCalls()
+        for (name, _) in namesAndBytes {
+            let unlink = try XCTUnwrap(calls.firstIndex(of: "unlinkAt:\(name)"))
+            let sync = try XCTUnwrap(calls[unlink...].firstIndex { $0.hasPrefix("syncDirectory:") })
+            let absence = try XCTUnwrap(calls[sync...].firstIndex(of: "fstatAt:\(name):true"))
+            XCTAssertLessThan(unlink, sync)
+            XCTAssertLessThan(sync, absence)
+        }
+        let finalAbsence = try XCTUnwrap(calls.lastIndex { call in
+            namesAndBytes.contains { call == "fstatAt:\($0.0):true" }
+        })
+        let recoveryReproof = try XCTUnwrap(calls[finalAbsence...].firstIndex(of: "fstatAt:Recovery:true"))
+        let ordinaryReproof = try XCTUnwrap(calls[recoveryReproof...].firstIndex(of: "fstatAt:ordinary:true"))
+        XCTAssertLessThan(finalAbsence, recoveryReproof)
+        XCTAssertLessThan(recoveryReproof, ordinaryReproof)
+    }
+
+    func testOrdinaryEmptyIndexCleanupRejectsAlteredAndOverlongBytesWithoutUnlink() throws {
+        let expected = Data("deterministic-empty-index".utf8)
+        let invalidContents: [(String, Data)] = [
+            ("altered", Data("deterministic-Xmpty-index".utf8)),
+            ("overlong", expected + Data("x".utf8)),
+        ]
+
+        for (label, bytes) in invalidContents {
+            let (_, root) = try makeScratch("ordinary-empty-index-\(label)")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let name = ordinaryEmptyIndexTempName("33333333-3333-3333-3333-333333333333")
+            let temp = ordinary.appendingPathComponent(name)
+            try writePrivate(bytes, to: temp)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+                try locked.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            }, label)
+            XCTAssertEqual(try Data(contentsOf: temp), bytes, label)
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(name)"), label)
+        }
+    }
+
+    func testOrdinaryEmptyIndexCleanupRejectsNoncanonicalLockBlobAndUnknownEntriesWithoutTouchingThem() throws {
+        let expected = Data("empty-index".utf8)
+        let names = [
+            ".AssetTracker.tmp.AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+            ".AssetTracker.storage.lock",
+            "\(String(repeating: "0", count: 64)).json",
+            "unknown",
+        ]
+
+        for name in names {
+            let (_, root) = try makeScratch("ordinary-empty-index-name-\(name.hashValue)")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let entry = ordinary.appendingPathComponent(name)
+            try writePrivate(expected, to: entry)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+                try locked.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            }, name)
+            XCTAssertEqual(try Data(contentsOf: entry), expected, name)
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(name)"), name)
+        }
+
+        do {
+            let (_, root) = try makeScratch("ordinary-empty-index-blobs-directory")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let blobs = ordinary.appendingPathComponent("blobs", isDirectory: true)
+            try makeDirectory(blobs)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+                try locked.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            })
+            XCTAssertTrue(fileManager.fileExists(atPath: blobs.path))
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:blobs"))
+        }
+    }
+
+    func testOrdinaryEmptyIndexCleanupRejectsWrongMetadataSymlinkAndDirectoryWithoutUnlink() throws {
+        let expected = Data("empty-index".utf8)
+        let canonicalName = ordinaryEmptyIndexTempName("44444444-4444-4444-4444-444444444444")
+
+        do {
+            let (_, root) = try makeScratch("ordinary-empty-index-wrong-mode")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let temp = ordinary.appendingPathComponent(canonicalName)
+            try writePrivate(expected, to: temp)
+            XCTAssertEqual(Darwin.chmod(temp.path, 0o644), 0)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock {
+                try $0.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            })
+            XCTAssertTrue(fileManager.fileExists(atPath: temp.path))
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(canonicalName)"))
+        }
+
+        do {
+            let (base, root) = try makeScratch("ordinary-empty-index-hardlink")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let temp = ordinary.appendingPathComponent(canonicalName)
+            let secondLink = base.appendingPathComponent("second-link")
+            try writePrivate(expected, to: temp)
+            try fileManager.linkItem(at: temp, to: secondLink)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock {
+                try $0.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            })
+            XCTAssertTrue(fileManager.fileExists(atPath: temp.path))
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(canonicalName)"))
+        }
+
+        do {
+            let (_, root) = try makeScratch("ordinary-empty-index-owner")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let temp = ordinary.appendingPathComponent(canonicalName)
+            try writePrivate(expected, to: temp)
+            let posix = RecordingNativePOSIX(wrongOwnerPath: canonicalName)
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock {
+                try $0.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            })
+            XCTAssertTrue(fileManager.fileExists(atPath: temp.path))
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(canonicalName)"))
+        }
+
+        do {
+            let (_, root) = try makeScratch("ordinary-empty-index-acl")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let temp = ordinary.appendingPathComponent(canonicalName)
+            try writePrivate(expected, to: temp)
+            try addACL("user:\(NSUserName()) allow read", to: temp)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock {
+                try $0.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            })
+            XCTAssertTrue(fileManager.fileExists(atPath: temp.path))
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(canonicalName)"))
+        }
+
+        do {
+            let (base, root) = try makeScratch("ordinary-empty-index-symlink")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let target = base.appendingPathComponent("target")
+            try writePrivate(expected, to: target)
+            let temp = ordinary.appendingPathComponent(canonicalName)
+            try fileManager.createSymbolicLink(at: temp, withDestinationURL: target)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock {
+                try $0.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            })
+            var value = stat()
+            XCTAssertEqual(Darwin.lstat(temp.path, &value), 0)
+            XCTAssertEqual(value.st_mode & mode_t(S_IFMT), mode_t(S_IFLNK))
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(canonicalName)"))
+        }
+
+        do {
+            let (_, root) = try makeScratch("ordinary-empty-index-directory")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let temp = ordinary.appendingPathComponent(canonicalName, isDirectory: true)
+            try makeDirectory(temp)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            XCTAssertThrowsError(try writer.withExclusiveMutationLock {
+                try $0.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            })
+            XCTAssertTrue(fileManager.fileExists(atPath: temp.path))
+            XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(canonicalName)"))
+        }
+    }
+
+    func testOrdinaryEmptyIndexCleanupPreservesCanonicalReplacementBeforeUnlink() throws {
+        let (base, root) = try makeScratch("ordinary-empty-index-replacement")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let expected = Data("empty-index".utf8)
+        let replacement = Data("replacement".utf8)
+        let name = ordinaryEmptyIndexTempName("55555555-5555-5555-5555-555555555555")
+        let temp = ordinary.appendingPathComponent(name)
+        let detached = base.appendingPathComponent("detached-temp")
+        try writePrivate(expected, to: temp)
+        let posix = RecordingNativePOSIX(
+            afterFirstReadOfPath: name,
+            afterFirstReadAction: {
+                try FileManager.default.moveItem(at: temp, to: detached)
+                try writePrivateForFault(replacement, to: temp)
+            }
+        )
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+            try locked.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+        })
+        XCTAssertEqual(try Data(contentsOf: temp), replacement)
+        XCTAssertEqual(try Data(contentsOf: detached), expected)
+        XCTAssertFalse(posix.snapshotCalls().contains("unlinkAt:\(name)"))
+    }
+
+    func testOrdinaryEmptyIndexCleanupRejectsRecreationAfterDirectorySync() throws {
+        let (_, root) = try makeScratch("ordinary-empty-index-recreated")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let expected = Data("empty-index".utf8)
+        let replacement = Data("replacement-after-sync".utf8)
+        let name = ordinaryEmptyIndexTempName("66666666-6666-6666-6666-666666666666")
+        let temp = ordinary.appendingPathComponent(name)
+        try writePrivate(expected, to: temp)
+        let posix = RecordingNativePOSIX(
+            afterSyncDirectoryPath: "ordinary",
+            afterSyncDirectoryAction: {
+                try writePrivateForFault(replacement, to: temp)
+            }
+        )
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+        var returned = false
+
+        XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+            try locked.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            returned = true
+        })
+        XCTAssertFalse(returned)
+        XCTAssertEqual(try Data(contentsOf: temp), replacement)
+    }
+
+    func testOrdinaryEmptyIndexCleanupRejectsDirectoryChainSwapAfterSync() throws {
+        let (base, root) = try makeScratch("ordinary-empty-index-chain-swap")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let expected = Data("empty-index".utf8)
+        let name = ordinaryEmptyIndexTempName("77777777-7777-7777-7777-777777777777")
+        let temp = ordinary.appendingPathComponent(name)
+        let detached = base.appendingPathComponent("detached-ordinary", isDirectory: true)
+        try writePrivate(expected, to: temp)
+        let posix = RecordingNativePOSIX(
+            afterSyncDirectoryPath: "ordinary",
+            afterSyncDirectoryAction: {
+                try swapDirectoryForFault(canonical: ordinary, detached: detached)
+            }
+        )
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+        var returned = false
+
+        XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+            try locked.cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: expected)
+            returned = true
+        })
+        XCTAssertFalse(returned)
+        XCTAssertTrue(fileManager.fileExists(atPath: ordinary.path))
+        XCTAssertTrue(fileManager.fileExists(atPath: detached.path))
+        XCTAssertFalse(fileManager.fileExists(atPath: detached.appendingPathComponent(name).path))
+    }
+
+    func testOrdinaryIndexCleanupPreservesCanonicalSlotsAndRemovesAllWriterRoleCrashTemps() throws {
+        let (_, root) = try makeScratch("ordinary-index-present-crash-temps")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let canonicalIndex = Data("canonical-old-slots".utf8)
+        let slots = ordinary.appendingPathComponent("slots.json")
+        try writePrivate(canonicalIndex, to: slots)
+        let blobs = ordinary.appendingPathComponent("blobs", isDirectory: true)
+        try makeDirectory(blobs)
+
+        let prepared = Data("prepared-index-target".utf8)
+        let committed = Data("committed-index-target".utf8)
+        let health = Data("health-index-target".utf8)
+        let namesAndBytes = [
+            (
+                ordinaryEmptyIndexTempName("88888888-8888-8888-8888-888888888888"),
+                Data(prepared.prefix(0))
+            ),
+            (
+                ordinaryEmptyIndexTempName("99999999-9999-9999-9999-999999999999"),
+                Data(committed.prefix(committed.count / 2))
+            ),
+            (ordinaryEmptyIndexTempName("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), health),
+        ]
+        for (name, bytes) in namesAndBytes {
+            try writePrivate(bytes, to: ordinary.appendingPathComponent(name))
+        }
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            try locked.cleanupOrdinaryIndexCrashTemps(
+                expectedEmptyIndexBytes: Data("different-virgin-empty-index".utf8)
+            )
+        }
+
+        XCTAssertEqual(try Data(contentsOf: slots), canonicalIndex)
+        XCTAssertTrue(fileManager.fileExists(atPath: blobs.path))
+        for (name, _) in namesAndBytes {
+            XCTAssertFalse(fileManager.fileExists(atPath: ordinary.appendingPathComponent(name).path))
+        }
+        let calls = posix.snapshotCalls()
+        XCTAssertFalse(calls.contains("unlinkAt:slots.json"))
+        XCTAssertFalse(calls.contains("unlinkAt:blobs"))
+    }
+
+    func testOrdinaryIndexCleanupWithCanonicalSlotsFailsClosedBeforeTouchingUnknownOrTemp() throws {
+        let (_, root) = try makeScratch("ordinary-index-present-unknown")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let canonicalIndex = Data("canonical-old-slots".utf8)
+        let slots = ordinary.appendingPathComponent("slots.json")
+        try writePrivate(canonicalIndex, to: slots)
+        let tempName = ordinaryEmptyIndexTempName("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        let temp = ordinary.appendingPathComponent(tempName)
+        let tempBytes = Data("prepared-index-target".utf8)
+        try writePrivate(tempBytes, to: temp)
+        let unknown = ordinary.appendingPathComponent("unknown-sentinel")
+        let unknownBytes = Data("preserve-me".utf8)
+        try writePrivate(unknownBytes, to: unknown)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        XCTAssertThrowsError(try writer.withExclusiveMutationLock { locked in
+            try locked.cleanupOrdinaryIndexCrashTemps(
+                expectedEmptyIndexBytes: Data("virgin-empty-index".utf8)
+            )
+        })
+
+        XCTAssertEqual(try Data(contentsOf: slots), canonicalIndex)
+        XCTAssertEqual(try Data(contentsOf: temp), tempBytes)
+        XCTAssertEqual(try Data(contentsOf: unknown), unknownBytes)
+        let calls = posix.snapshotCalls()
+        XCTAssertFalse(calls.contains("unlinkAt:slots.json"))
+        XCTAssertFalse(calls.contains("unlinkAt:\(tempName)"))
+        XCTAssertFalse(calls.contains("unlinkAt:unknown-sentinel"))
+    }
+
+    func testWriterHashSyntaxRejectsArabicIndicAndFullwidthDigitsAsNonASCII() throws {
+        let invalidHashes = [
+            String(repeating: "٠", count: 64),
+            String(repeating: "０", count: 64),
+        ]
+
+        for (index, invalidHash) in invalidHashes.enumerated() {
+            let (_, root) = try makeScratch("non-ascii-hash-\(index)")
+            _ = try makeOrdinaryBlobs(in: root)
+            let writer = NativeDurableFileWriter(rootURL: root)
+            try writer.withExclusiveMutationLock { locked in
+                XCTAssertThrowsError(
+                    try locked.verifyPrimarySource(expectedSource: .sha256(invalidHash))
+                ) { error in
+                    XCTAssertEqual(error as? NativeDurableFileWriterError, .sourceChanged)
+                }
+                XCTAssertThrowsError(
+                    try locked.readValidated(
+                        relativePath: "Recovery/ordinary/blobs/\(invalidHash).json"
+                    )
+                ) { error in
+                    XCTAssertEqual(error as? NativeDurableFileWriterError, .invalidManagedPath)
+                }
+                let sourceProof = try locked.verifyPrimarySource(expectedSource: .missing)
+                XCTAssertThrowsError(
+                    try locked.unlinkOrdinaryPendingAndSync(
+                        relativePath: "Recovery/ordinary/blobs/\(invalidHash).json",
+                        sourceProof: sourceProof,
+                        authorizeLatestIndex: { _ in
+                            XCTFail("invalid hash must fail before index authorization")
+                            return .unlinkPending
+                        }
+                    )
+                ) { error in
+                    XCTAssertEqual(error as? NativeDurableFileWriterError, .invalidRoleTarget)
+                }
+            }
+        }
+    }
+
+    func testOrdinaryNamespaceAuditDistinguishesProvenTopLevelAndNestedAbsence() throws {
+        do {
+            let (_, root) = try makeScratch("ordinary-audit-top-level-absent")
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let before = posix.snapshotCalls().count
+                XCTAssertEqual(
+                    try locked.auditOrdinaryIndexNamespace(
+                        expectedEmptyIndexBytes: Data("empty-index".utf8)
+                    ),
+                    .absent
+                )
+                let calls = Array(posix.snapshotCalls().dropFirst(before))
+                XCTAssertEqual(calls.filter { $0 == "fstatAt:Recovery:true" }.count, 2)
+                assertReadOnlyWriterCalls(calls)
+            }
+        }
+
+        do {
+            let (_, root) = try makeScratch("ordinary-audit-nested-absent")
+            let recovery = root.appendingPathComponent("Recovery", isDirectory: true)
+            try makeDirectory(recovery)
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let before = posix.snapshotCalls().count
+                XCTAssertEqual(
+                    try locked.auditOrdinaryIndexNamespace(
+                        expectedEmptyIndexBytes: Data("empty-index".utf8)
+                    ),
+                    .absent
+                )
+                let calls = Array(posix.snapshotCalls().dropFirst(before))
+                XCTAssertEqual(calls.filter { $0 == "fstatAt:ordinary:true" }.count, 2)
+                assertReadOnlyWriterCalls(calls)
+            }
+        }
+    }
+
+    func testOrdinaryNamespaceAuditRejectsTopLevelAndNestedAppearanceDuringAbsenceReproof() throws {
+        for topLevel in [true, false] {
+            let (_, root) = try makeScratch(
+                "ordinary-audit-absence-appearance-\(topLevel ? "top" : "nested")"
+            )
+            let recovery = root.appendingPathComponent("Recovery", isDirectory: true)
+            let ordinary = recovery.appendingPathComponent("ordinary", isDirectory: true)
+            if !topLevel { try makeDirectory(recovery) }
+            let missingName = topLevel ? "Recovery" : "ordinary"
+            let missingURL = topLevel ? recovery : ordinary
+            let posix = RecordingNativePOSIX(
+                beforeFstatAtPath: missingName,
+                beforeFstatAtOccurrence: 2,
+                beforeFstatAtAction: {
+                    try FileManager.default.createDirectory(
+                        at: missingURL,
+                        withIntermediateDirectories: false
+                    )
+                    guard Darwin.chmod(missingURL.path, 0o700) == 0 else {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryIndexNamespace(
+                        expectedEmptyIndexBytes: Data("empty-index".utf8)
+                    )
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            XCTAssertTrue(fileManager.fileExists(atPath: missingURL.path))
+        }
+    }
+
+    func testOrdinaryNamespaceAuditReportsEmptyIndexlessWithoutMutation() throws {
+        let (_, root) = try makeScratch("ordinary-audit-indexless-empty")
+        _ = try makeIndexlessOrdinary(in: root)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            let before = posix.snapshotCalls().count
+            XCTAssertEqual(
+                try locked.auditOrdinaryIndexNamespace(
+                    expectedEmptyIndexBytes: Data("empty-index".utf8)
+                ),
+                .indexless(validatedTempCount: 0)
+            )
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            XCTAssertGreaterThanOrEqual(calls.filter { $0.hasPrefix("directoryEntries:") }.count, 2)
+            assertReadOnlyWriterCalls(calls)
+        }
+    }
+
+    func testOrdinaryNamespaceAuditPreservesExactEmptyPartialAndFullIndexlessTemps() throws {
+        let (_, root) = try makeScratch("ordinary-audit-indexless-temps")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let expected = Data("deterministic-empty-index-bytes".utf8)
+        let namesAndBytes = [
+            (ordinaryEmptyIndexTempName("cccccccc-cccc-cccc-cccc-cccccccccccc"), Data()),
+            (
+                ordinaryEmptyIndexTempName("dddddddd-dddd-dddd-dddd-dddddddddddd"),
+                Data(expected.prefix(expected.count / 2))
+            ),
+            (ordinaryEmptyIndexTempName("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"), expected),
+        ]
+        var identities: [String: (UInt64, UInt64)] = [:]
+        for (name, bytes) in namesAndBytes {
+            let url = ordinary.appendingPathComponent(name)
+            try writePrivate(bytes, to: url)
+            var value = stat()
+            XCTAssertEqual(Darwin.lstat(url.path, &value), 0)
+            identities[name] = (UInt64(value.st_dev), UInt64(value.st_ino))
+        }
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            let before = posix.snapshotCalls().count
+            XCTAssertEqual(
+                try locked.auditOrdinaryIndexNamespace(expectedEmptyIndexBytes: expected),
+                .indexless(validatedTempCount: 3)
+            )
+            assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+        }
+
+        for (name, bytes) in namesAndBytes {
+            let url = ordinary.appendingPathComponent(name)
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            var value = stat()
+            XCTAssertEqual(Darwin.lstat(url.path, &value), 0)
+            XCTAssertEqual(identities[name]?.0, UInt64(value.st_dev))
+            XCTAssertEqual(identities[name]?.1, UInt64(value.st_ino))
+        }
+    }
+
+    func testOrdinaryNamespaceAuditRejectsAndPreservesEveryIllegalIndexlessEntryClass() throws {
+        enum Fixture: CaseIterable {
+            case blobsDirectory, blob, unknown, noncanonicalTemp
+            case alteredTemp, overlongTemp, symlinkTemp, directoryTemp
+            case wrongModeTemp, hardLinkedTemp, wrongOwnerTemp, aclTemp
+        }
+
+        let expected = Data("deterministic-empty-index".utf8)
+        let canonicalName = ordinaryEmptyIndexTempName("ffffffff-ffff-ffff-ffff-ffffffffffff")
+        for fixture in Fixture.allCases {
+            let (base, root) = try makeScratch("ordinary-audit-illegal-\(fixture)")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            var protectedURL = ordinary.appendingPathComponent(canonicalName)
+            var posix = RecordingNativePOSIX()
+
+            switch fixture {
+            case .blobsDirectory:
+                protectedURL = ordinary.appendingPathComponent("blobs", isDirectory: true)
+                try makeDirectory(protectedURL)
+            case .blob:
+                protectedURL = ordinary.appendingPathComponent(
+                    "\(String(repeating: "0", count: 64)).json"
+                )
+                try writePrivate(expected, to: protectedURL)
+            case .unknown:
+                protectedURL = ordinary.appendingPathComponent("unknown")
+                try writePrivate(expected, to: protectedURL)
+            case .noncanonicalTemp:
+                protectedURL = ordinary.appendingPathComponent(
+                    ".AssetTracker.tmp.FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"
+                )
+                try writePrivate(expected, to: protectedURL)
+            case .alteredTemp:
+                try writePrivate(Data("X".utf8) + Data(expected.dropFirst()), to: protectedURL)
+            case .overlongTemp:
+                try writePrivate(expected + Data("x".utf8), to: protectedURL)
+            case .symlinkTemp:
+                let target = base.appendingPathComponent("target")
+                try writePrivate(expected, to: target)
+                try fileManager.createSymbolicLink(at: protectedURL, withDestinationURL: target)
+            case .directoryTemp:
+                try makeDirectory(protectedURL)
+            case .wrongModeTemp:
+                try writePrivate(expected, to: protectedURL)
+                XCTAssertEqual(Darwin.chmod(protectedURL.path, 0o644), 0)
+            case .hardLinkedTemp:
+                try writePrivate(expected, to: protectedURL)
+                try fileManager.linkItem(
+                    at: protectedURL,
+                    to: base.appendingPathComponent("second-link")
+                )
+            case .wrongOwnerTemp:
+                try writePrivate(expected, to: protectedURL)
+                posix = RecordingNativePOSIX(wrongOwnerPath: canonicalName)
+            case .aclTemp:
+                try writePrivate(expected, to: protectedURL)
+                try addACL("user:\(NSUserName()) allow read", to: protectedURL)
+            }
+
+            var beforeStat = stat()
+            XCTAssertEqual(Darwin.lstat(protectedURL.path, &beforeStat), 0)
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            try writer.withExclusiveMutationLock { locked in
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryIndexNamespace(expectedEmptyIndexBytes: expected),
+                    "fixture=\(fixture)"
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            var afterStat = stat()
+            XCTAssertEqual(Darwin.lstat(protectedURL.path, &afterStat), 0)
+            XCTAssertEqual(UInt64(beforeStat.st_dev), UInt64(afterStat.st_dev), "fixture=\(fixture)")
+            XCTAssertEqual(UInt64(beforeStat.st_ino), UInt64(afterStat.st_ino), "fixture=\(fixture)")
+        }
+    }
+
+    func testOrdinaryNamespaceAuditReportsIndexedAndPreservesGenericTempsAndBlobsDirectory() throws {
+        let (_, root) = try makeScratch("ordinary-audit-indexed")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let slots = ordinary.appendingPathComponent("slots.json")
+        let indexBytes = Data("canonical-index".utf8)
+        try writePrivate(indexBytes, to: slots)
+        let blobs = ordinary.appendingPathComponent("blobs", isDirectory: true)
+        try makeDirectory(blobs)
+        let namesAndBytes = [
+            (ordinaryEmptyIndexTempName("12121212-1212-1212-1212-121212121212"), Data()),
+            (
+                ordinaryEmptyIndexTempName("13131313-1313-1313-1313-131313131313"),
+                Data("unrelated-partial-prepared".utf8)
+            ),
+            (
+                ordinaryEmptyIndexTempName("14141414-1414-1414-1414-141414141414"),
+                Data("unrelated-full-health-index".utf8)
+            ),
+        ]
+        for (name, bytes) in namesAndBytes {
+            try writePrivate(bytes, to: ordinary.appendingPathComponent(name))
+        }
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            let before = posix.snapshotCalls().count
+            XCTAssertEqual(
+                try locked.auditOrdinaryIndexNamespace(
+                    expectedEmptyIndexBytes: Data("different-empty-index".utf8)
+                ),
+                .indexed
+            )
+            assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: slots), indexBytes)
+        XCTAssertTrue(fileManager.fileExists(atPath: blobs.path))
+        for (name, bytes) in namesAndBytes {
+            XCTAssertEqual(try Data(contentsOf: ordinary.appendingPathComponent(name)), bytes)
+        }
+    }
+
+    func testOrdinaryNamespaceAuditIndexedModeRejectsUnknownAndInvalidGenericTempReadOnly() throws {
+        for invalidTemp in [false, true] {
+            let (_, root) = try makeScratch("ordinary-audit-indexed-illegal-\(invalidTemp)")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let slots = ordinary.appendingPathComponent("slots.json")
+            try writePrivate(Data("canonical-index".utf8), to: slots)
+            let protectedURL: URL
+            if invalidTemp {
+                let name = ordinaryEmptyIndexTempName("15151515-1515-1515-1515-151515151515")
+                protectedURL = ordinary.appendingPathComponent(name)
+                try writePrivate(Data("generic-temp".utf8), to: protectedURL)
+                XCTAssertEqual(Darwin.chmod(protectedURL.path, 0o644), 0)
+            } else {
+                protectedURL = ordinary.appendingPathComponent("unknown")
+                try writePrivate(Data("unknown".utf8), to: protectedURL)
+            }
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryIndexNamespace(
+                        expectedEmptyIndexBytes: Data("empty-index".utf8)
+                    )
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            XCTAssertTrue(fileManager.fileExists(atPath: protectedURL.path))
+            XCTAssertEqual(try Data(contentsOf: slots), Data("canonical-index".utf8))
+        }
+    }
+
+    func testOrdinaryNamespaceAuditFinalEnumerationRejectsLateAppearance() throws {
+        let (_, root) = try makeScratch("ordinary-audit-late-appearance")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let appeared = ordinary.appendingPathComponent("unknown")
+        let posix = RecordingNativePOSIX(
+            afterDirectoryEntriesPath: "ordinary",
+            afterDirectoryEntriesOccurrence: 1,
+            afterDirectoryEntriesAction: {
+                try writePrivateForFault(Data("appeared".utf8), to: appeared)
+            }
+        )
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(
+                try locked.auditOrdinaryIndexNamespace(
+                    expectedEmptyIndexBytes: Data("empty-index".utf8)
+                )
+            )
+            assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+        }
+        XCTAssertEqual(try Data(contentsOf: appeared), Data("appeared".utf8))
+    }
+
+    func testOrdinaryNamespaceAuditFinalRereadRejectsTempDisappearanceAndIndexReplacement() throws {
+        do {
+            let (base, root) = try makeScratch("ordinary-audit-temp-disappearance")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let expected = Data("empty-index".utf8)
+            let name = ordinaryEmptyIndexTempName("16161616-1616-1616-1616-161616161616")
+            let temp = ordinary.appendingPathComponent(name)
+            let detached = base.appendingPathComponent("detached-temp")
+            try writePrivate(expected, to: temp)
+            let posix = RecordingNativePOSIX(
+                afterPositiveReadOfPathPrefix: name,
+                afterPositiveReadOccurrence: 2,
+                afterPositiveReadAction: {
+                    try FileManager.default.moveItem(at: temp, to: detached)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryIndexNamespace(expectedEmptyIndexBytes: expected)
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            XCTAssertEqual(try Data(contentsOf: detached), expected)
+        }
+
+        do {
+            let (base, root) = try makeScratch("ordinary-audit-index-replacement")
+            let ordinary = try makeIndexlessOrdinary(in: root)
+            let slots = ordinary.appendingPathComponent("slots.json")
+            let detached = base.appendingPathComponent("detached-slots")
+            let original = Data("canonical-index".utf8)
+            let replacement = Data("replacement-index".utf8)
+            try writePrivate(original, to: slots)
+            let posix = RecordingNativePOSIX(
+                afterPositiveReadOfPathPrefix: "slots.json",
+                afterPositiveReadOccurrence: 2,
+                afterPositiveReadAction: {
+                    try FileManager.default.moveItem(at: slots, to: detached)
+                    try writePrivateForFault(replacement, to: slots)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryIndexNamespace(
+                        expectedEmptyIndexBytes: Data("empty-index".utf8)
+                    )
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            XCTAssertEqual(try Data(contentsOf: detached), original)
+            XCTAssertEqual(try Data(contentsOf: slots), replacement)
+        }
+    }
+
+    func testOrdinaryBlobNamespaceAuditPreservesCrashTempsAndReturnsOnlyCanonicalBlobs() throws {
+        let (_, root) = try makeScratch("ordinary-blob-audit-valid-temps")
+        let blobs = try makeOrdinaryBlobs(in: root)
+        try writePrivate(
+            Data("canonical-index".utf8),
+            to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+        )
+        let sourceBytes = Data("verified-current-primary-source".utf8)
+        try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+        let blobBytes = Data("committed-generation".utf8)
+        let blobName = "\(hash(blobBytes)).json"
+        try writePrivate(blobBytes, to: blobs.appendingPathComponent(blobName))
+        let namesAndBytes = [
+            (ordinaryEmptyIndexTempName("21212121-2121-2121-2121-212121212121"), Data()),
+            (
+                ordinaryEmptyIndexTempName("22222222-2222-2222-2222-222222222222"),
+                Data(sourceBytes.prefix(sourceBytes.count / 2))
+            ),
+            (ordinaryEmptyIndexTempName("23232323-2323-2323-2323-232323232323"), sourceBytes),
+        ]
+        var identities: [String: (UInt64, UInt64)] = [:]
+        for (name, bytes) in namesAndBytes {
+            let url = blobs.appendingPathComponent(name)
+            try writePrivate(bytes, to: url)
+            var value = stat()
+            XCTAssertEqual(Darwin.lstat(url.path, &value), 0)
+            identities[name] = (UInt64(value.st_dev), UInt64(value.st_ino))
+        }
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            let proof = try locked.verifyPrimarySource(expectedSource: .sha256(hash(sourceBytes)))
+            let before = posix.snapshotCalls().count
+            XCTAssertEqual(
+                try locked.auditOrdinaryBlobNamespace(
+                    expectedSourceBytes: sourceBytes,
+                    sourceProof: proof
+                ),
+                NativeOrdinaryBlobNamespaceAudit(
+                    blobNames: [blobName],
+                    validatedTempCount: 3
+                )
+            )
+            assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: blobs.appendingPathComponent(blobName)), blobBytes)
+        for (name, bytes) in namesAndBytes {
+            let url = blobs.appendingPathComponent(name)
+            XCTAssertEqual(try Data(contentsOf: url), bytes)
+            var value = stat()
+            XCTAssertEqual(Darwin.lstat(url.path, &value), 0)
+            XCTAssertEqual(identities[name]?.0, UInt64(value.st_dev))
+            XCTAssertEqual(identities[name]?.1, UInt64(value.st_ino))
+        }
+    }
+
+    func testOrdinaryBlobNamespaceAuditRejectsEveryInvalidCrashTempAndMissingSource() throws {
+        enum Fixture: CaseIterable {
+            case malformedName, altered, overlong, wrongMode, hardLinked
+            case wrongOwner, acl, symbolicLink, directory, missingSource
+        }
+
+        let sourceBytes = Data("verified-current-primary-source".utf8)
+        let canonicalName = ordinaryEmptyIndexTempName("24242424-2424-2424-2424-242424242424")
+        for fixture in Fixture.allCases {
+            let (base, root) = try makeScratch("ordinary-blob-audit-invalid-\(fixture)")
+            let blobs = try makeOrdinaryBlobs(in: root)
+            try writePrivate(
+                Data("canonical-index".utf8),
+                to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+            )
+            if fixture != .missingSource {
+                try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+            }
+            let name = fixture == .malformedName
+                ? ".AssetTracker.tmp.24242424-2424-2424-2424-24242424242A"
+                : canonicalName
+            let protectedURL = blobs.appendingPathComponent(name)
+            var posix = RecordingNativePOSIX()
+
+            switch fixture {
+            case .malformedName:
+                try writePrivate(sourceBytes, to: protectedURL)
+            case .altered:
+                try writePrivate(Data("X".utf8) + Data(sourceBytes.dropFirst()), to: protectedURL)
+            case .overlong:
+                try writePrivate(sourceBytes + Data("x".utf8), to: protectedURL)
+            case .wrongMode:
+                try writePrivate(sourceBytes, to: protectedURL)
+                XCTAssertEqual(Darwin.chmod(protectedURL.path, 0o644), 0)
+            case .hardLinked:
+                try writePrivate(sourceBytes, to: protectedURL)
+                try fileManager.linkItem(
+                    at: protectedURL,
+                    to: base.appendingPathComponent("second-link")
+                )
+            case .wrongOwner:
+                try writePrivate(sourceBytes, to: protectedURL)
+                posix = RecordingNativePOSIX(wrongOwnerPath: canonicalName)
+            case .acl:
+                try writePrivate(sourceBytes, to: protectedURL)
+                try addACL("user:\(NSUserName()) allow read", to: protectedURL)
+            case .symbolicLink:
+                let target = base.appendingPathComponent("target")
+                try writePrivate(sourceBytes, to: target)
+                try fileManager.createSymbolicLink(at: protectedURL, withDestinationURL: target)
+            case .directory:
+                try makeDirectory(protectedURL)
+            case .missingSource:
+                try writePrivate(sourceBytes, to: protectedURL)
+            }
+
+            var beforeStat = stat()
+            XCTAssertEqual(Darwin.lstat(protectedURL.path, &beforeStat), 0)
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            try writer.withExclusiveMutationLock { locked in
+                let expectedSource: ExpectedBookSource = fixture == .missingSource
+                    ? .missing
+                    : .sha256(hash(sourceBytes))
+                let proof = try locked.verifyPrimarySource(expectedSource: expectedSource)
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryBlobNamespace(
+                        expectedSourceBytes: fixture == .missingSource ? nil : sourceBytes,
+                        sourceProof: proof
+                    ),
+                    "fixture=\(fixture)"
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            var afterStat = stat()
+            XCTAssertEqual(Darwin.lstat(protectedURL.path, &afterStat), 0)
+            XCTAssertEqual(UInt64(beforeStat.st_dev), UInt64(afterStat.st_dev), "fixture=\(fixture)")
+            XCTAssertEqual(UInt64(beforeStat.st_ino), UInt64(afterStat.st_ino), "fixture=\(fixture)")
+        }
+    }
+
+    func testOrdinaryBlobNamespaceAuditRejectsLateTempAppearanceAndTempReplacementReadOnly() throws {
+        do {
+            let (_, root) = try makeScratch("ordinary-blob-audit-late-appearance")
+            let blobs = try makeOrdinaryBlobs(in: root)
+            try writePrivate(
+                Data("canonical-index".utf8),
+                to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+            )
+            let sourceBytes = Data("verified-source".utf8)
+            try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+            let appeared = blobs.appendingPathComponent("unknown-late-entry")
+            let posix = RecordingNativePOSIX(
+                afterDirectoryEntriesPath: "blobs",
+                afterDirectoryEntriesOccurrence: 1,
+                afterDirectoryEntriesAction: {
+                    try writePrivateForFault(Data("late".utf8), to: appeared)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let proof = try locked.verifyPrimarySource(expectedSource: .sha256(hash(sourceBytes)))
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryBlobNamespace(
+                        expectedSourceBytes: sourceBytes,
+                        sourceProof: proof
+                    )
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            XCTAssertEqual(try Data(contentsOf: appeared), Data("late".utf8))
+        }
+
+        do {
+            let (base, root) = try makeScratch("ordinary-blob-audit-temp-replacement")
+            let blobs = try makeOrdinaryBlobs(in: root)
+            try writePrivate(
+                Data("canonical-index".utf8),
+                to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+            )
+            let sourceBytes = Data("verified-source".utf8)
+            try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+            let name = ordinaryEmptyIndexTempName("25252525-2525-2525-2525-252525252525")
+            let temp = blobs.appendingPathComponent(name)
+            let detached = base.appendingPathComponent("detached-temp")
+            let replacement = Data(sourceBytes.prefix(1))
+            try writePrivate(sourceBytes, to: temp)
+            let posix = RecordingNativePOSIX(
+                afterPositiveReadOfPathPrefix: name,
+                afterPositiveReadOccurrence: 2,
+                afterPositiveReadAction: {
+                    try FileManager.default.moveItem(at: temp, to: detached)
+                    try writePrivateForFault(replacement, to: temp)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let proof = try locked.verifyPrimarySource(expectedSource: .sha256(hash(sourceBytes)))
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryBlobNamespace(
+                        expectedSourceBytes: sourceBytes,
+                        sourceProof: proof
+                    )
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            XCTAssertEqual(try Data(contentsOf: detached), sourceBytes)
+            XCTAssertEqual(try Data(contentsOf: temp), replacement)
+        }
+
+        do {
+            let (base, root) = try makeScratch("ordinary-blob-audit-source-replacement")
+            let blobs = try makeOrdinaryBlobs(in: root)
+            try writePrivate(
+                Data("canonical-index".utf8),
+                to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+            )
+            let sourceBytes = Data("verified-source".utf8)
+            let primary = root.appendingPathComponent("AssetTrackerBook.json")
+            let detached = base.appendingPathComponent("detached-primary")
+            let replacement = Data("replacement-primary".utf8)
+            try writePrivate(sourceBytes, to: primary)
+            let name = ordinaryEmptyIndexTempName("32323232-3232-3232-3232-323232323232")
+            let temp = blobs.appendingPathComponent(name)
+            try writePrivate(sourceBytes, to: temp)
+            let posix = RecordingNativePOSIX(
+                afterDirectoryEntriesPath: "blobs",
+                afterDirectoryEntriesOccurrence: 2,
+                afterDirectoryEntriesAction: {
+                    try FileManager.default.moveItem(at: primary, to: detached)
+                    try writePrivateForFault(replacement, to: primary)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let proof = try locked.verifyPrimarySource(expectedSource: .sha256(hash(sourceBytes)))
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.auditOrdinaryBlobNamespace(
+                        expectedSourceBytes: sourceBytes,
+                        sourceProof: proof
+                    )
+                )
+                assertReadOnlyWriterCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            }
+            XCTAssertEqual(try Data(contentsOf: detached), sourceBytes)
+            XCTAssertEqual(try Data(contentsOf: primary), replacement)
+            XCTAssertEqual(try Data(contentsOf: temp), sourceBytes)
+        }
+    }
+
+    func testOrdinaryBlobCrashTempCleanupDeletesOnlyValidatedTempsAndSyncsBlobDirectory() throws {
+        let (_, root) = try makeScratch("ordinary-blob-cleanup-valid")
+        let blobs = try makeOrdinaryBlobs(in: root)
+        try writePrivate(
+            Data("canonical-index".utf8),
+            to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+        )
+        let sourceBytes = Data("verified-current-primary-source".utf8)
+        try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+        let blobBytes = Data("canonical-blob".utf8)
+        let blob = blobs.appendingPathComponent("\(hash(blobBytes)).json")
+        try writePrivate(blobBytes, to: blob)
+        let unknownBytes = Data("unknown-preserved".utf8)
+        let unknown = blobs.appendingPathComponent("unknown-sentinel")
+        try writePrivate(unknownBytes, to: unknown)
+        let namesAndBytes = [
+            (ordinaryEmptyIndexTempName("26262626-2626-2626-2626-262626262626"), Data()),
+            (
+                ordinaryEmptyIndexTempName("27272727-2727-2727-2727-272727272727"),
+                Data(sourceBytes.prefix(sourceBytes.count / 2))
+            ),
+            (ordinaryEmptyIndexTempName("28282828-2828-2828-2828-282828282828"), sourceBytes),
+        ]
+        for (name, bytes) in namesAndBytes {
+            try writePrivate(bytes, to: blobs.appendingPathComponent(name))
+        }
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        try writer.withExclusiveMutationLock { locked in
+            let proof = try locked.verifyPrimarySource(expectedSource: .sha256(hash(sourceBytes)))
+            let before = posix.snapshotCalls().count
+            try locked.cleanupOrdinaryBlobCrashTemps(
+                expectedSourceBytes: sourceBytes,
+                sourceProof: proof
+            )
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            XCTAssertEqual(calls.filter { $0.hasPrefix("syncDirectory:") }.count, 1)
+            for (name, _) in namesAndBytes {
+                XCTAssertEqual(calls.filter { $0 == "unlinkAt:\(name)" }.count, 1)
+            }
+            XCTAssertFalse(calls.contains("unlinkAt:\(blob.lastPathComponent)"))
+            XCTAssertFalse(calls.contains("unlinkAt:unknown-sentinel"))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: blob), blobBytes)
+        XCTAssertEqual(try Data(contentsOf: unknown), unknownBytes)
+        for (name, _) in namesAndBytes {
+            XCTAssertFalse(fileManager.fileExists(atPath: blobs.appendingPathComponent(name).path))
+        }
+    }
+
+    func testOrdinaryBlobCrashTempCleanupFailsClosedAndPreservesInvalidOrRacedTemps() throws {
+        enum Fixture: CaseIterable {
+            case malformedName, altered, wrongMode, symbolicLink, directory, missingSource
+        }
+
+        let sourceBytes = Data("verified-current-primary-source".utf8)
+        let canonicalName = ordinaryEmptyIndexTempName("29292929-2929-2929-2929-292929292929")
+        for fixture in Fixture.allCases {
+            let (base, root) = try makeScratch("ordinary-blob-cleanup-invalid-\(fixture)")
+            let blobs = try makeOrdinaryBlobs(in: root)
+            try writePrivate(
+                Data("canonical-index".utf8),
+                to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+            )
+            if fixture != .missingSource {
+                try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+            }
+            let name = fixture == .malformedName
+                ? ".AssetTracker.tmp.29292929-2929-2929-2929-29292929292A"
+                : canonicalName
+            let protectedURL = blobs.appendingPathComponent(name)
+            switch fixture {
+            case .malformedName:
+                try writePrivate(sourceBytes, to: protectedURL)
+            case .altered:
+                try writePrivate(Data("altered".utf8), to: protectedURL)
+            case .wrongMode:
+                try writePrivate(sourceBytes, to: protectedURL)
+                XCTAssertEqual(Darwin.chmod(protectedURL.path, 0o644), 0)
+            case .symbolicLink:
+                let target = base.appendingPathComponent("target")
+                try writePrivate(sourceBytes, to: target)
+                try fileManager.createSymbolicLink(at: protectedURL, withDestinationURL: target)
+            case .directory:
+                try makeDirectory(protectedURL)
+            case .missingSource:
+                try writePrivate(sourceBytes, to: protectedURL)
+            }
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let expectedSource: ExpectedBookSource = fixture == .missingSource
+                    ? .missing
+                    : .sha256(hash(sourceBytes))
+                let proof = try locked.verifyPrimarySource(expectedSource: expectedSource)
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.cleanupOrdinaryBlobCrashTemps(
+                        expectedSourceBytes: fixture == .missingSource ? nil : sourceBytes,
+                        sourceProof: proof
+                    ),
+                    "fixture=\(fixture)"
+                )
+                XCTAssertFalse(
+                    posix.snapshotCalls().dropFirst(before).contains { $0.hasPrefix("unlinkAt:") },
+                    "fixture=\(fixture)"
+                )
+            }
+            XCTAssertTrue(fileManager.fileExists(atPath: protectedURL.path), "fixture=\(fixture)")
+        }
+
+        do {
+            let (base, root) = try makeScratch("ordinary-blob-cleanup-source-replacement")
+            let blobs = try makeOrdinaryBlobs(in: root)
+            try writePrivate(
+                Data("canonical-index".utf8),
+                to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+            )
+            let sourceBytes = Data("verified-source".utf8)
+            let primary = root.appendingPathComponent("AssetTrackerBook.json")
+            let detached = base.appendingPathComponent("detached-primary")
+            let replacement = Data("replacement-primary".utf8)
+            try writePrivate(sourceBytes, to: primary)
+            let name = ordinaryEmptyIndexTempName("33333333-3333-3333-3333-333333333333")
+            let temp = blobs.appendingPathComponent(name)
+            try writePrivate(sourceBytes, to: temp)
+            let posix = RecordingNativePOSIX(
+                afterPositiveReadOfPathPrefix: "AssetTrackerBook.json",
+                afterPositiveReadOccurrence: 3,
+                afterPositiveReadAction: {
+                    try FileManager.default.moveItem(at: primary, to: detached)
+                    try writePrivateForFault(replacement, to: primary)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let proof = try locked.verifyPrimarySource(expectedSource: .sha256(hash(sourceBytes)))
+                let before = posix.snapshotCalls().count
+                XCTAssertThrowsError(
+                    try locked.cleanupOrdinaryBlobCrashTemps(
+                        expectedSourceBytes: sourceBytes,
+                        sourceProof: proof
+                    )
+                )
+                XCTAssertFalse(
+                    posix.snapshotCalls().dropFirst(before).contains { $0.hasPrefix("unlinkAt:") }
+                )
+            }
+            XCTAssertEqual(try Data(contentsOf: detached), sourceBytes)
+            XCTAssertEqual(try Data(contentsOf: primary), replacement)
+            XCTAssertEqual(try Data(contentsOf: temp), sourceBytes)
+        }
+
+        do {
+            let (base, root) = try makeScratch("ordinary-blob-cleanup-replacement")
+            let blobs = try makeOrdinaryBlobs(in: root)
+            try writePrivate(
+                Data("canonical-index".utf8),
+                to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+            )
+            let sourceBytes = Data("verified-source".utf8)
+            try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+            let name = ordinaryEmptyIndexTempName("30303030-3030-3030-3030-303030303030")
+            let temp = blobs.appendingPathComponent(name)
+            let detached = base.appendingPathComponent("detached-temp")
+            let replacement = Data(sourceBytes.prefix(1))
+            try writePrivate(sourceBytes, to: temp)
+            let posix = RecordingNativePOSIX(
+                afterPositiveReadOfPathPrefix: name,
+                afterPositiveReadOccurrence: 2,
+                afterPositiveReadAction: {
+                    try FileManager.default.moveItem(at: temp, to: detached)
+                    try writePrivateForFault(replacement, to: temp)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let proof = try locked.verifyPrimarySource(expectedSource: .sha256(hash(sourceBytes)))
+                XCTAssertThrowsError(
+                    try locked.cleanupOrdinaryBlobCrashTemps(
+                        expectedSourceBytes: sourceBytes,
+                        sourceProof: proof
+                    )
+                )
+            }
+            XCTAssertEqual(try Data(contentsOf: detached), sourceBytes)
+            XCTAssertEqual(try Data(contentsOf: temp), replacement)
+        }
+
+        do {
+            let (_, root) = try makeScratch("ordinary-blob-cleanup-name-reappearance")
+            let blobs = try makeOrdinaryBlobs(in: root)
+            try writePrivate(
+                Data("canonical-index".utf8),
+                to: blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+            )
+            let sourceBytes = Data("verified-source".utf8)
+            try writePrivate(sourceBytes, to: root.appendingPathComponent("AssetTrackerBook.json"))
+            let name = ordinaryEmptyIndexTempName("31313131-3131-3131-3131-313131313131")
+            let temp = blobs.appendingPathComponent(name)
+            let replacement = Data(sourceBytes.prefix(1))
+            try writePrivate(sourceBytes, to: temp)
+            let posix = RecordingNativePOSIX(
+                afterSyncDirectoryPath: "blobs",
+                afterSyncDirectoryAction: {
+                    try writePrivateForFault(replacement, to: temp)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            try writer.withExclusiveMutationLock { locked in
+                let proof = try locked.verifyPrimarySource(expectedSource: .sha256(hash(sourceBytes)))
+                XCTAssertThrowsError(
+                    try locked.cleanupOrdinaryBlobCrashTemps(
+                        expectedSourceBytes: sourceBytes,
+                        sourceProof: proof
+                    )
+                )
+            }
+            XCTAssertEqual(try Data(contentsOf: temp), replacement)
+        }
+    }
+
+    func testReadOnlyAuditProvesAbsentRootWithoutCreatingOrChangingAnything() throws {
+        let (base, root) = try makeScratch("read-only-root-absent")
+        try fileManager.removeItem(at: root)
+        let sibling = base.appendingPathComponent("sibling")
+        let siblingBytes = Data("untouched".utf8)
+        try writePrivate(siblingBytes, to: sibling)
+        let parentEntriesBefore = try fileManager.contentsOfDirectory(atPath: base.path).sorted()
+        var siblingBefore = stat()
+        XCTAssertEqual(Darwin.lstat(sibling.path, &siblingBefore), 0)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        let before = posix.snapshotCalls().count
+        let result: Bool? = try writer.withReadOnlyAudit { _ in
+            XCTFail("absent roots must not expose a read context")
+            return true
+        }
+        XCTAssertNil(result)
+        let calls = Array(posix.snapshotCalls().dropFirst(before))
+        assertZeroWriteAuditCalls(calls)
+        XCTAssertEqual(calls.filter { $0 == "fstatAt:\(root.lastPathComponent):true" }.count, 2)
+        XCTAssertFalse(fileManager.fileExists(atPath: root.path))
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: base.path).sorted(), parentEntriesBefore)
+        XCTAssertEqual(try Data(contentsOf: sibling), siblingBytes)
+        var siblingAfter = stat()
+        XCTAssertEqual(Darwin.lstat(sibling.path, &siblingAfter), 0)
+        XCTAssertEqual(UInt64(siblingBefore.st_dev), UInt64(siblingAfter.st_dev))
+        XCTAssertEqual(UInt64(siblingBefore.st_ino), UInt64(siblingAfter.st_ino))
+    }
+
+    func testReadOnlyAuditExposesLegacyRootWithoutLockOrRecoveryAndPreservesItExactly() throws {
+        let (_, root) = try makeScratch("read-only-legacy-unmanaged")
+        XCTAssertEqual(Darwin.chmod(root.path, 0o755), 0)
+        let primary = root.appendingPathComponent("AssetTrackerBook.json")
+        let primaryBytes = Data("legacy-primary".utf8)
+        try writePrivate(primaryBytes, to: primary)
+        let entriesBefore = try fileManager.contentsOfDirectory(atPath: root.path).sorted()
+        var rootBefore = stat()
+        var primaryBefore = stat()
+        XCTAssertEqual(Darwin.lstat(root.path, &rootBefore), 0)
+        XCTAssertEqual(Darwin.lstat(primary.path, &primaryBefore), 0)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        let before = posix.snapshotCalls().count
+        let result = try writer.withReadOnlyAudit { readOnly in
+            XCTAssertEqual(
+                try readOnly.readValidated(relativePath: "AssetTrackerBook.json"),
+                primaryBytes
+            )
+            XCTAssertEqual(
+                try readOnly.auditOrdinaryIndexNamespace(
+                    expectedEmptyIndexBytes: Data("empty-index".utf8)
+                ),
+                .absent
+            )
+            try readOnly.revalidateCanonicalIdentity()
+            return "legacy"
+        }
+        XCTAssertEqual(result, "legacy")
+        assertZeroWriteAuditCalls(Array(posix.snapshotCalls().dropFirst(before)))
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: root.path).sorted(), entriesBefore)
+        XCTAssertFalse(
+            fileManager.fileExists(atPath: root.appendingPathComponent(".AssetTracker.storage.lock").path)
+        )
+        XCTAssertEqual(try permissions(root), 0o755)
+        XCTAssertEqual(try Data(contentsOf: primary), primaryBytes)
+        var rootAfter = stat()
+        var primaryAfter = stat()
+        XCTAssertEqual(Darwin.lstat(root.path, &rootAfter), 0)
+        XCTAssertEqual(Darwin.lstat(primary.path, &primaryAfter), 0)
+        XCTAssertEqual(UInt64(rootBefore.st_ino), UInt64(rootAfter.st_ino))
+        XCTAssertEqual(UInt64(primaryBefore.st_ino), UInt64(primaryAfter.st_ino))
+    }
+
+    func testReadOnlyAuditWithoutLockAuditsExistingStrictRecoveryAndCreatesNoLock() throws {
+        let (_, root) = try makeScratch("read-only-recovery-without-lock")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let slots = ordinary.appendingPathComponent("slots.json")
+        let indexBytes = Data("canonical-index".utf8)
+        try writePrivate(indexBytes, to: slots)
+        let entriesBefore = try fileManager.contentsOfDirectory(atPath: root.path).sorted()
+        let ordinaryEntriesBefore = try fileManager.contentsOfDirectory(atPath: ordinary.path).sorted()
+        var slotsBefore = stat()
+        XCTAssertEqual(Darwin.lstat(slots.path, &slotsBefore), 0)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        let before = posix.snapshotCalls().count
+        let result = try writer.withReadOnlyAudit { readOnly in
+            XCTAssertEqual(
+                try readOnly.auditOrdinaryIndexNamespace(
+                    expectedEmptyIndexBytes: Data("different-empty-index".utf8)
+                ),
+                .indexed
+            )
+            return "healthy"
+        }
+        XCTAssertEqual(result, "healthy")
+        assertZeroWriteAuditCalls(Array(posix.snapshotCalls().dropFirst(before)))
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: root.path).sorted(), entriesBefore)
+        XCTAssertEqual(
+            try fileManager.contentsOfDirectory(atPath: ordinary.path).sorted(),
+            ordinaryEntriesBefore
+        )
+        XCTAssertFalse(
+            fileManager.fileExists(atPath: root.appendingPathComponent(".AssetTracker.storage.lock").path)
+        )
+        XCTAssertEqual(try Data(contentsOf: slots), indexBytes)
+        var slotsAfter = stat()
+        XCTAssertEqual(Darwin.lstat(slots.path, &slotsAfter), 0)
+        XCTAssertEqual(UInt64(slotsBefore.st_ino), UInt64(slotsAfter.st_ino))
+    }
+
+    func testReadOnlyAuditWithoutLockRejectsUnknownManagedEntryAndPreservesIt() throws {
+        let (_, root) = try makeScratch("read-only-recovery-unknown-without-lock")
+        let ordinary = try makeIndexlessOrdinary(in: root)
+        let unknown = ordinary.appendingPathComponent("unknown")
+        let unknownBytes = Data("preserve".utf8)
+        try writePrivate(unknownBytes, to: unknown)
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        let before = posix.snapshotCalls().count
+        XCTAssertThrowsError(
+            try writer.withReadOnlyAudit { readOnly in
+                try readOnly.auditOrdinaryIndexNamespace(
+                    expectedEmptyIndexBytes: Data("empty-index".utf8)
+                )
+            }
+        )
+        assertZeroWriteAuditCalls(Array(posix.snapshotCalls().dropFirst(before)))
+        XCTAssertEqual(try Data(contentsOf: unknown), unknownBytes)
+        XCTAssertFalse(
+            fileManager.fileExists(atPath: root.appendingPathComponent(".AssetTracker.storage.lock").path)
+        )
+    }
+
+    func testReadOnlyAuditUsesSharedLockAndExposesOnlyReadPrimitivesWithoutMutation() throws {
+        let (_, root) = try makeScratch("read-only-managed")
+        let lock = root.appendingPathComponent(".AssetTracker.storage.lock")
+        try writePrivate(Data(), to: lock)
+        let blobs = try makeOrdinaryBlobs(in: root)
+        let slots = blobs.deletingLastPathComponent().appendingPathComponent("slots.json")
+        let indexBytes = Data("canonical-index".utf8)
+        try writePrivate(indexBytes, to: slots)
+        let sourceBytes = Data("verified-current-primary".utf8)
+        let primary = root.appendingPathComponent("AssetTrackerBook.json")
+        try writePrivate(sourceBytes, to: primary)
+        let entriesBefore = try fileManager.contentsOfDirectory(atPath: root.path).sorted()
+        let ordinaryEntriesBefore = try fileManager.contentsOfDirectory(
+            atPath: blobs.deletingLastPathComponent().path
+        ).sorted()
+        var identitiesBefore: [String: UInt64] = [:]
+        for url in [root, lock, primary, slots, blobs] {
+            var value = stat()
+            XCTAssertEqual(Darwin.lstat(url.path, &value), 0)
+            identitiesBefore[url.path] = UInt64(value.st_ino)
+        }
+        let posix = RecordingNativePOSIX()
+        let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+        let before = posix.snapshotCalls().count
+        let result = try writer.withReadOnlyAudit { readOnly in
+            XCTAssertEqual(
+                try readOnly.readValidated(relativePath: "AssetTrackerBook.json"),
+                sourceBytes
+            )
+            let proof = try readOnly.verifyPrimarySource(
+                expectedSource: .sha256(hash(sourceBytes))
+            )
+            XCTAssertEqual(
+                try readOnly.enumerateIfPresent(relativePath: "Recovery/ordinary")?.map(\.name),
+                ["blobs", "slots.json"]
+            )
+            XCTAssertEqual(
+                try readOnly.auditOrdinaryIndexNamespace(
+                    expectedEmptyIndexBytes: Data("different-empty-index".utf8)
+                ),
+                .indexed
+            )
+            XCTAssertEqual(
+                try readOnly.auditOrdinaryBlobNamespace(
+                    expectedSourceBytes: sourceBytes,
+                    sourceProof: proof
+                ),
+                NativeOrdinaryBlobNamespaceAudit(blobNames: [], validatedTempCount: 0)
+            )
+            try readOnly.revalidateCanonicalIdentity()
+            return "audited"
+        }
+        XCTAssertEqual(result, "audited")
+        let calls = Array(posix.snapshotCalls().dropFirst(before))
+        assertZeroWriteAuditCalls(calls)
+        XCTAssertTrue(calls.contains { call in
+            call.hasPrefix("flock:") && call.hasSuffix(":\(LOCK_SH)")
+        })
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: root.path).sorted(), entriesBefore)
+        XCTAssertEqual(
+            try fileManager.contentsOfDirectory(atPath: blobs.deletingLastPathComponent().path).sorted(),
+            ordinaryEntriesBefore
+        )
+        XCTAssertEqual(try Data(contentsOf: primary), sourceBytes)
+        XCTAssertEqual(try Data(contentsOf: slots), indexBytes)
+        for url in [root, lock, primary, slots, blobs] {
+            var value = stat()
+            XCTAssertEqual(Darwin.lstat(url.path, &value), 0)
+            XCTAssertEqual(identitiesBefore[url.path], UInt64(value.st_ino))
+        }
+    }
+
+    func testReadOnlyAuditRejectsRootLockAndRecoveryAbsenceRacesWithoutMutation() throws {
+        do {
+            let (_, root) = try makeScratch("read-only-root-appearance")
+            try fileManager.removeItem(at: root)
+            let posix = RecordingNativePOSIX(
+                beforeFstatAtPath: root.lastPathComponent,
+                beforeFstatAtOccurrence: 2,
+                beforeFstatAtAction: {
+                    try FileManager.default.createDirectory(
+                        at: root,
+                        withIntermediateDirectories: false
+                    )
+                    guard Darwin.chmod(root.path, 0o700) == 0 else {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(try writer.withReadOnlyAudit { _ in true })
+            assertZeroWriteAuditCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            XCTAssertTrue(fileManager.fileExists(atPath: root.path))
+        }
+
+        for appearingName in ["Recovery", ".AssetTracker.storage.lock"] {
+            let (_, root) = try makeScratch("read-only-child-appearance-\(appearingName)")
+            let appeared = root.appendingPathComponent(
+                appearingName,
+                isDirectory: appearingName == "Recovery"
+            )
+            let posix = RecordingNativePOSIX(
+                beforeFstatAtPath: appearingName,
+                beforeFstatAtOccurrence: 2,
+                beforeFstatAtAction: {
+                    if appearingName == "Recovery" {
+                        try FileManager.default.createDirectory(
+                            at: appeared,
+                            withIntermediateDirectories: false
+                        )
+                        guard Darwin.chmod(appeared.path, 0o700) == 0 else {
+                            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                        }
+                    } else {
+                        try writePrivateForFault(Data(), to: appeared)
+                    }
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(try writer.withReadOnlyAudit { _ in true })
+            assertZeroWriteAuditCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            XCTAssertTrue(fileManager.fileExists(atPath: appeared.path))
+        }
+    }
+
+    func testReadOnlyAuditRejectsCanonicalRootOrLockIdentityReplacement() throws {
+        do {
+            let (base, root) = try makeScratch("read-only-root-replacement")
+            let detached = base.appendingPathComponent("detached-root")
+            let posix = RecordingNativePOSIX(
+                beforeFstatAtPath: root.lastPathComponent,
+                beforeFstatAtOccurrence: 2,
+                beforeFstatAtAction: {
+                    try swapDirectoryForFault(canonical: root, detached: detached)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(try writer.withReadOnlyAudit { _ in true })
+            assertZeroWriteAuditCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            XCTAssertTrue(fileManager.fileExists(atPath: detached.path))
+            XCTAssertTrue(fileManager.fileExists(atPath: root.path))
+        }
+
+        do {
+            let (base, root) = try makeScratch("read-only-lock-replacement")
+            let lock = root.appendingPathComponent(".AssetTracker.storage.lock")
+            let detached = base.appendingPathComponent("detached-lock")
+            try writePrivate(Data(), to: lock)
+            let posix = RecordingNativePOSIX(
+                beforeFstatAtPath: ".AssetTracker.storage.lock",
+                beforeFstatAtOccurrence: 2,
+                beforeFstatAtAction: {
+                    try FileManager.default.moveItem(at: lock, to: detached)
+                    try writePrivateForFault(Data(), to: lock)
+                }
+            )
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(try writer.withReadOnlyAudit { _ in true })
+            assertZeroWriteAuditCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            XCTAssertTrue(fileManager.fileExists(atPath: detached.path))
+            XCTAssertTrue(fileManager.fileExists(atPath: lock.path))
+        }
+    }
+
+    func testReadOnlyAuditRejectsEveryInvalidCanonicalLockWithoutRepairingIt() throws {
+        enum Fixture: CaseIterable {
+            case directory, symbolicLink, wrongMode, hardLinked, wrongOwner, acl
+        }
+
+        for fixture in Fixture.allCases {
+            let (base, root) = try makeScratch("read-only-invalid-lock-\(fixture)")
+            let lock = root.appendingPathComponent(".AssetTracker.storage.lock")
+            var posix = RecordingNativePOSIX()
+            switch fixture {
+            case .directory:
+                try makeDirectory(lock)
+            case .symbolicLink:
+                let target = base.appendingPathComponent("target")
+                try writePrivate(Data(), to: target)
+                try fileManager.createSymbolicLink(at: lock, withDestinationURL: target)
+            case .wrongMode:
+                try writePrivate(Data(), to: lock)
+                XCTAssertEqual(Darwin.chmod(lock.path, 0o644), 0)
+            case .hardLinked:
+                try writePrivate(Data(), to: lock)
+                try fileManager.linkItem(at: lock, to: base.appendingPathComponent("second-link"))
+            case .wrongOwner:
+                try writePrivate(Data(), to: lock)
+                posix = RecordingNativePOSIX(wrongOwnerPath: ".AssetTracker.storage.lock")
+            case .acl:
+                try writePrivate(Data(), to: lock)
+                try addACL("user:\(NSUserName()) allow read", to: lock)
+            }
+            var beforeStat = stat()
+            XCTAssertEqual(Darwin.lstat(lock.path, &beforeStat), 0)
+            let entriesBefore = try fileManager.contentsOfDirectory(atPath: root.path).sorted()
+            let writer = NativeDurableFileWriter(rootURL: root, posix: posix, faultHandler: { _ in })
+
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(
+                try writer.withReadOnlyAudit { _ in true },
+                "fixture=\(fixture)"
+            )
+            assertZeroWriteAuditCalls(Array(posix.snapshotCalls().dropFirst(before)))
+            XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: root.path).sorted(), entriesBefore)
+            var afterStat = stat()
+            XCTAssertEqual(Darwin.lstat(lock.path, &afterStat), 0)
+            XCTAssertEqual(UInt64(beforeStat.st_dev), UInt64(afterStat.st_dev), "fixture=\(fixture)")
+            XCTAssertEqual(UInt64(beforeStat.st_ino), UInt64(afterStat.st_ino), "fixture=\(fixture)")
+        }
+    }
+
+    func testReadOnlyAuditRejectsFIFOCanonicalLockPromptlyWithoutMutation() throws {
+        let childMarker = "ASSET_TRACKER_FIFO_LOCK_CHILD"
+        let childRootKey = "ASSET_TRACKER_FIFO_LOCK_ROOT"
+        let lockName = ".AssetTracker.storage.lock"
+
+        if ProcessInfo.processInfo.environment[childMarker] == "1" {
+            let rootPath = try XCTUnwrap(ProcessInfo.processInfo.environment[childRootKey])
+            let root = URL(fileURLWithPath: rootPath, isDirectory: true)
+            let lock = root.appendingPathComponent(lockName)
+            var beforeStat = stat()
+            XCTAssertEqual(Darwin.lstat(lock.path, &beforeStat), 0)
+            XCTAssertEqual(beforeStat.st_mode & mode_t(S_IFMT), mode_t(S_IFIFO))
+            let posix = RecordingNativePOSIX()
+            let writer = NativeDurableFileWriter(
+                rootURL: root,
+                posix: posix,
+                faultHandler: { _ in }
+            )
+
+            let before = posix.snapshotCalls().count
+            XCTAssertThrowsError(try writer.withReadOnlyAudit { _ in true })
+            let calls = Array(posix.snapshotCalls().dropFirst(before))
+            let lockOpen = try XCTUnwrap(
+                calls.first { $0.hasPrefix("openAt:\(lockName):") }
+            )
+            let flags = try XCTUnwrap(Int32(lockOpen.split(separator: ":").last ?? ""))
+            XCTAssertNotEqual(flags & O_NONBLOCK, 0)
+            assertZeroWriteAuditCalls(calls)
+
+            var afterStat = stat()
+            XCTAssertEqual(Darwin.lstat(lock.path, &afterStat), 0)
+            XCTAssertEqual(afterStat.st_mode & mode_t(S_IFMT), mode_t(S_IFIFO))
+            XCTAssertEqual(UInt64(beforeStat.st_dev), UInt64(afterStat.st_dev))
+            XCTAssertEqual(UInt64(beforeStat.st_ino), UInt64(afterStat.st_ino))
+            return
+        }
+
+        let (_, root) = try makeScratch("read-only-fifo-lock")
+        let lock = root.appendingPathComponent(lockName)
+        XCTAssertEqual(Darwin.mkfifo(lock.path, 0o600), 0)
+        XCTAssertEqual(Darwin.chmod(lock.path, 0o600), 0)
+        let entriesBefore = try fileManager.contentsOfDirectory(atPath: root.path).sorted()
+        var beforeStat = stat()
+        XCTAssertEqual(Darwin.lstat(lock.path, &beforeStat), 0)
+        XCTAssertEqual(beforeStat.st_mode & mode_t(S_IFMT), mode_t(S_IFIFO))
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = [
+            "xctest",
+            "-XCTest",
+            "NativeDurableFileWriterTests/testReadOnlyAuditRejectsFIFOCanonicalLockPromptlyWithoutMutation",
+            Bundle(for: NativeDurableFileWriterTests.self).bundleURL.path,
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment[childMarker] = "1"
+        environment[childRootKey] = root.path
+        process.environment = environment
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+
+        let deadline = Date().addingTimeInterval(1)
+        while process.isRunning, Date() < deadline {
+            Darwin.usleep(10_000)
+        }
+        let timedOut = process.isRunning
+        if timedOut {
+            process.terminate()
+            let terminationDeadline = Date().addingTimeInterval(0.5)
+            while process.isRunning, Date() < terminationDeadline {
+                Darwin.usleep(10_000)
+            }
+            if process.isRunning {
+                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        }
+        process.waitUntilExit()
+        let childOutput = String(
+            data: output.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? "<non-UTF8 child output>"
+
+        XCTAssertFalse(timedOut, "read-only FIFO audit child hung:\n\(childOutput)")
+        if !timedOut {
+            XCTAssertEqual(
+                process.terminationStatus,
+                0,
+                "read-only FIFO audit child failed:\n\(childOutput)"
+            )
+        }
+        XCTAssertEqual(try fileManager.contentsOfDirectory(atPath: root.path).sorted(), entriesBefore)
+        var afterStat = stat()
+        XCTAssertEqual(Darwin.lstat(lock.path, &afterStat), 0)
+        XCTAssertEqual(afterStat.st_mode & mode_t(S_IFMT), mode_t(S_IFIFO))
+        XCTAssertEqual(UInt64(beforeStat.st_dev), UInt64(afterStat.st_dev))
+        XCTAssertEqual(UInt64(beforeStat.st_ino), UInt64(afterStat.st_ino))
     }
 }
 
@@ -1814,6 +5239,12 @@ private final class RecordingNativePOSIX: NativePOSIX, @unchecked Sendable {
     private let beforeFstatAtAction: (@Sendable () throws -> Void)?
     private let afterSyncDirectoryPath: String?
     private let afterSyncDirectoryAction: (@Sendable () throws -> Void)?
+    private let wrongOwnerPath: String?
+    private let afterMissingOpenAtPath: String?
+    private let afterMissingOpenAtAction: (@Sendable () throws -> Void)?
+    private let afterDirectoryEntriesPath: String?
+    private let afterDirectoryEntriesOccurrence: Int
+    private let afterDirectoryEntriesAction: (@Sendable () throws -> Void)?
     private var shouldReportRootMissing = true
     private var shouldLoseRootCreationRace = true
     private var shouldFailLockBootstrap = true
@@ -1826,6 +5257,7 @@ private final class RecordingNativePOSIX: NativePOSIX, @unchecked Sendable {
     private var openedPaths: [Int32: String] = [:]
     private var injectedReadPaths: Set<String> = []
     private var positiveReadMatchCount = 0
+    private var directoryEntriesMatchCount = 0
     private(set) var calls: [String] = []
 
     init(
@@ -1847,7 +5279,13 @@ private final class RecordingNativePOSIX: NativePOSIX, @unchecked Sendable {
         beforeFstatAtOccurrence: Int = 1,
         beforeFstatAtAction: (@Sendable () throws -> Void)? = nil,
         afterSyncDirectoryPath: String? = nil,
-        afterSyncDirectoryAction: (@Sendable () throws -> Void)? = nil
+        afterSyncDirectoryAction: (@Sendable () throws -> Void)? = nil,
+        wrongOwnerPath: String? = nil,
+        afterMissingOpenAtPath: String? = nil,
+        afterMissingOpenAtAction: (@Sendable () throws -> Void)? = nil,
+        afterDirectoryEntriesPath: String? = nil,
+        afterDirectoryEntriesOccurrence: Int = 1,
+        afterDirectoryEntriesAction: (@Sendable () throws -> Void)? = nil
     ) {
         self.writeSteps = writeSteps
         self.overriddenUserID = effectiveUserID
@@ -1868,6 +5306,12 @@ private final class RecordingNativePOSIX: NativePOSIX, @unchecked Sendable {
         self.beforeFstatAtAction = beforeFstatAtAction
         self.afterSyncDirectoryPath = afterSyncDirectoryPath
         self.afterSyncDirectoryAction = afterSyncDirectoryAction
+        self.wrongOwnerPath = wrongOwnerPath
+        self.afterMissingOpenAtPath = afterMissingOpenAtPath
+        self.afterMissingOpenAtAction = afterMissingOpenAtAction
+        self.afterDirectoryEntriesPath = afterDirectoryEntriesPath
+        self.afterDirectoryEntriesOccurrence = afterDirectoryEntriesOccurrence
+        self.afterDirectoryEntriesAction = afterDirectoryEntriesAction
     }
 
     func callCount(prefix: String) -> Int {
@@ -1917,7 +5361,15 @@ private final class RecordingNativePOSIX: NativePOSIX, @unchecked Sendable {
 
     func openAt(directoryFD: Int32, path: String, flags: Int32, mode: mode_t) throws -> Int32 {
         record("openAt:\(path):\(flags)")
-        let result = try base.openAt(directoryFD: directoryFD, path: path, flags: flags, mode: mode)
+        let result: Int32
+        do {
+            result = try base.openAt(directoryFD: directoryFD, path: path, flags: flags, mode: mode)
+        } catch let error as POSIXError where error.code == .ENOENT {
+            if path == afterMissingOpenAtPath {
+                try afterMissingOpenAtAction?()
+            }
+            throw error
+        }
         if path.hasPrefix(".AssetTracker.lock.tmp."), let newLockTempInitialMode {
             try base.changeMode(fileFD: result, mode: newLockTempInitialMode)
         }
@@ -2002,7 +5454,11 @@ private final class RecordingNativePOSIX: NativePOSIX, @unchecked Sendable {
 
     func fstat(fileFD: Int32) throws -> stat {
         record("fstat:\(fileFD)")
-        return try base.fstat(fileFD: fileFD)
+        var value = try base.fstat(fileFD: fileFD)
+        if path(for: fileFD) == wrongOwnerPath {
+            value.st_uid = value.st_uid &+ 1
+        }
+        return value
     }
 
     func syncFile(fileFD: Int32) throws {
@@ -2119,12 +5575,28 @@ private final class RecordingNativePOSIX: NativePOSIX, @unchecked Sendable {
         lock.unlock()
         try action?()
         if reportMissing { throw POSIXError(.ENOENT) }
-        return try base.fstatAt(directoryFD: directoryFD, path: path, noFollow: noFollow)
+        var value = try base.fstatAt(directoryFD: directoryFD, path: path, noFollow: noFollow)
+        if path == wrongOwnerPath {
+            value.st_uid = value.st_uid &+ 1
+        }
+        return value
     }
 
     func directoryEntries(directoryFD: Int32) throws -> [NativeDirectoryEntry] {
         record("directoryEntries:\(directoryFD)")
-        return try base.directoryEntries(directoryFD: directoryFD)
+        let entries = try base.directoryEntries(directoryFD: directoryFD)
+        let currentPath = path(for: directoryFD)
+        var action: (@Sendable () throws -> Void)?
+        lock.lock()
+        if currentPath == afterDirectoryEntriesPath {
+            directoryEntriesMatchCount += 1
+            if directoryEntriesMatchCount == afterDirectoryEntriesOccurrence {
+                action = afterDirectoryEntriesAction
+            }
+        }
+        lock.unlock()
+        try action?()
+        return entries
     }
 
     func extendedACLEntryCount(fileFD: Int32) throws -> Int {

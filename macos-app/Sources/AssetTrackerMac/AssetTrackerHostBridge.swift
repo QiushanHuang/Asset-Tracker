@@ -95,6 +95,8 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
             handleStorageTerminalize(requestID: requestID, payload: payload)
         case "storage.save":
             handleStorageSave(requestID: requestID, payload: payload)
+        case "storage.snapshot":
+            handleStorageSnapshot(requestID: requestID, payload: payload)
         case "file.saveRawBook":
             handleRawBookExport(requestID: requestID, payload: payload)
         default:
@@ -217,28 +219,101 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
 
     private func handleStorageSave(requestID: String, payload: [String: Any]) {
         do {
-            let request = try storageSaveRequest(payload: payload)
+            let request = try AssetTrackerNativeBridgeRequestParser.durableSave(
+                payload: payload
+            )
             try storageCoordinator.startSave(request: request) { [weak self] result in
                 guard let self else { return }
                 switch result {
                 case .success(let saved):
-                    self.sendResponse(
-                        id: requestID,
-                        ok: true,
-                        result: .object([
-                            "ok": .bool(true),
-                            "stateHash": .string(saved.rawHash),
-                            "updatedAt": .string(saved.updatedAt.ISO8601Format()),
-                            "storagePath": .string(saved.storagePath)
-                        ]),
-                        error: nil
-                    )
+                    do {
+                        self.responsePipeline.send(.success(
+                            requestID: requestID,
+                            result: try AssetTrackerNativeBridgeDTOMapper.saveReceipt(saved)
+                        ))
+                    } catch {
+                        self.sendResponse(
+                            id: requestID,
+                            ok: false,
+                            result: nil,
+                            error: error.localizedDescription
+                        )
+                    }
+                case .failure(let proof as NativeDurableSaveErrorProof):
+                    do {
+                        self.responsePipeline.send(try .saveFailure(
+                            requestID: requestID,
+                            proof: proof
+                        ))
+                    } catch {
+                        self.sendResponse(
+                            id: requestID,
+                            ok: false,
+                            result: nil,
+                            error: error.localizedDescription
+                        )
+                    }
                 case .failure(let error):
                     self.sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
                 }
             }
         } catch {
             sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+        }
+    }
+
+    private func handleStorageSnapshot(requestID: String, payload: [String: Any]) {
+        do {
+            let request = try AssetTrackerNativeBridgeRequestParser.snapshot(
+                payload: payload
+            )
+            try storageCoordinator.startSnapshot(request: request) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let receipt):
+                    do {
+                        self.responsePipeline.send(.success(
+                            requestID: requestID,
+                            result: try AssetTrackerNativeBridgeDTOMapper.snapshotReceipt(receipt)
+                        ))
+                    } catch {
+                        self.sendResponse(
+                            id: requestID,
+                            ok: false,
+                            result: nil,
+                            error: error.localizedDescription
+                        )
+                    }
+                case .failure(let proof as NativeSnapshotErrorProof):
+                    do {
+                        self.responsePipeline.send(try .snapshotFailure(
+                            requestID: requestID,
+                            proof: proof
+                        ))
+                    } catch {
+                        self.sendResponse(
+                            id: requestID,
+                            ok: false,
+                            result: nil,
+                            error: error.localizedDescription
+                        )
+                    }
+                case .failure(let error):
+                    self.sendResponse(
+                        id: requestID,
+                        ok: false,
+                        result: nil,
+                        error: error.localizedDescription
+                    )
+                }
+            }
+        } catch {
+            sendResponse(
+                id: requestID,
+                ok: false,
+                result: nil,
+                error: error.localizedDescription
+            )
         }
     }
 
@@ -249,15 +324,20 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
                 guard let self else { return }
                 switch result {
                 case .success(let acknowledgement):
-                    self.sendResponse(
-                        id: requestID,
-                        ok: true,
-                        result: .object([
-                            "ok": .bool(true),
-                            "reason": .string(acknowledgement.reason)
-                        ]),
-                        error: nil
-                    )
+                    do {
+                        self.responsePipeline.send(try .terminalizationSuccess(
+                            requestID: requestID,
+                            request: request,
+                            acknowledgement: acknowledgement
+                        ))
+                    } catch {
+                        self.sendResponse(
+                            id: requestID,
+                            ok: false,
+                            result: nil,
+                            error: error.localizedDescription
+                        )
+                    }
                 case .failure(let error):
                     self.sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
                 }
@@ -281,32 +361,6 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
             loadID: loadID,
             writeSessionToken: try optionalString(payload, key: "writeSessionToken"),
             reason: reason
-        )
-    }
-
-    private func storageSaveRequest(payload: [String: Any]) throws -> AssetTrackerStorageSaveRequest {
-        guard let stateJson = payload["stateJson"] as? String else {
-            throw AssetTrackerBridgeError.invalidPayload("缺少 stateJson")
-        }
-        guard let loadID = payload["loadId"] as? String else {
-            throw AssetTrackerBridgeError.invalidPayload("缺少 loadId")
-        }
-        let protocolVersion = payload["protocolVersion"] as? Int
-        let writeSessionToken = try optionalString(payload, key: "writeSessionToken")
-        let expectedHash = try optionalString(payload, key: "expectedHash")
-        let validatedSourceHash = try optionalString(payload, key: "validatedSourceHash")
-        let authorization = AssetTrackerSaveAuthorization(
-            protocolVersion: protocolVersion,
-            loadID: loadID,
-            writeSessionToken: writeSessionToken,
-            expectedHash: expectedHash,
-            validatedSourceHash: validatedSourceHash
-        )
-        return AssetTrackerStorageSaveRequest(
-            authorization: authorization,
-            stateJson: stateJson,
-            schemaVersion: payload["schemaVersion"] as? Int ?? 1,
-            reason: payload["reason"] as? String ?? "manual"
         )
     }
 

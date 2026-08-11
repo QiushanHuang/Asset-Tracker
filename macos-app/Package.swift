@@ -15,6 +15,10 @@ let package = Package(
         .executable(
             name: "AssetTracker",
             targets: ["AssetTrackerMac"]
+        ),
+        .executable(
+            name: "AssetTrackerFaultHarness",
+            targets: ["AssetTrackerFaultHarness"]
         )
     ],
     targets: [
@@ -26,6 +30,11 @@ let package = Package(
             name: "AssetTrackerMac",
             dependencies: ["AssetTrackerCore"],
             path: "Sources/AssetTrackerMac"
+        ),
+        .executableTarget(
+            name: "AssetTrackerFaultHarness",
+            dependencies: ["AssetTrackerCore"],
+            path: "Sources/AssetTrackerFaultHarness"
         ),
         .testTarget(
             name: "AssetTrackerCoreTests",

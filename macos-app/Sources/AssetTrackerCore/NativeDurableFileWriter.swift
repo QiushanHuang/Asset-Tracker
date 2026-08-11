@@ -127,6 +127,99 @@ enum NativeDirectoryEntryType: Equatable, Sendable {
     case regular, directory, symbolicLink, other
 }
 
+enum NativeOrdinaryIndexNamespaceState: Equatable, Sendable {
+    case absent
+    case indexless(validatedTempCount: Int)
+    case indexed
+}
+
+enum NativeSnapshotIndexNamespaceState: Equatable, Sendable {
+    case absent
+    case indexless(validatedTempCount: Int)
+    case indexed(validatedTempCount: Int)
+}
+
+struct NativeOrdinaryBlobNamespaceAudit: Equatable, Sendable {
+    let blobNames: [String]
+    let validatedTempCount: Int
+}
+
+enum NativeOrdinaryPendingIndexDecision: Equatable, Sendable {
+    case unlinkPending
+    case preserveReferenced
+    case notPending
+}
+
+enum NativeOrdinaryPendingCleanupDisposition: Equatable, Sendable {
+    case unlinked
+    case alreadyAbsent
+    case preservedReferenced
+    case notPending
+}
+
+enum NativeOrdinaryPendingCleanupIOError: Error, Equatable {
+    case unlinkFailed
+    case directorySyncFailed
+}
+
+struct NativeManagedFileProof: Equatable, Sendable {
+    let bytes: Data
+    let sha256: String
+    let byteCount: Int
+
+    fileprivate let leaseID: UInt64
+    fileprivate let relativePath: String
+    fileprivate let role: NativeDurabilityRole
+    fileprivate let device: UInt64
+    fileprivate let inode: UInt64
+
+    fileprivate init(
+        bytes: Data,
+        leaseID: UInt64,
+        relativePath: String,
+        role: NativeDurabilityRole,
+        device: UInt64,
+        inode: UInt64
+    ) {
+        self.bytes = bytes
+        self.sha256 = sha256Hex(bytes)
+        self.byteCount = bytes.count
+        self.leaseID = leaseID
+        self.relativePath = relativePath
+        self.role = role
+        self.device = device
+        self.inode = inode
+    }
+}
+
+struct NativeOrdinaryPendingCleanupResult: Equatable, Sendable {
+    let disposition: NativeOrdinaryPendingCleanupDisposition
+    let latestIndexProof: NativeManagedFileProof
+}
+
+enum NativeSnapshotPendingIndexDecision: Equatable, Sendable {
+    case unlinkPending
+    case preserveReferenced
+    case notPending
+}
+
+enum NativeSnapshotPendingCleanupDisposition: Equatable, Sendable {
+    case unlinked
+    case alreadyAbsent
+    case preservedReferenced
+    case notPending
+}
+
+enum NativeSnapshotPendingCleanupIOError: Error, Equatable {
+    case unlinkFailed
+    case directorySyncFailed
+}
+
+struct NativeSnapshotPendingCleanupResult: Equatable, Sendable {
+    let disposition: NativeSnapshotPendingCleanupDisposition
+    let latestIndexProof: NativeManagedFileProof
+}
+
 struct DarwinNativePOSIX: NativePOSIX {
     func effectiveUserID() -> uid_t {
         Darwin.geteuid()
@@ -226,10 +319,14 @@ struct DarwinNativePOSIX: NativePOSIX {
     }
 
     func directoryEntries(directoryFD: Int32) throws -> [NativeDirectoryEntry] {
-        let duplicate = Darwin.dup(directoryFD)
-        guard duplicate >= 0 else { throw currentPOSIXError() }
-        guard let directory = Darwin.fdopendir(duplicate) else {
-            Darwin.close(duplicate)
+        let enumerationFD = Darwin.openat(
+            directoryFD,
+            ".",
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard enumerationFD >= 0 else { throw currentPOSIXError() }
+        guard let directory = Darwin.fdopendir(enumerationFD) else {
+            Darwin.close(enumerationFD)
             throw currentPOSIXError()
         }
         defer { Darwin.closedir(directory) }
@@ -436,6 +533,204 @@ final class NativeDurableFileWriter: @unchecked Sendable {
         self.faultHandler = faultHandler
     }
 
+    func withReadOnlyAudit<T>(
+        _ body: (NativeReadOnlyBookDirectory) throws -> T
+    ) throws -> T? {
+        let threadID = currentThreadID()
+        try rejectRecursiveAcquisition(threadID: threadID)
+
+        let rootName = rootURL.lastPathComponent
+        guard isSinglePathComponent(rootName) else {
+            throw NativeDurableFileWriterError.invalidRoot
+        }
+        let parentPath = rootURL.deletingLastPathComponent().path
+        let directoryFlags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        let parentFD = try posix.openAt(
+            directoryFD: AT_FDCWD,
+            path: parentPath,
+            flags: directoryFlags,
+            mode: 0
+        )
+        defer { posix.close(fileFD: parentFD) }
+        let parentIdentity = NativeFileIdentity(try posix.fstat(fileFD: parentFD))
+        try validateExternalDirectoryBinding(
+            fileFD: parentFD,
+            path: parentPath,
+            expectedIdentity: parentIdentity
+        )
+
+        let namedRoot: stat
+        do {
+            namedRoot = try posix.fstatAt(
+                directoryFD: parentFD,
+                path: rootName,
+                noFollow: true
+            )
+        } catch where isMissingPOSIXError(error) {
+            try validateExternalDirectoryBinding(
+                fileFD: parentFD,
+                path: parentPath,
+                expectedIdentity: parentIdentity
+            )
+            do {
+                _ = try posix.fstatAt(
+                    directoryFD: parentFD,
+                    path: rootName,
+                    noFollow: true
+                )
+                throw NativeDurableFileWriterError.identityChanged
+            } catch where isMissingPOSIXError(error) {
+                try validateExternalDirectoryBinding(
+                    fileFD: parentFD,
+                    path: parentPath,
+                    expectedIdentity: parentIdentity
+                )
+                return nil
+            }
+        }
+
+        let rootFD = try posix.openAt(
+            directoryFD: parentFD,
+            path: rootName,
+            flags: directoryFlags,
+            mode: 0
+        )
+        defer { posix.close(fileFD: rootFD) }
+        let rootStat = try posix.fstat(fileFD: rootFD)
+        let rootIdentity = NativeFileIdentity(rootStat)
+        guard rootIdentity == NativeFileIdentity(namedRoot) else {
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        try admitRootBeforeLock(rootFD: rootFD, parentFD: parentFD, rootName: rootName)
+
+        let firstLock = try statIfPresent(directoryFD: rootFD, leaf: Self.lockName)
+        let firstRecovery = try statIfPresent(directoryFD: rootFD, leaf: "Recovery")
+        try validateReadOnlyRootBinding(
+            parentFD: parentFD,
+            rootFD: rootFD,
+            rootName: rootName,
+            expectedIdentity: rootIdentity,
+            strict: firstLock != nil || firstRecovery != nil
+        )
+        let secondLock = try statIfPresent(directoryFD: rootFD, leaf: Self.lockName)
+        let secondRecovery = try statIfPresent(directoryFD: rootFD, leaf: "Recovery")
+        guard sameOptionalIdentity(firstLock, secondLock),
+              sameOptionalIdentity(firstRecovery, secondRecovery)
+        else {
+            throw NativeDurableFileWriterError.identityChanged
+        }
+
+        let rootRegistryKey = RootRegistryKey(
+            device: rootIdentity.device,
+            inode: rootIdentity.inode
+        )
+        try registerRootAcquisition(rootRegistryKey, threadID: threadID)
+        defer { unregisterRootAcquisition(rootRegistryKey, threadID: threadID) }
+
+        var recoveryFD: Int32?
+        var recoveryIdentity: NativeFileIdentity?
+        if let recoveryStat = firstRecovery {
+            let openedRecovery = try posix.openAt(
+                directoryFD: rootFD,
+                path: "Recovery",
+                flags: directoryFlags,
+                mode: 0
+            )
+            do {
+                let identity = NativeFileIdentity(recoveryStat)
+                try validateReadOnlyManagedDirectory(
+                    fileFD: openedRecovery,
+                    parentDirectoryFD: rootFD,
+                    leaf: "Recovery",
+                    expectedIdentity: identity
+                )
+                recoveryFD = openedRecovery
+                recoveryIdentity = identity
+            } catch {
+                posix.close(fileFD: openedRecovery)
+                throw error
+            }
+        }
+        defer {
+            if let recoveryFD { posix.close(fileFD: recoveryFD) }
+        }
+
+        var lockFD: Int32?
+        var lockIdentity: NativeFileIdentity?
+        if let lockStat = firstLock {
+            let openedLock = try posix.openAt(
+                directoryFD: rootFD,
+                path: Self.lockName,
+                flags: O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC,
+                mode: 0
+            )
+            do {
+                try posix.flock(fileFD: openedLock, operation: LOCK_SH)
+                try validateManagedFile(fileFD: openedLock, expectedModes: [0o600])
+                let identity = NativeFileIdentity(lockStat)
+                try validateCanonicalRootAndLock(
+                    parentFD: parentFD,
+                    rootFD: rootFD,
+                    rootName: rootName,
+                    rootIdentity: rootIdentity,
+                    lockFD: openedLock,
+                    lockIdentity: identity
+                )
+                lockFD = openedLock
+                lockIdentity = identity
+            } catch {
+                try? posix.flock(fileFD: openedLock, operation: LOCK_UN)
+                posix.close(fileFD: openedLock)
+                throw error
+            }
+        }
+        defer {
+            if let lockFD {
+                try? posix.flock(fileFD: lockFD, operation: LOCK_UN)
+                posix.close(fileFD: lockFD)
+            }
+        }
+
+        markActive(threadID: threadID)
+        defer { clearActive(threadID: threadID) }
+        let lease = NativeMutationLease(id: UInt64.random(in: 1 ... UInt64.max))
+        defer { lease.invalidate() }
+        let core = NativeLockedBookDirectory(
+            posix: posix,
+            faultHandler: faultHandler,
+            lease: lease,
+            effectiveUserID: posix.effectiveUserID(),
+            parentFD: parentFD,
+            rootFD: rootFD,
+            rootName: rootName,
+            rootIdentity: rootIdentity,
+            lockFD: lockFD,
+            lockName: Self.lockName,
+            lockIdentity: lockIdentity,
+            allowedRootModes: firstLock == nil && firstRecovery == nil ? [0o700, 0o755] : [0o700],
+            requiresZeroRootACL: firstLock != nil || firstRecovery != nil,
+            requiredAbsentRootNames: firstRecovery == nil ? ["Recovery"] : []
+        )
+        let readOnly = NativeReadOnlyBookDirectory(core: core)
+        try core.revalidateCanonicalIdentity()
+        let result = try body(readOnly)
+        try core.revalidateCanonicalIdentity()
+        if let recoveryFD, let recoveryIdentity {
+            try validateReadOnlyManagedDirectory(
+                fileFD: recoveryFD,
+                parentDirectoryFD: rootFD,
+                leaf: "Recovery",
+                expectedIdentity: recoveryIdentity
+            )
+        }
+        try validateExternalDirectoryBinding(
+            fileFD: parentFD,
+            path: parentPath,
+            expectedIdentity: parentIdentity
+        )
+        return result
+    }
+
     func withExclusiveMutationLock<T>(
         _ body: (NativeLockedBookDirectory) throws -> T
     ) throws -> T {
@@ -546,6 +841,97 @@ final class NativeDurableFileWriter: @unchecked Sendable {
         let result = try body(locked)
         try locked.revalidateCanonicalIdentity()
         return result
+    }
+
+    private func statIfPresent(directoryFD: Int32, leaf: String) throws -> stat? {
+        do {
+            return try posix.fstatAt(directoryFD: directoryFD, path: leaf, noFollow: true)
+        } catch where isMissingPOSIXError(error) {
+            return nil
+        }
+    }
+
+    private func sameOptionalIdentity(_ lhs: stat?, _ rhs: stat?) -> Bool {
+        switch (lhs, rhs) {
+        case (.none, .none):
+            return true
+        case (.some(let lhs), .some(let rhs)):
+            return NativeFileIdentity(lhs) == NativeFileIdentity(rhs)
+        default:
+            return false
+        }
+    }
+
+    private func validateExternalDirectoryBinding(
+        fileFD: Int32,
+        path: String,
+        expectedIdentity: NativeFileIdentity
+    ) throws {
+        let byFD = try posix.fstat(fileFD: fileFD)
+        let byPath = try posix.fstatAt(directoryFD: AT_FDCWD, path: path, noFollow: true)
+        guard NativeFileIdentity(byFD) == expectedIdentity,
+              NativeFileIdentity(byPath) == expectedIdentity,
+              isDirectory(byFD), byFD.st_nlink > 0
+        else {
+            throw NativeDurableFileWriterError.identityChanged
+        }
+    }
+
+    private func validateReadOnlyRootBinding(
+        parentFD: Int32,
+        rootFD: Int32,
+        rootName: String,
+        expectedIdentity: NativeFileIdentity,
+        strict: Bool
+    ) throws {
+        let byFD = try posix.fstat(fileFD: rootFD)
+        let byName = try posix.fstatAt(directoryFD: parentFD, path: rootName, noFollow: true)
+        guard NativeFileIdentity(byFD) == expectedIdentity,
+              NativeFileIdentity(byName) == expectedIdentity,
+              isDirectory(byFD), byFD.st_nlink > 0,
+              byFD.st_uid == posix.effectiveUserID()
+        else {
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        if strict {
+            guard permissionBits(byFD) == 0o700,
+                  try posix.extendedACLEntryCount(fileFD: rootFD) == 0
+            else {
+                throw NativeDurableFileWriterError.invalidMetadata
+            }
+        } else {
+            guard [mode_t(0o700), mode_t(0o755)].contains(permissionBits(byFD)),
+                  try !posix.hasDangerousLegacyACL(
+                      fileFD: rootFD,
+                      ownerUserID: posix.effectiveUserID()
+                  )
+            else {
+                throw NativeDurableFileWriterError.invalidMetadata
+            }
+        }
+    }
+
+    private func validateReadOnlyManagedDirectory(
+        fileFD: Int32,
+        parentDirectoryFD: Int32,
+        leaf: String,
+        expectedIdentity: NativeFileIdentity
+    ) throws {
+        let byFD = try posix.fstat(fileFD: fileFD)
+        let byName = try posix.fstatAt(
+            directoryFD: parentDirectoryFD,
+            path: leaf,
+            noFollow: true
+        )
+        guard NativeFileIdentity(byFD) == expectedIdentity,
+              NativeFileIdentity(byName) == expectedIdentity,
+              isDirectory(byFD), byFD.st_nlink > 0,
+              byFD.st_uid == posix.effectiveUserID(),
+              permissionBits(byFD) == 0o700,
+              try posix.extendedACLEntryCount(fileFD: fileFD) == 0
+        else {
+            throw NativeDurableFileWriterError.invalidMetadata
+        }
     }
 
     private func rejectRecursiveAcquisition(threadID: UInt64) throws {
@@ -784,9 +1170,12 @@ final class NativeLockedBookDirectory {
     private let rootFD: Int32
     private let rootName: String
     private let rootIdentity: NativeFileIdentity
-    private let lockFD: Int32
+    private let lockFD: Int32?
     private let lockName: String
-    private let lockIdentity: NativeFileIdentity
+    private let lockIdentity: NativeFileIdentity?
+    private let allowedRootModes: Set<mode_t>
+    private let requiresZeroRootACL: Bool
+    private let requiredAbsentRootNames: Set<String>
 
     fileprivate init(
         posix: any NativePOSIX,
@@ -797,9 +1186,12 @@ final class NativeLockedBookDirectory {
         rootFD: Int32,
         rootName: String,
         rootIdentity: NativeFileIdentity,
-        lockFD: Int32,
+        lockFD: Int32?,
         lockName: String,
-        lockIdentity: NativeFileIdentity
+        lockIdentity: NativeFileIdentity?,
+        allowedRootModes: Set<mode_t> = [0o700],
+        requiresZeroRootACL: Bool = true,
+        requiredAbsentRootNames: Set<String> = []
     ) {
         self.posix = posix
         self.faultHandler = faultHandler
@@ -812,6 +1204,9 @@ final class NativeLockedBookDirectory {
         self.lockFD = lockFD
         self.lockName = lockName
         self.lockIdentity = lockIdentity
+        self.allowedRootModes = allowedRootModes
+        self.requiresZeroRootACL = requiresZeroRootACL
+        self.requiredAbsentRootNames = requiredAbsentRootNames
     }
 
     func readValidated(relativePath: String) throws -> Data? {
@@ -829,7 +1224,11 @@ final class NativeLockedBookDirectory {
                     mode: 0
                 )
             } catch where isMissingPOSIXError(error) {
-                try revalidateCanonicalIdentity(bounds: bounds)
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: parent,
+                    leaf: leaf,
+                    bounds: bounds
+                )
                 return nil
             }
             defer { posix.close(fileFD: fd) }
@@ -888,6 +1287,61 @@ final class NativeLockedBookDirectory {
                 byteCount: result.data.count
             )
         }
+    }
+
+    func readManagedFileProof(
+        relativePath: String,
+        role: NativeDurabilityRole
+    ) throws -> NativeManagedFileProof? {
+        try lease.requireActive()
+        guard (relativePath == ordinaryIndexPath && role == .ordinaryHealthIndex)
+                || (relativePath == snapshotIndexPath && role == .snapshotHealthIndex)
+        else {
+            throw NativeDurableFileWriterError.invalidRoleTarget
+        }
+        let parts = try splitPath(relativePath)
+        return try withBoundDirectory(components: Array(parts.dropLast())) { parent, bounds in
+            let leaf = parts[parts.count - 1]
+            do {
+                _ = try posix.fstatAt(directoryFD: parent, path: leaf, noFollow: true)
+            } catch where isMissingPOSIXError(error) {
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: parent,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                return nil
+            }
+            let value = try readCanonicalManagedFile(
+                parentDirectoryFD: parent,
+                leaf: leaf,
+                bounds: bounds
+            )
+            return makeManagedFileProof(
+                bytes: value.data,
+                relativePath: relativePath,
+                role: role,
+                identity: value.identity
+            )
+        }
+    }
+
+    func revalidate(_ proof: NativeManagedFileProof) throws {
+        try validateManagedProof(proof)
+        let parts = try splitPath(proof.relativePath)
+        try withBoundDirectory(components: Array(parts.dropLast())) { parent, bounds in
+            let leaf = parts[parts.count - 1]
+            try withRevalidatedManagedProof(
+                proof,
+                parentDirectoryFD: parent,
+                leaf: leaf,
+                bounds: bounds
+            ) {}
+        }
+    }
+
+    func revalidatePrimarySource(_ proof: NativeSourceProof) throws {
+        try revalidateSource(proof)
     }
 
     func durableReplacePrimary(
@@ -954,6 +1408,9 @@ final class NativeLockedBookDirectory {
         role: NativeDurabilityRole
     ) throws -> NativeDurableFileReceipt {
         try lease.requireActive()
+        guard role != .ordinaryHealthIndex, role != .snapshotHealthIndex else {
+            throw NativeDurableFileWriterError.invalidRoleTarget
+        }
         try validateWriteTarget(bytes: bytes, path: relativePath, disposition: disposition, role: role)
         return try durableWriteInternal(
             bytes,
@@ -962,6 +1419,129 @@ final class NativeLockedBookDirectory {
             role: role,
             sourceProof: nil
         )
+    }
+
+    func durableWriteOrdinaryIndex(
+        _ bytes: Data,
+        role: NativeDurabilityRole
+    ) throws -> NativeManagedFileProof {
+        try lease.requireActive()
+        guard role == .ordinaryEmptyIndex
+                || role == .ordinaryPreparedIndex
+                || role == .ordinaryCommittedIndex
+        else {
+            throw NativeDurableFileWriterError.invalidRoleTarget
+        }
+        try validateWriteTarget(
+            bytes: bytes,
+            path: ordinaryIndexPath,
+            disposition: .replace,
+            role: role
+        )
+        let receipt = try durableWriteInternal(
+            bytes,
+            relativePath: ordinaryIndexPath,
+            disposition: .replace,
+            role: role,
+            sourceProof: nil
+        )
+        let proof = NativeManagedFileProof(
+            bytes: bytes,
+            leaseID: lease.id,
+            relativePath: ordinaryIndexPath,
+            role: .ordinaryHealthIndex,
+            device: receipt.device,
+            inode: receipt.inode
+        )
+        try revalidate(proof)
+        try revalidateCanonicalIdentity(bounds: [])
+        return proof
+    }
+
+    func durableCreateSnapshotIndex(
+        _ bytes: Data,
+        sourceProof: NativeSourceProof
+    ) throws -> NativeManagedFileProof {
+        try lease.requireActive()
+        try validateSourceProof(sourceProof)
+        try revalidateSource(sourceProof)
+        try validateWriteTarget(
+            bytes: bytes,
+            path: snapshotIndexPath,
+            disposition: .createOnly,
+            role: .snapshotEmptyIndex
+        )
+        let receipt = try durableWriteInternal(
+            bytes,
+            relativePath: snapshotIndexPath,
+            disposition: .createOnly,
+            role: .snapshotEmptyIndex,
+            sourceProof: sourceProof,
+            revalidateSourceAfterRename: true
+        )
+        let proof = NativeManagedFileProof(
+            bytes: bytes,
+            leaseID: lease.id,
+            relativePath: snapshotIndexPath,
+            role: .snapshotHealthIndex,
+            device: receipt.device,
+            inode: receipt.inode
+        )
+        try revalidate(proof)
+        try revalidateSource(sourceProof)
+        try revalidateCanonicalIdentity(bounds: [])
+        return proof
+    }
+
+    func durableCompareAndSwapManaged(
+        _ newBytes: Data,
+        replacing expectedProof: NativeManagedFileProof,
+        sourceProof: NativeSourceProof,
+        role: NativeDurabilityRole
+    ) throws -> NativeManagedFileProof {
+        try lease.requireActive()
+        let isOrdinary = role == .ordinaryHealthIndex
+            && expectedProof.role == .ordinaryHealthIndex
+            && expectedProof.relativePath == ordinaryIndexPath
+        let isSnapshot = (role == .snapshotFinalIndex || role == .snapshotHealthIndex)
+            && expectedProof.role == .snapshotHealthIndex
+            && expectedProof.relativePath == snapshotIndexPath
+        guard isOrdinary || isSnapshot
+        else {
+            throw NativeDurableFileWriterError.invalidRoleTarget
+        }
+        try validateManagedProof(expectedProof)
+        try validateSourceProof(sourceProof)
+        try revalidate(expectedProof)
+        try revalidateSource(sourceProof)
+        try validateWriteTarget(
+            bytes: newBytes,
+            path: expectedProof.relativePath,
+            disposition: .replace,
+            role: role
+        )
+
+        let receipt = try durableWriteInternal(
+            newBytes,
+            relativePath: expectedProof.relativePath,
+            disposition: .replace,
+            role: role,
+            sourceProof: sourceProof,
+            expectedManagedProof: expectedProof,
+            revalidateSourceAfterRename: true
+        )
+        let newProof = NativeManagedFileProof(
+            bytes: newBytes,
+            leaseID: lease.id,
+            relativePath: expectedProof.relativePath,
+            role: isSnapshot ? .snapshotHealthIndex : role,
+            device: receipt.device,
+            inode: receipt.inode
+        )
+        try revalidate(newProof)
+        try revalidateSource(sourceProof)
+        try revalidateCanonicalIdentity(bounds: [])
+        return newProof
     }
 
     func durablySyncManagedDirectory(
@@ -1097,12 +1677,1007 @@ final class NativeLockedBookDirectory {
         }
     }
 
-    func unlinkOrdinaryPendingAndSync(relativePath: String) throws {
-        try unlinkPending(relativePath: relativePath, snapshot: false)
+    func enumerateIfPresent(relativePath: String) throws -> [NativeDirectoryEntry]? {
+        try lease.requireActive()
+        guard isKnownManagedDirectory(relativePath) else {
+            throw NativeDurableFileWriterError.invalidManagedPath
+        }
+        let parts = try splitPath(relativePath)
+        return try withBoundDirectoryIfPresent(components: parts) { directoryFD, _ in
+            try posix.directoryEntries(directoryFD: directoryFD)
+        }
+    }
+
+    func auditOrdinaryIndexNamespace(
+        expectedEmptyIndexBytes: Data
+    ) throws -> NativeOrdinaryIndexNamespaceState {
+        try lease.requireActive()
+        let result: NativeOrdinaryIndexNamespaceState? = try withBoundDirectoryIfPresent(
+            components: ["Recovery", "ordinary"]
+        ) { directoryFD, bounds in
+            let initialEntries = try posix.directoryEntries(directoryFD: directoryFD)
+            guard Set(initialEntries.map(\.name)).count == initialEntries.count else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+
+            let indexEntry = initialEntries.first { $0.name == "slots.json" }
+            let indexProof: (data: Data, identity: NativeFileIdentity)?
+            if let indexEntry {
+                guard indexEntry.fileType == .regular else {
+                    throw NativeDurableFileWriterError.invalidMetadata
+                }
+                indexProof = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: indexEntry.name,
+                    bounds: bounds
+                )
+            } else {
+                indexProof = nil
+            }
+
+            var blobsIdentity: NativeFileIdentity?
+            var tempProofs: [String: (data: Data, identity: NativeFileIdentity)] = [:]
+            for entry in initialEntries {
+                if entry.name == "slots.json" { continue }
+                if indexProof != nil, entry.name == "blobs" {
+                    guard entry.fileType == .directory else {
+                        throw NativeDurableFileWriterError.invalidMetadata
+                    }
+                    blobsIdentity = try readCanonicalManagedDirectory(
+                        parentDirectoryFD: directoryFD,
+                        leaf: entry.name,
+                        bounds: bounds
+                    )
+                    continue
+                }
+                guard isCanonicalWriterTempName(entry.name),
+                      entry.fileType == .regular
+                else {
+                    throw NativeDurableFileWriterError.invalidManagedPath
+                }
+                tempProofs[entry.name] = try withValidatedCrashTemp(
+                    expectedPrefix: indexProof == nil ? expectedEmptyIndexBytes : nil,
+                    parentDirectoryFD: directoryFD,
+                    leaf: entry.name,
+                    bounds: bounds
+                ) { data, identity in
+                    (data: data, identity: identity)
+                }
+            }
+
+            for name in tempProofs.keys.sorted() {
+                guard let expected = tempProofs[name] else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                let actual = try withValidatedCrashTemp(
+                    expectedPrefix: indexProof == nil ? expectedEmptyIndexBytes : nil,
+                    parentDirectoryFD: directoryFD,
+                    leaf: name,
+                    bounds: bounds
+                ) { data, identity in
+                    (data: data, identity: identity)
+                }
+                guard actual.identity == expected.identity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                guard actual.data == expected.data else {
+                    throw NativeDurableFileWriterError.contentMismatch
+                }
+            }
+
+            if let indexProof {
+                let finalIndex = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: "slots.json",
+                    bounds: bounds
+                )
+                guard finalIndex.identity == indexProof.identity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                guard finalIndex.data == indexProof.data else {
+                    throw NativeDurableFileWriterError.contentMismatch
+                }
+            }
+            if let blobsIdentity {
+                let finalBlobsIdentity = try readCanonicalManagedDirectory(
+                    parentDirectoryFD: directoryFD,
+                    leaf: "blobs",
+                    bounds: bounds
+                )
+                guard finalBlobsIdentity == blobsIdentity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+            }
+            guard try posix.directoryEntries(directoryFD: directoryFD) == initialEntries else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+
+            if indexProof != nil { return NativeOrdinaryIndexNamespaceState.indexed }
+            return .indexless(validatedTempCount: tempProofs.count)
+        }
+        return result ?? .absent
+    }
+
+    func auditOrdinaryBlobNamespace(
+        expectedSourceBytes: Data?,
+        sourceProof: NativeSourceProof
+    ) throws -> NativeOrdinaryBlobNamespaceAudit {
+        try validateExpectedSourceBytes(expectedSourceBytes, sourceProof: sourceProof)
+        try revalidateSource(sourceProof)
+        let result: NativeOrdinaryBlobNamespaceAudit? = try withBoundDirectoryIfPresent(
+            components: ["Recovery", "ordinary", "blobs"]
+        ) { directoryFD, bounds in
+            let initialEntries = try posix.directoryEntries(directoryFD: directoryFD)
+            guard Set(initialEntries.map(\.name)).count == initialEntries.count else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+            var blobProofs: [String: (data: Data, identity: NativeFileIdentity)] = [:]
+            var tempProofs: [String: (data: Data, identity: NativeFileIdentity)] = [:]
+
+            for entry in initialEntries {
+                if isCanonicalWriterTempName(entry.name) {
+                    guard let expectedSourceBytes, entry.fileType == .regular else {
+                        throw NativeDurableFileWriterError.invalidMetadata
+                    }
+                    tempProofs[entry.name] = try withValidatedCrashTemp(
+                        expectedPrefix: expectedSourceBytes,
+                        parentDirectoryFD: directoryFD,
+                        leaf: entry.name,
+                        bounds: bounds
+                    ) { data, identity in
+                        (data: data, identity: identity)
+                    }
+                    continue
+                }
+                guard !entry.name.hasPrefix(writerTempPrefix),
+                      ordinaryBlobHash(fromLeaf: entry.name) != nil,
+                      entry.fileType == .regular
+                else {
+                    throw NativeDurableFileWriterError.invalidManagedPath
+                }
+                blobProofs[entry.name] = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: entry.name,
+                    bounds: bounds
+                )
+            }
+
+            for name in tempProofs.keys.sorted() {
+                guard let expected = tempProofs[name], let expectedSourceBytes else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                let actual = try withValidatedCrashTemp(
+                    expectedPrefix: expectedSourceBytes,
+                    parentDirectoryFD: directoryFD,
+                    leaf: name,
+                    bounds: bounds
+                ) { data, identity in
+                    (data: data, identity: identity)
+                }
+                guard actual.identity == expected.identity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                guard actual.data == expected.data else {
+                    throw NativeDurableFileWriterError.contentMismatch
+                }
+            }
+            for name in blobProofs.keys.sorted() {
+                guard let expected = blobProofs[name] else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                let actual = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: name,
+                    bounds: bounds
+                )
+                guard actual.identity == expected.identity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                guard actual.data == expected.data else {
+                    throw NativeDurableFileWriterError.contentMismatch
+                }
+            }
+            guard try posix.directoryEntries(directoryFD: directoryFD) == initialEntries else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+            return NativeOrdinaryBlobNamespaceAudit(
+                blobNames: blobProofs.keys.sorted(),
+                validatedTempCount: tempProofs.count
+            )
+        }
+        try revalidateSource(sourceProof)
+        return result ?? NativeOrdinaryBlobNamespaceAudit(blobNames: [], validatedTempCount: 0)
+    }
+
+    func auditSnapshotIndexNamespace(
+        expectedEmptyIndexBytes: Data
+    ) throws -> NativeSnapshotIndexNamespaceState {
+        try lease.requireActive()
+        let result: NativeSnapshotIndexNamespaceState? = try withBoundDirectoryIfPresent(
+            components: ["Recovery", "snapshots"]
+        ) { directoryFD, bounds in
+            let initialEntries = try posix.directoryEntries(directoryFD: directoryFD)
+            guard Set(initialEntries.map(\.name)).count == initialEntries.count else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+
+            let indexEntry = initialEntries.first { $0.name == "index.json" }
+            let indexProof: (data: Data, identity: NativeFileIdentity)?
+            if let indexEntry {
+                guard indexEntry.fileType == .regular else {
+                    throw NativeDurableFileWriterError.invalidMetadata
+                }
+                indexProof = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: indexEntry.name,
+                    bounds: bounds
+                )
+            } else {
+                indexProof = nil
+            }
+
+            var tempProofs: [String: (data: Data, identity: NativeFileIdentity)] = [:]
+            var blobProofs: [String: (data: Data, identity: NativeFileIdentity)] = [:]
+            for entry in initialEntries {
+                if entry.name == "index.json" { continue }
+                if isCanonicalWriterTempName(entry.name) {
+                    guard entry.fileType == .regular else {
+                        throw NativeDurableFileWriterError.invalidMetadata
+                    }
+                    tempProofs[entry.name] = try withValidatedCrashTemp(
+                        expectedPrefix: indexProof == nil ? expectedEmptyIndexBytes : nil,
+                        parentDirectoryFD: directoryFD,
+                        leaf: entry.name,
+                        bounds: bounds
+                    ) { data, identity in
+                        (data: data, identity: identity)
+                    }
+                    continue
+                }
+                guard indexProof != nil,
+                      entry.fileType == .regular,
+                      let hash = blobHash(
+                        from: "Recovery/snapshots/\(entry.name)",
+                        prefix: "Recovery/snapshots/"
+                      )
+                else {
+                    throw NativeDurableFileWriterError.invalidManagedPath
+                }
+                let proof = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: entry.name,
+                    bounds: bounds
+                )
+                guard sha256Hex(proof.data) == hash else {
+                    throw NativeDurableFileWriterError.contentMismatch
+                }
+                blobProofs[entry.name] = proof
+            }
+
+            for name in tempProofs.keys.sorted() {
+                guard let expected = tempProofs[name] else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                let actual = try withValidatedCrashTemp(
+                    expectedPrefix: indexProof == nil ? expectedEmptyIndexBytes : nil,
+                    parentDirectoryFD: directoryFD,
+                    leaf: name,
+                    bounds: bounds
+                ) { data, identity in
+                    (data: data, identity: identity)
+                }
+                guard actual.data == expected.data, actual.identity == expected.identity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+            }
+            for name in blobProofs.keys.sorted() {
+                guard let expected = blobProofs[name] else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                let actual = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: name,
+                    bounds: bounds
+                )
+                guard actual.data == expected.data, actual.identity == expected.identity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+            }
+            if let indexProof {
+                let finalIndex = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: "index.json",
+                    bounds: bounds
+                )
+                guard finalIndex.data == indexProof.data,
+                      finalIndex.identity == indexProof.identity
+                else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+            }
+            guard try posix.directoryEntries(directoryFD: directoryFD) == initialEntries else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+            if indexProof != nil {
+                return .indexed(validatedTempCount: tempProofs.count)
+            }
+            return .indexless(validatedTempCount: tempProofs.count)
+        }
+        return result ?? .absent
+    }
+
+    func cleanupSnapshotIndexCrashTemps(expectedEmptyIndexBytes: Data) throws {
+        try lease.requireActive()
+        _ = try withBoundDirectoryIfPresent(
+            components: ["Recovery", "snapshots"]
+        ) { directoryFD, bounds in
+            let entries = try posix.directoryEntries(directoryFD: directoryFD)
+            let indexEntry = entries.first { $0.name == "index.json" }
+            let canonicalIndex: (data: Data, identity: NativeFileIdentity)?
+            if let indexEntry {
+                guard indexEntry.fileType == .regular else {
+                    throw NativeDurableFileWriterError.invalidMetadata
+                }
+                canonicalIndex = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: indexEntry.name,
+                    bounds: bounds
+                )
+            } else {
+                canonicalIndex = nil
+            }
+            var tempProofs: [String: (data: Data, identity: NativeFileIdentity)] = [:]
+            for entry in entries {
+                if entry.name == "index.json" { continue }
+                if isCanonicalWriterTempName(entry.name) {
+                    guard entry.fileType == .regular else {
+                        throw NativeDurableFileWriterError.invalidMetadata
+                    }
+                    tempProofs[entry.name] = try withValidatedCrashTemp(
+                        expectedPrefix: canonicalIndex == nil ? expectedEmptyIndexBytes : nil,
+                        parentDirectoryFD: directoryFD,
+                        leaf: entry.name,
+                        bounds: bounds
+                    ) { data, identity in
+                        (data: data, identity: identity)
+                    }
+                    continue
+                }
+                guard canonicalIndex != nil,
+                      entry.fileType == .regular,
+                      blobHash(
+                        from: "Recovery/snapshots/\(entry.name)",
+                        prefix: "Recovery/snapshots/"
+                      ) != nil
+                else {
+                    throw NativeDurableFileWriterError.invalidManagedPath
+                }
+            }
+
+            try revalidateCanonicalIdentity(bounds: bounds)
+            for name in tempProofs.keys.sorted() {
+                guard let expected = tempProofs[name] else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                try withValidatedCrashTemp(
+                    expectedPrefix: canonicalIndex == nil ? expectedEmptyIndexBytes : nil,
+                    parentDirectoryFD: directoryFD,
+                    leaf: name,
+                    bounds: bounds
+                ) { data, identity in
+                    guard data == expected.data, identity == expected.identity else {
+                        throw NativeDurableFileWriterError.identityChanged
+                    }
+                    try posix.unlinkAt(directoryFD: directoryFD, path: name)
+                }
+            }
+            if !tempProofs.isEmpty {
+                try posix.syncDirectory(directoryFD: directoryFD)
+                for name in tempProofs.keys.sorted() {
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: directoryFD,
+                        leaf: name,
+                        bounds: bounds
+                    )
+                }
+            }
+            if let canonicalIndex {
+                let finalIndex = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: "index.json",
+                    bounds: bounds
+                )
+                guard finalIndex.data == canonicalIndex.data,
+                      finalIndex.identity == canonicalIndex.identity
+                else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+            }
+        }
+    }
+
+    func cleanupOrdinaryBlobCrashTemps(
+        expectedSourceBytes: Data?,
+        sourceProof: NativeSourceProof
+    ) throws {
+        try validateExpectedSourceBytes(expectedSourceBytes, sourceProof: sourceProof)
+        try revalidateSource(sourceProof)
+        _ = try withBoundDirectoryIfPresent(
+            components: ["Recovery", "ordinary", "blobs"]
+        ) { directoryFD, bounds in
+            let entries = try posix.directoryEntries(directoryFD: directoryFD)
+            var tempProofs: [String: (data: Data, identity: NativeFileIdentity)] = [:]
+            for entry in entries {
+                if isCanonicalWriterTempName(entry.name) {
+                    guard let expectedSourceBytes, entry.fileType == .regular else {
+                        throw NativeDurableFileWriterError.invalidMetadata
+                    }
+                    tempProofs[entry.name] = try withValidatedCrashTemp(
+                        expectedPrefix: expectedSourceBytes,
+                        parentDirectoryFD: directoryFD,
+                        leaf: entry.name,
+                        bounds: bounds
+                    ) { data, identity in
+                        (data: data, identity: identity)
+                    }
+                } else if entry.name.hasPrefix(writerTempPrefix) {
+                    throw NativeDurableFileWriterError.invalidManagedPath
+                }
+            }
+
+            try revalidateSource(sourceProof)
+            for name in tempProofs.keys.sorted() {
+                guard let expected = tempProofs[name], let expectedSourceBytes else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                try revalidateSource(sourceProof)
+                try withValidatedCrashTemp(
+                    expectedPrefix: expectedSourceBytes,
+                    parentDirectoryFD: directoryFD,
+                    leaf: name,
+                    bounds: bounds
+                ) { data, identity in
+                    guard identity == expected.identity else {
+                        throw NativeDurableFileWriterError.identityChanged
+                    }
+                    guard data == expected.data else {
+                        throw NativeDurableFileWriterError.contentMismatch
+                    }
+                    try posix.unlinkAt(directoryFD: directoryFD, path: name)
+                }
+            }
+            if !tempProofs.isEmpty {
+                try posix.syncDirectory(directoryFD: directoryFD)
+                for name in tempProofs.keys.sorted() {
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: directoryFD,
+                        leaf: name,
+                        bounds: bounds
+                    )
+                }
+            }
+            try revalidateSource(sourceProof)
+        }
+        try revalidateSource(sourceProof)
+    }
+
+    func cleanupOrdinaryIndexCrashTemps(expectedEmptyIndexBytes: Data) throws {
+        try lease.requireActive()
+        let parts = ["Recovery", "ordinary"]
+        _ = try withBoundDirectoryIfPresent(components: parts) { directoryFD, bounds in
+            let entries = try posix.directoryEntries(directoryFD: directoryFD)
+            let indexEntry = entries.first { $0.name == "slots.json" }
+            let canonicalIndex: (data: Data, identity: NativeFileIdentity)?
+            if let indexEntry {
+                guard indexEntry.fileType == .regular else {
+                    throw NativeDurableFileWriterError.invalidMetadata
+                }
+                canonicalIndex = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: indexEntry.name,
+                    bounds: bounds
+                )
+            } else {
+                canonicalIndex = nil
+            }
+            var tempNames: [String] = []
+
+            for entry in entries {
+                if entry.name == "slots.json" { continue }
+                if canonicalIndex != nil,
+                   entry.name == "blobs",
+                   entry.fileType == .directory {
+                    continue
+                }
+                guard isCanonicalWriterTempName(entry.name),
+                      entry.fileType == .regular
+                else {
+                    throw NativeDurableFileWriterError.invalidManagedPath
+                }
+                try withValidatedCrashTemp(
+                    expectedPrefix: canonicalIndex == nil ? expectedEmptyIndexBytes : nil,
+                    parentDirectoryFD: directoryFD,
+                    leaf: entry.name,
+                    bounds: bounds
+                ) { _, _ in }
+                tempNames.append(entry.name)
+            }
+
+            try revalidateCanonicalIdentity(bounds: bounds)
+            for name in tempNames {
+                try withValidatedCrashTemp(
+                    expectedPrefix: canonicalIndex == nil ? expectedEmptyIndexBytes : nil,
+                    parentDirectoryFD: directoryFD,
+                    leaf: name,
+                    bounds: bounds
+                ) { _, _ in
+                    try posix.unlinkAt(directoryFD: directoryFD, path: name)
+                }
+            }
+
+            if !tempNames.isEmpty {
+                try posix.syncDirectory(directoryFD: directoryFD)
+                for name in tempNames {
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: directoryFD,
+                        leaf: name,
+                        bounds: bounds
+                    )
+                }
+            }
+
+            if let canonicalIndex {
+                let finalIndex = try readCanonicalManagedFile(
+                    parentDirectoryFD: directoryFD,
+                    leaf: "slots.json",
+                    bounds: bounds
+                )
+                guard finalIndex.identity == canonicalIndex.identity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                guard finalIndex.data == canonicalIndex.data else {
+                    throw NativeDurableFileWriterError.contentMismatch
+                }
+            }
+        }
+    }
+
+    func unlinkOrdinaryPendingAndSync(
+        relativePath: String,
+        sourceProof: NativeSourceProof,
+        authorizeLatestIndex: (NativeManagedFileProof) throws -> NativeOrdinaryPendingIndexDecision
+    ) throws -> NativeOrdinaryPendingCleanupResult {
+        try lease.requireActive()
+        guard let expectedBlobHash = blobHash(
+            from: relativePath,
+            prefix: "Recovery/ordinary/blobs/"
+        ) else {
+            throw NativeDurableFileWriterError.invalidRoleTarget
+        }
+        try validateSourceProof(sourceProof)
+        try revalidateSource(sourceProof)
+
+        let parts = try splitPath(relativePath)
+        return try withBoundDirectory(components: Array(parts.dropLast())) { blobsFD, bounds in
+            let leaf = parts[parts.count - 1]
+            guard let ordinaryBound = bounds.first(where: { $0.name == "ordinary" }) else {
+                throw NativeDurableFileWriterError.invalidManagedPath
+            }
+
+            let blobFD: Int32?
+            let blobBytes: Data?
+            let blobIdentity: NativeFileIdentity?
+            do {
+                let openedFD = try posix.openAt(
+                    directoryFD: blobsFD,
+                    path: leaf,
+                    flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+                    mode: 0
+                )
+                do {
+                    try validateManagedFile(fileFD: openedFD, expectedModes: [0o600])
+                    let value = try posix.fstat(fileFD: openedFD)
+                    let bytes = try readAll(fileFD: openedFD)
+                    guard sha256Hex(bytes) == expectedBlobHash else {
+                        throw NativeDurableFileWriterError.contentMismatch
+                    }
+                    try validateManagedFile(fileFD: openedFD, expectedModes: [0o600])
+                    try validateCanonicalLeaf(
+                        fileFD: openedFD,
+                        parentDirectoryFD: blobsFD,
+                        leaf: leaf,
+                        expectedIdentity: NativeFileIdentity(value)
+                    )
+                    try revalidateCanonicalIdentity(bounds: bounds)
+                    blobFD = openedFD
+                    blobBytes = bytes
+                    blobIdentity = NativeFileIdentity(value)
+                } catch {
+                    posix.close(fileFD: openedFD)
+                    throw error
+                }
+            } catch where isMissingPOSIXError(error) {
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: blobsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                blobFD = nil
+                blobBytes = nil
+                blobIdentity = nil
+            }
+            defer {
+                if let blobFD { posix.close(fileFD: blobFD) }
+            }
+
+            let indexValue = try readCanonicalManagedFile(
+                parentDirectoryFD: ordinaryBound.fd,
+                leaf: "slots.json",
+                bounds: bounds
+            )
+            let latestIndexProof = makeManagedFileProof(
+                bytes: indexValue.data,
+                relativePath: ordinaryIndexPath,
+                role: .ordinaryHealthIndex,
+                identity: indexValue.identity
+            )
+            let decision = try authorizeLatestIndex(latestIndexProof)
+
+            func revalidateBlobOrAbsence() throws {
+                guard let blobFD, let blobBytes, let blobIdentity else {
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: blobsFD,
+                        leaf: leaf,
+                        bounds: bounds
+                    )
+                    return
+                }
+                let actual = try readCanonicalManagedFile(
+                    parentDirectoryFD: blobsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                guard actual.identity == blobIdentity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                guard actual.data == blobBytes,
+                      actual.data.count == blobBytes.count,
+                      sha256Hex(actual.data) == expectedBlobHash
+                else {
+                    throw NativeDurableFileWriterError.contentMismatch
+                }
+                try validateManagedFile(fileFD: blobFD, expectedModes: [0o600])
+                try validateCanonicalLeaf(
+                    fileFD: blobFD,
+                    parentDirectoryFD: blobsFD,
+                    leaf: leaf,
+                    expectedIdentity: blobIdentity
+                )
+            }
+
+            func revalidateLatestIndex(
+                perform body: () throws -> Void = {}
+            ) throws {
+                try withRevalidatedManagedProof(
+                    latestIndexProof,
+                    parentDirectoryFD: ordinaryBound.fd,
+                    leaf: "slots.json",
+                    bounds: bounds,
+                    perform: body
+                )
+            }
+
+            switch decision {
+            case .preserveReferenced, .notPending:
+                try revalidateBlobOrAbsence()
+                try revalidateSource(sourceProof)
+                try revalidateLatestIndex()
+                try revalidateCanonicalIdentity(bounds: bounds)
+                return NativeOrdinaryPendingCleanupResult(
+                    disposition: decision == .preserveReferenced
+                        ? .preservedReferenced
+                        : .notPending,
+                    latestIndexProof: latestIndexProof
+                )
+
+            case .unlinkPending:
+                guard blobFD != nil else {
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: blobsFD,
+                        leaf: leaf,
+                        bounds: bounds
+                    )
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: blobsFD,
+                        leaf: leaf,
+                        bounds: bounds
+                    )
+                    try revalidateSource(sourceProof)
+                    try revalidateLatestIndex()
+                    try revalidateCanonicalIdentity(bounds: bounds)
+                    do {
+                        try posix.syncDirectory(directoryFD: blobsFD)
+                    } catch {
+                        throw NativeOrdinaryPendingCleanupIOError.directorySyncFailed
+                    }
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: blobsFD,
+                        leaf: leaf,
+                        bounds: bounds
+                    )
+                    try revalidateSource(sourceProof)
+                    try revalidateLatestIndex()
+                    try revalidateCanonicalIdentity(bounds: bounds)
+                    return NativeOrdinaryPendingCleanupResult(
+                        disposition: .alreadyAbsent,
+                        latestIndexProof: latestIndexProof
+                    )
+                }
+
+                try revalidateBlobOrAbsence()
+                try revalidateSource(sourceProof)
+                try revalidateCanonicalIdentity(bounds: bounds)
+                try revalidateLatestIndex {
+                    do {
+                        try posix.unlinkAt(directoryFD: blobsFD, path: leaf)
+                    } catch {
+                        throw NativeOrdinaryPendingCleanupIOError.unlinkFailed
+                    }
+                }
+                do {
+                    try posix.syncDirectory(directoryFD: blobsFD)
+                } catch {
+                    throw NativeOrdinaryPendingCleanupIOError.directorySyncFailed
+                }
+
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: blobsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: blobsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                try revalidateSource(sourceProof)
+                try revalidateLatestIndex()
+                try revalidateCanonicalIdentity(bounds: bounds)
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: blobsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                try revalidateSource(sourceProof)
+                try revalidateLatestIndex()
+                try revalidateCanonicalIdentity(bounds: bounds)
+                return NativeOrdinaryPendingCleanupResult(
+                    disposition: .unlinked,
+                    latestIndexProof: latestIndexProof
+                )
+            }
+        }
     }
 
     func unlinkSnapshotPendingAndSync(relativePath: String) throws {
         try unlinkPending(relativePath: relativePath, snapshot: true)
+    }
+
+    func unlinkSnapshotPendingAndSync(
+        relativePath: String,
+        sourceProof: NativeSourceProof,
+        authorizeLatestIndex: (NativeManagedFileProof) throws -> NativeSnapshotPendingIndexDecision
+    ) throws -> NativeSnapshotPendingCleanupResult {
+        try lease.requireActive()
+        guard let expectedBlobHash = blobHash(
+            from: relativePath,
+            prefix: "Recovery/snapshots/"
+        ) else {
+            throw NativeDurableFileWriterError.invalidRoleTarget
+        }
+        try validateSourceProof(sourceProof)
+        try revalidateSource(sourceProof)
+
+        let parts = try splitPath(relativePath)
+        return try withBoundDirectory(components: Array(parts.dropLast())) { snapshotsFD, bounds in
+            let leaf = parts[parts.count - 1]
+            let blobFD: Int32?
+            let blobBytes: Data?
+            let blobIdentity: NativeFileIdentity?
+            do {
+                let openedFD = try posix.openAt(
+                    directoryFD: snapshotsFD,
+                    path: leaf,
+                    flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+                    mode: 0
+                )
+                do {
+                    try validateManagedFile(fileFD: openedFD, expectedModes: [0o600])
+                    let value = try posix.fstat(fileFD: openedFD)
+                    let bytes = try readAll(fileFD: openedFD)
+                    guard sha256Hex(bytes) == expectedBlobHash else {
+                        throw NativeDurableFileWriterError.contentMismatch
+                    }
+                    try validateManagedFile(fileFD: openedFD, expectedModes: [0o600])
+                    try validateCanonicalLeaf(
+                        fileFD: openedFD,
+                        parentDirectoryFD: snapshotsFD,
+                        leaf: leaf,
+                        expectedIdentity: NativeFileIdentity(value)
+                    )
+                    try revalidateCanonicalIdentity(bounds: bounds)
+                    blobFD = openedFD
+                    blobBytes = bytes
+                    blobIdentity = NativeFileIdentity(value)
+                } catch {
+                    posix.close(fileFD: openedFD)
+                    throw error
+                }
+            } catch where isMissingPOSIXError(error) {
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: snapshotsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                blobFD = nil
+                blobBytes = nil
+                blobIdentity = nil
+            }
+            defer {
+                if let blobFD { posix.close(fileFD: blobFD) }
+            }
+
+            let indexValue = try readCanonicalManagedFile(
+                parentDirectoryFD: snapshotsFD,
+                leaf: "index.json",
+                bounds: bounds
+            )
+            let latestIndexProof = makeManagedFileProof(
+                bytes: indexValue.data,
+                relativePath: snapshotIndexPath,
+                role: .snapshotHealthIndex,
+                identity: indexValue.identity
+            )
+            let decision = try authorizeLatestIndex(latestIndexProof)
+
+            func revalidateBlobOrAbsence() throws {
+                guard let blobFD, let blobBytes, let blobIdentity else {
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: snapshotsFD,
+                        leaf: leaf,
+                        bounds: bounds
+                    )
+                    return
+                }
+                let actual = try readCanonicalManagedFile(
+                    parentDirectoryFD: snapshotsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                guard actual.identity == blobIdentity else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                guard actual.data == blobBytes,
+                      actual.data.count == blobBytes.count,
+                      sha256Hex(actual.data) == expectedBlobHash
+                else {
+                    throw NativeDurableFileWriterError.contentMismatch
+                }
+                try validateManagedFile(fileFD: blobFD, expectedModes: [0o600])
+                try validateCanonicalLeaf(
+                    fileFD: blobFD,
+                    parentDirectoryFD: snapshotsFD,
+                    leaf: leaf,
+                    expectedIdentity: blobIdentity
+                )
+            }
+
+            func revalidateLatestIndex(
+                perform body: () throws -> Void = {}
+            ) throws {
+                try withRevalidatedManagedProof(
+                    latestIndexProof,
+                    parentDirectoryFD: snapshotsFD,
+                    leaf: "index.json",
+                    bounds: bounds,
+                    perform: body
+                )
+            }
+
+            switch decision {
+            case .preserveReferenced, .notPending:
+                try revalidateBlobOrAbsence()
+                try revalidateSource(sourceProof)
+                try revalidateLatestIndex()
+                try revalidateCanonicalIdentity(bounds: bounds)
+                return NativeSnapshotPendingCleanupResult(
+                    disposition: decision == .preserveReferenced
+                        ? .preservedReferenced
+                        : .notPending,
+                    latestIndexProof: latestIndexProof
+                )
+
+            case .unlinkPending:
+                guard blobFD != nil else {
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: snapshotsFD,
+                        leaf: leaf,
+                        bounds: bounds
+                    )
+                    try revalidateSource(sourceProof)
+                    try revalidateLatestIndex()
+                    try revalidateCanonicalIdentity(bounds: bounds)
+                    do {
+                        try posix.syncDirectory(directoryFD: snapshotsFD)
+                    } catch {
+                        throw NativeSnapshotPendingCleanupIOError.directorySyncFailed
+                    }
+                    try proveCanonicalNameMissing(
+                        parentDirectoryFD: snapshotsFD,
+                        leaf: leaf,
+                        bounds: bounds
+                    )
+                    try revalidateSource(sourceProof)
+                    try revalidateLatestIndex()
+                    try revalidateCanonicalIdentity(bounds: bounds)
+                    return NativeSnapshotPendingCleanupResult(
+                        disposition: .alreadyAbsent,
+                        latestIndexProof: latestIndexProof
+                    )
+                }
+
+                try revalidateBlobOrAbsence()
+                try revalidateSource(sourceProof)
+                try revalidateCanonicalIdentity(bounds: bounds)
+                try revalidateLatestIndex {
+                    try emit(
+                        .beforeRetentionUnlink,
+                        role: .snapshotFinalIndex,
+                        targetName: relativePath
+                    )
+                    try revalidateBlobOrAbsence()
+                    try revalidateSource(sourceProof)
+                    do {
+                        try posix.unlinkAt(directoryFD: snapshotsFD, path: leaf)
+                    } catch {
+                        throw NativeSnapshotPendingCleanupIOError.unlinkFailed
+                    }
+                }
+                try emit(
+                    .afterRetentionUnlink,
+                    role: .snapshotFinalIndex,
+                    targetName: relativePath
+                )
+                do {
+                    try posix.syncDirectory(directoryFD: snapshotsFD)
+                } catch {
+                    throw NativeSnapshotPendingCleanupIOError.directorySyncFailed
+                }
+                try emit(
+                    .afterRetentionDirectoryFSync,
+                    role: .snapshotFinalIndex,
+                    targetName: relativePath
+                )
+
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: snapshotsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                try revalidateSource(sourceProof)
+                try revalidateLatestIndex()
+                try revalidateCanonicalIdentity(bounds: bounds)
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: snapshotsFD,
+                    leaf: leaf,
+                    bounds: bounds
+                )
+                return NativeSnapshotPendingCleanupResult(
+                    disposition: .unlinked,
+                    latestIndexProof: latestIndexProof
+                )
+            }
+        }
     }
 
     func revalidateCanonicalIdentity() throws {
@@ -1115,7 +2690,9 @@ final class NativeLockedBookDirectory {
         relativePath: String,
         disposition: NativeDurableWriteDisposition,
         role: NativeDurabilityRole,
-        sourceProof: NativeSourceProof?
+        sourceProof: NativeSourceProof?,
+        expectedManagedProof: NativeManagedFileProof? = nil,
+        revalidateSourceAfterRename: Bool = false
     ) throws -> NativeDurableFileReceipt {
         try lease.requireActive()
         let parts = try splitPath(relativePath)
@@ -1158,18 +2735,8 @@ final class NativeLockedBookDirectory {
                     expectedIdentity: tempIdentity
                 )
                 try revalidateCanonicalIdentity(bounds: bounds)
-                if let sourceProof {
-                    try withRevalidatedSource(sourceProof) {
-                        try posix.renameAt(
-                            sourceDirectoryFD: parent,
-                            source: tempName,
-                            destinationDirectoryFD: parent,
-                            destination: leaf,
-                            exclusive: disposition == .createOnly
-                        )
-                    }
-                } else {
-                    try posix.renameAt(
+                let renamePreparedTemp = {
+                    try self.posix.renameAt(
                         sourceDirectoryFD: parent,
                         source: tempName,
                         destinationDirectoryFD: parent,
@@ -1177,11 +2744,35 @@ final class NativeLockedBookDirectory {
                         exclusive: disposition == .createOnly
                     )
                 }
+                if let expectedManagedProof {
+                    guard let sourceProof else {
+                        throw NativeDurableFileWriterError.sourceMissing
+                    }
+                    try withRevalidatedSource(sourceProof) {
+                        try withRevalidatedManagedProof(
+                            expectedManagedProof,
+                            parentDirectoryFD: parent,
+                            leaf: leaf,
+                            bounds: bounds,
+                            perform: renamePreparedTemp
+                        )
+                    }
+                } else if let sourceProof {
+                    try withRevalidatedSource(sourceProof, perform: renamePreparedTemp)
+                } else {
+                    try renamePreparedTemp()
+                }
                 renamed = true
                 try emit(.afterRename, role: role, targetName: relativePath)
+                if revalidateSourceAfterRename, let sourceProof {
+                    try revalidateSource(sourceProof)
+                }
                 try posix.syncDirectory(directoryFD: parent)
                 try emit(.afterParentDirectoryFSync, role: role, targetName: relativePath)
                 try revalidateCanonicalIdentity(bounds: bounds)
+                if revalidateSourceAfterRename, let sourceProof {
+                    try revalidateSource(sourceProof)
+                }
 
                 let finalFD = try posix.openAt(
                     directoryFD: parent,
@@ -1209,6 +2800,9 @@ final class NativeLockedBookDirectory {
                     expectedIdentity: NativeFileIdentity(finalStat)
                 )
                 try revalidateCanonicalIdentity(bounds: bounds)
+                if revalidateSourceAfterRename, let sourceProof {
+                    try revalidateSource(sourceProof)
+                }
                 return receipt
             } catch {
                 if !renamed {
@@ -1332,6 +2926,8 @@ final class NativeLockedBookDirectory {
     }
 
     private var primaryName: String { "AssetTrackerBook.json" }
+    private var ordinaryIndexPath: String { "Recovery/ordinary/slots.json" }
+    private var snapshotIndexPath: String { "Recovery/snapshots/index.json" }
 
     private func validateReadableFilePath(_ path: String) throws -> ReadableFileKind {
         if path == primaryName { return .primary }
@@ -1359,8 +2955,14 @@ final class NativeLockedBookDirectory {
             guard path == "Recovery/ordinary/slots.json", disposition == .replace else {
                 throw NativeDurableFileWriterError.invalidRoleTarget
             }
-        case .snapshotEmptyIndex, .snapshotFinalIndex, .snapshotHealthIndex:
-            guard path == "Recovery/snapshots/index.json", disposition == .replace else {
+        case .snapshotEmptyIndex:
+            guard path == snapshotIndexPath,
+                  disposition == .replace || disposition == .createOnly
+            else {
+                throw NativeDurableFileWriterError.invalidRoleTarget
+            }
+        case .snapshotFinalIndex, .snapshotHealthIndex:
+            guard path == snapshotIndexPath, disposition == .replace else {
                 throw NativeDurableFileWriterError.invalidRoleTarget
             }
         case .ordinaryBlob:
@@ -1415,12 +3017,14 @@ final class NativeLockedBookDirectory {
         let name = String(path.dropFirst(prefix.count))
         guard !name.contains("/"), name.hasSuffix(".json") else { return nil }
         let hash = String(name.dropLast(5))
-        guard hash.count == 64,
-              hash.allSatisfy({ $0.isNumber || ("a" ... "f").contains(String($0)) })
-        else {
+        guard isLowercaseASCIIHash(hash) else {
             return nil
         }
         return hash
+    }
+
+    private func ordinaryBlobHash(fromLeaf leaf: String) -> String? {
+        blobHash(from: "Recovery/ordinary/blobs/\(leaf)", prefix: "Recovery/ordinary/blobs/")
     }
 
     private func splitPath(_ path: String) throws -> [String] {
@@ -1436,9 +3040,7 @@ final class NativeLockedBookDirectory {
 
     private func validateHash(_ source: ExpectedBookSource) throws {
         guard case .sha256(let hash) = source else { return }
-        guard hash.count == 64,
-              hash.allSatisfy({ $0.isNumber || ("a" ... "f").contains(String($0)) })
-        else {
+        guard isLowercaseASCIIHash(hash) else {
             throw NativeDurableFileWriterError.sourceChanged
         }
     }
@@ -1447,6 +3049,121 @@ final class NativeLockedBookDirectory {
         try lease.requireActive()
         guard proof.leaseID == lease.id, proof.targetName == primaryName else {
             throw NativeDurableFileWriterError.leaseExpired
+        }
+    }
+
+    private func makeManagedFileProof(
+        bytes: Data,
+        relativePath: String,
+        role: NativeDurabilityRole,
+        identity: NativeFileIdentity
+    ) -> NativeManagedFileProof {
+        NativeManagedFileProof(
+            bytes: bytes,
+            leaseID: lease.id,
+            relativePath: relativePath,
+            role: role,
+            device: identity.device,
+            inode: identity.inode
+        )
+    }
+
+    private func validateManagedProof(_ proof: NativeManagedFileProof) throws {
+        try lease.requireActive()
+        guard proof.leaseID == lease.id else {
+            throw NativeDurableFileWriterError.leaseExpired
+        }
+        guard (proof.relativePath == ordinaryIndexPath && proof.role == .ordinaryHealthIndex)
+                || (proof.relativePath == snapshotIndexPath && proof.role == .snapshotHealthIndex)
+        else {
+            throw NativeDurableFileWriterError.invalidRoleTarget
+        }
+        guard proof.byteCount == proof.bytes.count,
+              proof.sha256 == sha256Hex(proof.bytes)
+        else {
+            throw NativeDurableFileWriterError.contentMismatch
+        }
+    }
+
+    private func withRevalidatedManagedProof<T>(
+        _ proof: NativeManagedFileProof,
+        parentDirectoryFD: Int32,
+        leaf: String,
+        bounds: [BoundDirectory],
+        perform body: () throws -> T
+    ) throws -> T {
+        try validateManagedProof(proof)
+        guard proof.relativePath.split(separator: "/").last.map(String.init) == leaf else {
+            throw NativeDurableFileWriterError.invalidRoleTarget
+        }
+        let fileFD: Int32
+        do {
+            fileFD = try posix.openAt(
+                directoryFD: parentDirectoryFD,
+                path: leaf,
+                flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+                mode: 0
+            )
+        } catch where isMissingPOSIXError(error) {
+            try proveCanonicalNameMissing(
+                parentDirectoryFD: parentDirectoryFD,
+                leaf: leaf,
+                bounds: bounds
+            )
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        defer { posix.close(fileFD: fileFD) }
+
+        try validateManagedFile(fileFD: fileFD, expectedModes: [0o600])
+        let value = try posix.fstat(fileFD: fileFD)
+        let identity = NativeFileIdentity(value)
+        let bytes = try readAll(fileFD: fileFD)
+        guard identity.device == proof.device,
+              identity.inode == proof.inode
+        else {
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        guard bytes == proof.bytes,
+              bytes.count == proof.byteCount,
+              sha256Hex(bytes) == proof.sha256
+        else {
+            throw NativeDurableFileWriterError.contentMismatch
+        }
+        try validateManagedFile(fileFD: fileFD, expectedModes: [0o600])
+        try validateCanonicalLeaf(
+            fileFD: fileFD,
+            parentDirectoryFD: parentDirectoryFD,
+            leaf: leaf,
+            expectedIdentity: identity
+        )
+        try revalidateCanonicalIdentity(bounds: bounds)
+        try validateManagedFile(fileFD: fileFD, expectedModes: [0o600])
+        try validateCanonicalLeaf(
+            fileFD: fileFD,
+            parentDirectoryFD: parentDirectoryFD,
+            leaf: leaf,
+            expectedIdentity: identity
+        )
+        return try body()
+    }
+
+    private func validateExpectedSourceBytes(
+        _ expectedSourceBytes: Data?,
+        sourceProof: NativeSourceProof
+    ) throws {
+        try validateSourceProof(sourceProof)
+        switch sourceProof.expectedSource {
+        case .missing:
+            guard expectedSourceBytes == nil else {
+                throw NativeDurableFileWriterError.sourceChanged
+            }
+        case .sha256(let expectedHash):
+            guard let expectedSourceBytes,
+                  sha256Hex(expectedSourceBytes) == expectedHash,
+                  expectedSourceBytes.count == sourceProof.byteCount
+            else {
+                throw NativeDurableFileWriterError.sourceChanged
+            }
         }
     }
 
@@ -1539,6 +3256,175 @@ final class NativeLockedBookDirectory {
               NativeFileIdentity(byName) == expectedIdentity
         else {
             throw NativeDurableFileWriterError.identityChanged
+        }
+    }
+
+    private func withValidatedCrashTemp<T>(
+        expectedPrefix: Data?,
+        parentDirectoryFD: Int32,
+        leaf: String,
+        bounds: [BoundDirectory],
+        _ body: (Data, NativeFileIdentity) throws -> T
+    ) throws -> T {
+        let fileFD: Int32
+        do {
+            fileFD = try posix.openAt(
+                directoryFD: parentDirectoryFD,
+                path: leaf,
+                flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+                mode: 0
+            )
+        } catch where isMissingPOSIXError(error) {
+            try proveCanonicalNameMissing(
+                parentDirectoryFD: parentDirectoryFD,
+                leaf: leaf,
+                bounds: bounds
+            )
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        defer { posix.close(fileFD: fileFD) }
+
+        try validateManagedFile(fileFD: fileFD, expectedModes: [0o600])
+        let identity = NativeFileIdentity(try posix.fstat(fileFD: fileFD))
+        let bytes = try readAll(fileFD: fileFD)
+        if let expectedPrefix {
+            guard bytes.count <= expectedPrefix.count,
+                  expectedPrefix.starts(with: bytes)
+            else {
+                throw NativeDurableFileWriterError.contentMismatch
+            }
+        }
+        try validateManagedFile(fileFD: fileFD, expectedModes: [0o600])
+        try validateCanonicalLeaf(
+            fileFD: fileFD,
+            parentDirectoryFD: parentDirectoryFD,
+            leaf: leaf,
+            expectedIdentity: identity
+        )
+        try revalidateCanonicalIdentity(bounds: bounds)
+        try validateManagedFile(fileFD: fileFD, expectedModes: [0o600])
+        try validateCanonicalLeaf(
+            fileFD: fileFD,
+            parentDirectoryFD: parentDirectoryFD,
+            leaf: leaf,
+            expectedIdentity: identity
+        )
+        return try body(bytes, identity)
+    }
+
+    private func readCanonicalManagedFile(
+        parentDirectoryFD: Int32,
+        leaf: String,
+        bounds: [BoundDirectory]
+    ) throws -> (data: Data, identity: NativeFileIdentity) {
+        let fileFD: Int32
+        do {
+            fileFD = try posix.openAt(
+                directoryFD: parentDirectoryFD,
+                path: leaf,
+                flags: O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+                mode: 0
+            )
+        } catch where isMissingPOSIXError(error) {
+            try proveCanonicalNameMissing(
+                parentDirectoryFD: parentDirectoryFD,
+                leaf: leaf,
+                bounds: bounds
+            )
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        defer { posix.close(fileFD: fileFD) }
+
+        try validateManagedFile(fileFD: fileFD, expectedModes: [0o600])
+        let identity = NativeFileIdentity(try posix.fstat(fileFD: fileFD))
+        let data = try readAll(fileFD: fileFD)
+        try validateManagedFile(fileFD: fileFD, expectedModes: [0o600])
+        try validateCanonicalLeaf(
+            fileFD: fileFD,
+            parentDirectoryFD: parentDirectoryFD,
+            leaf: leaf,
+            expectedIdentity: identity
+        )
+        try revalidateCanonicalIdentity(bounds: bounds)
+        try validateCanonicalLeaf(
+            fileFD: fileFD,
+            parentDirectoryFD: parentDirectoryFD,
+            leaf: leaf,
+            expectedIdentity: identity
+        )
+        return (data, identity)
+    }
+
+    private func readCanonicalManagedDirectory(
+        parentDirectoryFD: Int32,
+        leaf: String,
+        bounds: [BoundDirectory]
+    ) throws -> NativeFileIdentity {
+        let namedStat: stat
+        do {
+            namedStat = try posix.fstatAt(
+                directoryFD: parentDirectoryFD,
+                path: leaf,
+                noFollow: true
+            )
+        } catch where isMissingPOSIXError(error) {
+            try proveCanonicalNameMissing(
+                parentDirectoryFD: parentDirectoryFD,
+                leaf: leaf,
+                bounds: bounds
+            )
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        let directoryFD: Int32
+        do {
+            directoryFD = try posix.openAt(
+                directoryFD: parentDirectoryFD,
+                path: leaf,
+                flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                mode: 0
+            )
+        } catch where isMissingPOSIXError(error) {
+            try proveCanonicalNameMissing(
+                parentDirectoryFD: parentDirectoryFD,
+                leaf: leaf,
+                bounds: bounds
+            )
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        defer { posix.close(fileFD: directoryFD) }
+
+        let identity = NativeFileIdentity(namedStat)
+        try validateCanonicalManagedDirectory(
+            fileFD: directoryFD,
+            parentDirectoryFD: parentDirectoryFD,
+            leaf: leaf,
+            expectedIdentity: identity
+        )
+        try revalidateCanonicalIdentity(bounds: bounds)
+        try validateCanonicalManagedDirectory(
+            fileFD: directoryFD,
+            parentDirectoryFD: parentDirectoryFD,
+            leaf: leaf,
+            expectedIdentity: identity
+        )
+        return identity
+    }
+
+    private func proveCanonicalNameMissing(
+        parentDirectoryFD: Int32,
+        leaf: String,
+        bounds: [BoundDirectory]
+    ) throws {
+        try revalidateCanonicalIdentity(bounds: bounds)
+        do {
+            _ = try posix.fstatAt(
+                directoryFD: parentDirectoryFD,
+                path: leaf,
+                noFollow: true
+            )
+            throw NativeDurableFileWriterError.identityChanged
+        } catch where isMissingPOSIXError(error) {
+            try revalidateCanonicalIdentity(bounds: bounds)
         }
     }
 
@@ -1698,27 +3584,80 @@ final class NativeLockedBookDirectory {
         return try body(currentFD, bounds)
     }
 
+    private func withBoundDirectoryIfPresent<T>(
+        components: [String],
+        _ body: (Int32, [BoundDirectory]) throws -> T
+    ) throws -> T? {
+        var currentFD = rootFD
+        var bounds: [BoundDirectory] = []
+        defer {
+            for bound in bounds.reversed() {
+                posix.close(fileFD: bound.fd)
+            }
+        }
+
+        for component in components {
+            let namedStat: stat
+            do {
+                namedStat = try posix.fstatAt(
+                    directoryFD: currentFD,
+                    path: component,
+                    noFollow: true
+                )
+            } catch where isMissingPOSIXError(error) {
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: currentFD,
+                    leaf: component,
+                    bounds: bounds
+                )
+                return nil
+            }
+
+            let fd: Int32
+            do {
+                fd = try posix.openAt(
+                    directoryFD: currentFD,
+                    path: component,
+                    flags: O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                    mode: 0
+                )
+            } catch where isMissingPOSIXError(error) {
+                try proveCanonicalNameMissing(
+                    parentDirectoryFD: currentFD,
+                    leaf: component,
+                    bounds: bounds
+                )
+                throw NativeDurableFileWriterError.identityChanged
+            }
+
+            do {
+                let fdStat = try posix.fstat(fileFD: fd)
+                try validateManagedDirectory(stat: fdStat, fileFD: fd)
+                guard NativeFileIdentity(fdStat) == NativeFileIdentity(namedStat) else {
+                    throw NativeDurableFileWriterError.identityChanged
+                }
+                bounds.append(BoundDirectory(
+                    fd: fd,
+                    parentFD: currentFD,
+                    name: component,
+                    identity: NativeFileIdentity(fdStat)
+                ))
+                currentFD = fd
+            } catch {
+                posix.close(fileFD: fd)
+                throw error
+            }
+        }
+
+        try revalidateCanonicalIdentity(bounds: bounds)
+        let value = try body(currentFD, bounds)
+        try revalidateCanonicalIdentity(bounds: bounds)
+        return value
+    }
+
     private func revalidateCanonicalIdentity(bounds: [BoundDirectory]) throws {
         try lease.requireActive()
-        let rootByFD = try posix.fstat(fileFD: rootFD)
-        let rootByName = try posix.fstatAt(directoryFD: parentFD, path: rootName, noFollow: true)
-        let lockByFD = try posix.fstat(fileFD: lockFD)
-        let lockByName = try posix.fstatAt(directoryFD: rootFD, path: lockName, noFollow: true)
-        guard NativeFileIdentity(rootByFD) == rootIdentity,
-              NativeFileIdentity(rootByName) == rootIdentity,
-              isDirectory(rootByFD), rootByFD.st_nlink > 0,
-              rootByFD.st_uid == effectiveUserID,
-              permissionBits(rootByFD) == 0o700,
-              try posix.extendedACLEntryCount(fileFD: rootFD) == 0,
-              NativeFileIdentity(lockByFD) == lockIdentity,
-              NativeFileIdentity(lockByName) == lockIdentity,
-              isRegularFile(lockByFD), lockByFD.st_nlink == 1,
-              lockByFD.st_uid == effectiveUserID,
-              permissionBits(lockByFD) == 0o600,
-              try posix.extendedACLEntryCount(fileFD: lockFD) == 0
-        else {
-            throw NativeDurableFileWriterError.identityChanged
-        }
+        try validateRootAndLockBinding()
         for bound in bounds {
             let byFD = try posix.fstat(fileFD: bound.fd)
             let byName = try posix.fstatAt(directoryFD: bound.parentFD, path: bound.name, noFollow: true)
@@ -1730,6 +3669,69 @@ final class NativeLockedBookDirectory {
                   try posix.extendedACLEntryCount(fileFD: bound.fd) == 0
             else {
                 throw NativeDurableFileWriterError.identityChanged
+            }
+        }
+        try validateRootAndLockBinding()
+    }
+
+    private func validateRootAndLockBinding() throws {
+        let rootByFD = try posix.fstat(fileFD: rootFD)
+        let rootByName = try posix.fstatAt(directoryFD: parentFD, path: rootName, noFollow: true)
+        guard NativeFileIdentity(rootByFD) == rootIdentity,
+              NativeFileIdentity(rootByName) == rootIdentity,
+              isDirectory(rootByFD), rootByFD.st_nlink > 0,
+              rootByFD.st_uid == effectiveUserID,
+              allowedRootModes.contains(permissionBits(rootByFD))
+        else {
+            throw NativeDurableFileWriterError.identityChanged
+        }
+        if requiresZeroRootACL {
+            guard try posix.extendedACLEntryCount(fileFD: rootFD) == 0 else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+        } else {
+            guard try !posix.hasDangerousLegacyACL(
+                fileFD: rootFD,
+                ownerUserID: effectiveUserID
+            ) else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+        }
+
+        switch (lockFD, lockIdentity) {
+        case (.some(let lockFD), .some(let lockIdentity)):
+            let lockByFD = try posix.fstat(fileFD: lockFD)
+            let lockByName = try posix.fstatAt(
+                directoryFD: rootFD,
+                path: lockName,
+                noFollow: true
+            )
+            guard NativeFileIdentity(lockByFD) == lockIdentity,
+                  NativeFileIdentity(lockByName) == lockIdentity,
+                  isRegularFile(lockByFD), lockByFD.st_nlink == 1,
+                  lockByFD.st_uid == effectiveUserID,
+                  permissionBits(lockByFD) == 0o600,
+                  try posix.extendedACLEntryCount(fileFD: lockFD) == 0
+            else {
+                throw NativeDurableFileWriterError.identityChanged
+            }
+        case (.none, .none):
+            do {
+                _ = try posix.fstatAt(directoryFD: rootFD, path: lockName, noFollow: true)
+                throw NativeDurableFileWriterError.identityChanged
+            } catch where isMissingPOSIXError(error) {
+                break
+            }
+        default:
+            throw NativeDurableFileWriterError.identityChanged
+        }
+
+        for name in requiredAbsentRootNames {
+            do {
+                _ = try posix.fstatAt(directoryFD: rootFD, path: name, noFollow: true)
+                throw NativeDurableFileWriterError.identityChanged
+            } catch where isMissingPOSIXError(error) {
+                continue
             }
         }
     }
@@ -1790,8 +3792,76 @@ final class NativeLockedBookDirectory {
     }
 }
 
+final class NativeReadOnlyBookDirectory {
+    private let core: NativeLockedBookDirectory
+
+    fileprivate init(core: NativeLockedBookDirectory) {
+        self.core = core
+    }
+
+    func readValidated(relativePath: String) throws -> Data? {
+        try core.readValidated(relativePath: relativePath)
+    }
+
+    func verifyPrimarySource(expectedSource: ExpectedBookSource) throws -> NativeSourceProof {
+        try core.verifyPrimarySource(expectedSource: expectedSource)
+    }
+
+    func enumerateIfPresent(relativePath: String) throws -> [NativeDirectoryEntry]? {
+        try core.enumerateIfPresent(relativePath: relativePath)
+    }
+
+    func auditOrdinaryIndexNamespace(
+        expectedEmptyIndexBytes: Data
+    ) throws -> NativeOrdinaryIndexNamespaceState {
+        try core.auditOrdinaryIndexNamespace(expectedEmptyIndexBytes: expectedEmptyIndexBytes)
+    }
+
+    func auditSnapshotIndexNamespace(
+        expectedEmptyIndexBytes: Data
+    ) throws -> NativeSnapshotIndexNamespaceState {
+        try core.auditSnapshotIndexNamespace(expectedEmptyIndexBytes: expectedEmptyIndexBytes)
+    }
+
+    func auditOrdinaryBlobNamespace(
+        expectedSourceBytes: Data?,
+        sourceProof: NativeSourceProof
+    ) throws -> NativeOrdinaryBlobNamespaceAudit {
+        try core.auditOrdinaryBlobNamespace(
+            expectedSourceBytes: expectedSourceBytes,
+            sourceProof: sourceProof
+        )
+    }
+
+    func revalidateCanonicalIdentity() throws {
+        try core.revalidateCanonicalIdentity()
+    }
+}
+
 private func sha256Hex(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+private func isLowercaseASCIIHash(_ value: String) -> Bool {
+    let bytes = value.utf8
+    guard bytes.count == 64 else { return false }
+    return bytes.allSatisfy { byte in
+        (48 ... 57).contains(byte) || (97 ... 102).contains(byte)
+    }
+}
+
+private let writerTempPrefix = ".AssetTracker.tmp."
+
+private func isCanonicalWriterTempName(_ value: String) -> Bool {
+    guard value.hasPrefix(writerTempPrefix) else { return false }
+    let suffix = String(value.dropFirst(writerTempPrefix.count))
+    guard suffix.utf8.count == 36,
+          suffix == suffix.lowercased(),
+          let uuid = UUID(uuidString: suffix)
+    else {
+        return false
+    }
+    return uuid.uuidString.lowercased() == suffix
 }
 
 private func permissionBits(_ value: stat) -> mode_t {

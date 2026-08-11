@@ -26,11 +26,324 @@ public indirect enum AssetTrackerBridgeJSONValue: Equatable, Sendable {
     }
 }
 
+public enum AssetTrackerNativeBridgeRequestValidationError: Error, Equatable, LocalizedError {
+    case invalidPayload(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidPayload(let message):
+            return message
+        }
+    }
+}
+
+public enum AssetTrackerNativeBridgeRequestParser {
+    private static let saveKeys: Set<String> = [
+        "protocolVersion",
+        "loadId",
+        "writeSessionToken",
+        "clientSaveId",
+        "stateJson",
+        "payloadHash",
+        "reason",
+        "expectedHash",
+        "validatedSourceHash",
+        "schemaVersion",
+    ]
+    private static let snapshotKeys: Set<String> = [
+        "protocolVersion",
+        "loadId",
+        "writeSessionToken",
+        "clientSnapshotId",
+        "reason",
+        "expectedHash",
+    ]
+
+    public static func durableSave(payload: [String: Any]) throws -> DurableBookSaveRequest {
+        try requireExactKeys(payload, expected: saveKeys)
+        let protocolVersion = try integer(payload, key: "protocolVersion")
+        let loadID = try string(payload, key: "loadId")
+        let writeSessionToken = try string(payload, key: "writeSessionToken")
+        let clientSaveID = try string(payload, key: "clientSaveId")
+        let stateJSON = try string(payload, key: "stateJson")
+        let payloadHash = try string(payload, key: "payloadHash")
+        let reason = try string(payload, key: "reason")
+        let expectedHash = try optionalString(payload, key: "expectedHash")
+        let validatedSourceHash = try optionalString(
+            payload,
+            key: "validatedSourceHash"
+        )
+        let schemaVersion = try integer(payload, key: "schemaVersion")
+        let authorization = AssetTrackerSaveAuthorization(
+            protocolVersion: protocolVersion,
+            loadID: loadID,
+            writeSessionToken: writeSessionToken,
+            expectedHash: expectedHash,
+            validatedSourceHash: validatedSourceHash
+        )
+        let request = DurableBookSaveRequest(
+            clientSaveID: clientSaveID,
+            expectedSource: expectedHash.map(ExpectedBookSource.sha256) ?? .missing,
+            payloadHash: payloadHash,
+            stateJSON: stateJSON,
+            schemaVersion: schemaVersion,
+            reason: reason,
+            authorization: authorization
+        )
+        try NativeDurableDTOValidator.validate(request)
+        return request
+    }
+
+    public static func snapshot(payload: [String: Any]) throws -> NativeSnapshotRequest {
+        try requireExactKeys(payload, expected: snapshotKeys)
+        let protocolVersion = try integer(payload, key: "protocolVersion")
+        let loadID = try string(payload, key: "loadId")
+        let writeSessionToken = try string(payload, key: "writeSessionToken")
+        let clientSnapshotID = try string(payload, key: "clientSnapshotId")
+        let reasonValue = try string(payload, key: "reason")
+        guard let reason = NativeSnapshotReason(rawValue: reasonValue) else {
+            throw invalid("无效的 reason")
+        }
+        let expectedHash = try string(payload, key: "expectedHash")
+        let request = NativeSnapshotRequest(
+            clientSnapshotID: clientSnapshotID,
+            reason: reason,
+            expectedHash: expectedHash,
+            authorization: AssetTrackerSaveAuthorization(
+                protocolVersion: protocolVersion,
+                loadID: loadID,
+                writeSessionToken: writeSessionToken,
+                expectedHash: expectedHash,
+                validatedSourceHash: expectedHash
+            )
+        )
+        try NativeDurableDTOValidator.validate(request)
+        return request
+    }
+
+    private static func requireExactKeys(
+        _ payload: [String: Any],
+        expected: Set<String>
+    ) throws {
+        guard Set(payload.keys) == expected else {
+            throw invalid("桥接请求字段不匹配")
+        }
+    }
+
+    private static func string(_ payload: [String: Any], key: String) throws -> String {
+        guard let value = payload[key] as? String else {
+            throw invalid("无效的 \(key)")
+        }
+        return value
+    }
+
+    private static func optionalString(
+        _ payload: [String: Any],
+        key: String
+    ) throws -> String? {
+        guard let value = payload[key] else {
+            throw invalid("缺少 \(key)")
+        }
+        if value is NSNull { return nil }
+        guard let string = value as? String else {
+            throw invalid("无效的 \(key)")
+        }
+        return string
+    }
+
+    private static func integer(_ payload: [String: Any], key: String) throws -> Int {
+        guard let value = payload[key], !(value is Bool), let integer = value as? Int else {
+            throw invalid("无效的 \(key)")
+        }
+        return integer
+    }
+
+    private static func invalid(
+        _ message: String
+    ) -> AssetTrackerNativeBridgeRequestValidationError {
+        .invalidPayload(message)
+    }
+}
+
+public enum AssetTrackerNativeBridgeDTOMapper {
+    public static func saveReceipt(
+        _ receipt: NativeDurableSaveReceipt
+    ) throws -> AssetTrackerBridgeJSONValue {
+        try NativeDurableDTOValidator.validate(receipt)
+        return .object([
+            "ok": .bool(true),
+            "clientSaveId": .string(receipt.clientSaveID),
+            "payloadHash": .string(receipt.payloadHash),
+            "sourceHashBefore": receipt.sourceHashBefore.map(AssetTrackerBridgeJSONValue.string) ?? .null,
+            "stateHashAfter": .string(receipt.stateHashAfter),
+            "stateHash": .string(receipt.stateHashAfter),
+            "byteCount": .integer(receipt.byteCount),
+            "durability": .string(durability(receipt.durability)),
+            "updatedAt": .string(verifiedTimestamp(receipt.updatedAt)),
+            "storagePath": .string(receipt.storagePath),
+            "recoveryHealth": recoveryHealth(receipt.recoveryHealth)
+        ])
+    }
+
+    public static func snapshotReceipt(
+        _ receipt: NativeSnapshotReceipt
+    ) throws -> AssetTrackerBridgeJSONValue {
+        try NativeDurableDTOValidator.validate(receipt)
+        guard let ordinal = Int(exactly: receipt.ordinal) else {
+            throw NativeDurableDTOValidationError.invalidOrdinal(receipt.ordinal)
+        }
+        return .object([
+            "ok": .bool(true),
+            "clientSnapshotId": .string(receipt.clientSnapshotID),
+            "sourceHash": .string(receipt.sourceHash),
+            "snapshotHash": .string(receipt.snapshotHash),
+            "ordinal": .integer(ordinal),
+            "snapshotStatus": .string(snapshotStatus(receipt.snapshotStatus)),
+            "durability": .string(durability(receipt.durability)),
+            "retainedCount": .integer(receipt.retainedCount),
+            "recoveryHealth": recoveryHealth(receipt.recoveryHealth)
+        ])
+    }
+
+    public static func terminalizationReceipt(
+        request: AssetTrackerTerminalizationRequest,
+        acknowledgement: AssetTrackerTerminalizationAcknowledgement
+    ) throws -> AssetTrackerBridgeJSONValue {
+        guard request.protocolVersion == 2,
+              !request.loadID.isEmpty,
+              AssetTrackerLegacyWriteGate.supportedTerminalizationReasons.contains(
+                  acknowledgement.reason
+              )
+        else {
+            throw AssetTrackerNativeBridgeRequestValidationError.invalidPayload(
+                "本机终止回执无效"
+            )
+        }
+        return .object([
+            "ok": .bool(true),
+            "protocolVersion": .integer(2),
+            "loadId": .string(request.loadID),
+            "reason": .string(acknowledgement.reason),
+            "gateState": .string("terminal-locked")
+        ])
+    }
+
+    public static func saveError(
+        _ proof: NativeDurableSaveErrorProof
+    ) throws -> AssetTrackerBridgeJSONValue {
+        try NativeDurableDTOValidator.validate(proof)
+        return .object([
+            "code": .string(proof.code),
+            "message": .string(proof.message),
+            "writeOutcome": .string(writeOutcome(proof.writeOutcome)),
+            "conflict": conflict(proof.conflict),
+            "clientSaveId": .string(proof.clientSaveID),
+            "payloadHash": .string(proof.payloadHash),
+            "sourceHashAfter": proof.sourceHashAfter.map(AssetTrackerBridgeJSONValue.string) ?? .null,
+            "sourceReverified": .bool(proof.sourceReverified),
+            "coordinatorReleased": .bool(proof.coordinatorReleased),
+            "healthPersisted": .bool(proof.healthPersisted),
+            "recoveryHealthEvidence": proof.recoveryHealthEvidence.map(recoveryHealth) ?? .null
+        ])
+    }
+
+    public static func snapshotError(
+        _ proof: NativeSnapshotErrorProof
+    ) throws -> AssetTrackerBridgeJSONValue {
+        try NativeDurableDTOValidator.validate(proof)
+        return .object([
+            "code": .string(proof.code),
+            "message": .string(proof.message),
+            "snapshotOutcome": .string(snapshotOutcome(proof.snapshotOutcome)),
+            "conflict": conflict(proof.conflict),
+            "clientSnapshotId": .string(proof.clientSnapshotID),
+            "sourceHashAfter": proof.sourceHashAfter.map(AssetTrackerBridgeJSONValue.string) ?? .null,
+            "sourceReverified": .bool(proof.sourceReverified),
+            "coordinatorReleased": .bool(proof.coordinatorReleased),
+            "healthPersisted": .bool(proof.healthPersisted),
+            "recoveryHealthEvidence": proof.recoveryHealthEvidence.map(recoveryHealth) ?? .null
+        ])
+    }
+
+    private static func durability(_ value: NativeDurability) -> String {
+        switch value {
+        case .nativeDurable:
+            return "native-durable"
+        }
+    }
+
+    private static func verifiedTimestamp(_ value: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: value)
+    }
+
+    private static func snapshotStatus(_ value: NativeSnapshotStatus) -> String {
+        switch value {
+        case .created:
+            return "created"
+        case .deduplicated:
+            return "deduplicated"
+        }
+    }
+
+    private static func writeOutcome(_ value: NativeWriteOutcome) -> String {
+        switch value {
+        case .notCommitted:
+            return "not-committed"
+        case .unknown:
+            return "unknown"
+        }
+    }
+
+    private static func snapshotOutcome(_ value: NativeSnapshotOutcome) -> String {
+        switch value {
+        case .notCreated:
+            return "not-created"
+        case .unknown:
+            return "unknown"
+        }
+    }
+
+    private static func conflict(_ value: NativeOperationConflict) -> AssetTrackerBridgeJSONValue {
+        switch value {
+        case .none:
+            return .bool(false)
+        case .sourceChanged:
+            return .string("source-changed")
+        case .sessionInvalid:
+            return .string("session-invalid")
+        }
+    }
+
+    fileprivate static func recoveryHealth(
+        _ health: NativeRecoveryHealth
+    ) -> AssetTrackerBridgeJSONValue {
+        let status: String
+        switch health.status {
+        case .healthy:
+            status = "healthy"
+        case .degraded:
+            status = "degraded"
+        case .notApplicable:
+            status = "not-applicable"
+        }
+        return .object([
+            "domain": .string(health.domain.rawValue),
+            "status": .string(status),
+            "auditComplete": .bool(health.auditComplete),
+            "code": health.code.map(AssetTrackerBridgeJSONValue.string) ?? .null,
+            "maintenancePendingCount": .integer(health.maintenancePendingCount),
+            "detail": health.detail.map(AssetTrackerBridgeJSONValue.string) ?? .null
+        ])
+    }
+}
+
 public struct AssetTrackerBridgeResponse: Equatable, Sendable {
     public let requestID: String
     public let ok: Bool
     public let result: AssetTrackerBridgeJSONValue?
-    public let error: String?
+    public let error: AssetTrackerBridgeJSONValue?
 
     public init(
         requestID: String,
@@ -41,7 +354,19 @@ public struct AssetTrackerBridgeResponse: Equatable, Sendable {
         self.requestID = requestID
         self.ok = ok
         self.result = result
-        self.error = error
+        self.error = error.map(AssetTrackerBridgeJSONValue.string)
+    }
+
+    private init(
+        requestID: String,
+        ok: Bool,
+        result: AssetTrackerBridgeJSONValue?,
+        structuredError: AssetTrackerBridgeJSONValue?
+    ) {
+        self.requestID = requestID
+        self.ok = ok
+        self.result = result
+        self.error = structuredError
     }
 
     public static func success(
@@ -53,6 +378,44 @@ public struct AssetTrackerBridgeResponse: Equatable, Sendable {
 
     public static func failure(requestID: String, error: String) -> Self {
         Self(requestID: requestID, ok: false, error: error)
+    }
+
+    public static func saveFailure(
+        requestID: String,
+        proof: NativeDurableSaveErrorProof
+    ) throws -> Self {
+        Self(
+            requestID: requestID,
+            ok: false,
+            result: nil,
+            structuredError: try AssetTrackerNativeBridgeDTOMapper.saveError(proof)
+        )
+    }
+
+    public static func snapshotFailure(
+        requestID: String,
+        proof: NativeSnapshotErrorProof
+    ) throws -> Self {
+        Self(
+            requestID: requestID,
+            ok: false,
+            result: nil,
+            structuredError: try AssetTrackerNativeBridgeDTOMapper.snapshotError(proof)
+        )
+    }
+
+    public static func terminalizationSuccess(
+        requestID: String,
+        request: AssetTrackerTerminalizationRequest,
+        acknowledgement: AssetTrackerTerminalizationAcknowledgement
+    ) throws -> Self {
+        .success(
+            requestID: requestID,
+            result: try AssetTrackerNativeBridgeDTOMapper.terminalizationReceipt(
+                request: request,
+                acknowledgement: acknowledgement
+            )
+        )
     }
 
     public static func loadSuccess(
@@ -72,7 +435,12 @@ public struct AssetTrackerBridgeResponse: Equatable, Sendable {
             "storagePath": .string(book.storagePath),
             "updatedAt": book.updatedAt.map { .string($0.ISO8601Format()) } ?? .null,
             "canExportRaw": .bool(book.canExportRaw),
-            "canRevealFolder": .bool(book.canRevealFolder)
+            "canRevealFolder": .bool(book.canRevealFolder),
+            "recoveryHealthComplete": .bool(book.recoveryHealthComplete),
+            "ordinaryRecoveryHealth": book.ordinaryRecoveryHealth
+                .map(AssetTrackerNativeBridgeDTOMapper.recoveryHealth) ?? .null,
+            "snapshotRecoveryHealth": book.snapshotRecoveryHealth
+                .map(AssetTrackerNativeBridgeDTOMapper.recoveryHealth) ?? .null
         ]))
     }
 
@@ -85,7 +453,7 @@ public struct AssetTrackerBridgeResponse: Equatable, Sendable {
             response["result"] = result.foundationValue
         }
         if let error {
-            response["error"] = error
+            response["error"] = error.foundationValue
         }
         return response
     }
