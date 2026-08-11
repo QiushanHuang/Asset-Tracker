@@ -1,0 +1,110 @@
+{
+  "categories": {
+    "银行卡": {
+      "id": "bank",
+      "name": "银行卡",
+      "balance": 0,
+      "currency": "CNY",
+      "isDebt": false,
+      "collapsed": false,
+      "children": {
+        "中国": {
+          "id": "bank-china",
+          "name": "中国",
+          "balance": 0,
+          "currency": "CNY",
+          "isDebt": false,
+          "collapsed": false,
+          "children": {
+            "ICBC": {
+              "id": "bank-china-icbc",
+              "name": "ICBC",
+              "balance": 1200,
+              "currency": "CNY",
+              "isDebt": false
+            }
+          }
+        },
+        "新加坡": {
+          "id": "bank-singapore",
+          "name": "新加坡",
+          "balance": 0,
+          "currency": "SGD",
+          "isDebt": false,
+          "collapsed": false,
+          "children": {
+            "ICBC": {
+              "id": "bank-singapore-icbc",
+              "name": "ICBC",
+              "balance": 300,
+              "currency": "SGD",
+              "isDebt": false
+            }
+          }
+        }
+      }
+    },
+    "支付宝": {
+      "id": "alipay",
+      "name": "支付宝",
+      "balance": 0,
+      "currency": "CNY",
+      "isDebt": false,
+      "collapsed": false,
+      "children": {
+        "钱包": {
+          "id": "alipay-wallet",
+          "name": "钱包",
+          "balance": 400,
+          "currency": "CNY",
+          "isDebt": false
+        }
+      }
+    }
+  },
+  "transactions": [
+    {
+      "id": "txn-1",
+      "date": "2026-04-01",
+      "category": "银行卡",
+      "subcategory": "ICBC",
+      "amount": -20,
+      "currency": "CNY",
+      "type": "单次",
+      "purpose": "餐饮美食",
+      "description": "午饭",
+      "timestamp": "2026-04-01T12:00:00.000Z"
+    }
+  ],
+  "automationRules": [],
+  "purposeCategories": ["餐饮美食", "交通出行"],
+  "initialAssets": {
+    "银行卡/中国/ICBC": 1200
+  },
+  "memo": "legacy memo",
+  "transactionTemplates": [
+    {
+      "id": "template-1",
+      "name": "早餐",
+      "category": "支付宝",
+      "subcategory": "钱包",
+      "amount": -15,
+      "currency": "CNY",
+      "type": "单次",
+      "purpose": "餐饮美食",
+      "description": "早餐费用"
+    }
+  ],
+  "settings": {
+    "baseCurrency": "CNY",
+    "exchangeRates": {
+      "CNY": 1,
+      "SGD": 5.2,
+      "USD": 7.2,
+      "MYR": 1.6
+    },
+    "autoBackup": true,
+    "backupInterval": 24,
+    "autoExportData": false
+  }
+}

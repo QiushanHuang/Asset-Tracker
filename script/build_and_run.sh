@@ -5,6 +5,8 @@ MODE="${1:-run}"
 APP_NAME="AssetTracker"
 BUNDLE_NAME="AssetTracker.app"
 BUNDLE_ID="com.qiushan.AssetTracker"
+APP_VERSION="${ASSET_TRACKER_VERSION:-3.1.0}"
+APP_BUILD="${ASSET_TRACKER_BUILD:-1}"
 MIN_SYSTEM_VERSION="14.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,6 +45,10 @@ cat >"$INFO_PLIST" <<PLIST
   <string>智能资产记账</string>
   <key>CFBundleDisplayName</key>
   <string>智能资产记账</string>
+  <key>CFBundleShortVersionString</key>
+  <string>$APP_VERSION</string>
+  <key>CFBundleVersion</key>
+  <string>$APP_BUILD</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>
@@ -85,4 +91,3 @@ case "$MODE" in
     exit 2
     ;;
 esac
-

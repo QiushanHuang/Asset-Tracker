@@ -1396,6 +1396,84 @@ tr:hover {
     font-size: 0.95rem;
 }
 
+.app-status,
+.data-safety-status {
+    position: relative;
+    z-index: 20;
+    padding: 0.65rem 1rem;
+    color: #24324a;
+    background: #eef3ff;
+    border-bottom: 1px solid #cbd7ee;
+}
+
+.data-safety-status:empty {
+    display: none;
+}
+
+.recovery-surface {
+    min-height: calc(100vh - 3rem);
+    padding: 3rem 1rem;
+    background: #f5f7fb;
+}
+
+.recovery-surface[hidden],
+#normal-app-shell[hidden] {
+    display: none !important;
+}
+
+.recovery-card {
+    width: min(680px, 100%);
+    margin: 0 auto;
+    padding: 2rem;
+    color: #1d2939;
+    background: #fff;
+    border: 1px solid #cbd5e1;
+    border-radius: 12px;
+    box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+}
+
+.recovery-kicker {
+    margin: 0 0 0.5rem;
+    color: #9a3412;
+    font-weight: 700;
+}
+
+.recovery-card h1 {
+    margin: 0 0 1rem;
+}
+
+.recovery-detail,
+.recovery-protection,
+.recovery-relaunch-note {
+    line-height: 1.6;
+}
+
+.recovery-source-detail {
+    padding: 0.85rem;
+    overflow-wrap: anywhere;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+}
+
+.recovery-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-top: 1rem;
+}
+
+.recovery-actions [hidden] {
+    display: none !important;
+}
+
+.recovery-relaunch-note {
+    color: #9a3412;
+    font-weight: 600;
+}
+
 /* 鼠标悬停提示样式 */
 .tooltip {
     position: fixed;

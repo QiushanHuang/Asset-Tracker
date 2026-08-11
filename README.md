@@ -1,6 +1,11 @@
 # 智能资产记账系统 (Asset Tracker)
 
+[![简体中文](https://img.shields.io/badge/语言-简体中文-1677ff)](./README.md)
+[![English](https://img.shields.io/badge/Language-English-24292f)](./README.en.md)
+
 一个功能丰富的个人资产管理和记账可视化系统，支持多币种、多层级分类管理、趋势分析和自动记账等功能。
+
+当前正式版本为 **v3.1.0**。本版本重点完成 macOS 原生耐久保存、崩溃恢复、版本快照、双域健康状态和严格桥接协议。详见 [更新日志](./CHANGELOG.md) 与 [v3.1.0 发行说明](./docs/releases/v3.1.0.md)。
 
 ## 🚀 核心功能
 
@@ -31,12 +36,15 @@
 ## 📁 项目结构
 
 ```
-可视化jz/
-├── index.html          # 主页面结构
-├── styles.css          # 样式文件
-├── script.js           # 核心业务逻辑
-├── README.md           # 项目文档
-└── 记账.rtf            # 需求文档
+.
+├── index.html          # 当前静态前端入口
+├── styles.css          # 当前前端样式
+├── script.js           # 当前前端业务逻辑
+├── macos-app/          # Swift/AppKit/WKWebView 原生包装与耐久存储
+├── app/                # TypeScript + IndexedDB 演进实现
+├── tests/              # Web/跨层验收测试
+├── docs/               # 设计、计划、完成日志和发行说明
+└── script/             # 构建、资源同步与本地运行脚本
 ```
 
 ## 🛠 技术栈
@@ -188,7 +196,15 @@ xattr -dr com.apple.quarantine dist/AssetTracker.app
 
 ## 🔄 最近更新
 
-### v3.0 (当前版本)
+### v3.1.0 (当前版本，2026-08-11)
+- ✅ **原生耐久保存**: 保存回执绑定精确源状态、持久化哈希和完成状态
+- ✅ **崩溃恢复**: ordinary 主账本恢复、pending 清理和故障后收敛
+- ✅ **版本快照**: 创建、去重、保留策略、健康状态与安全清理
+- ✅ **严格桥接协议**: `storage.save`、`storage.snapshot`、load 和 terminal 回执无损映射
+- ✅ **真实进程故障验证**: 覆盖关键 rename 边界与双进程 CAS
+- ✅ **正式未签名发行包**: 提供可复现的 `.app`、zip 和 SHA-256 校验和
+
+### v3.0 (历史版本)
 - ✅ **拖拽排序功能修复**: 真实的分类重新排序，支持跨层级拖拽
 - ✅ **统一交易表单**: 添加和编辑交易功能完全统一，包含货币选择和时间设置
 - ✅ **资产趋势图精度提升**: 修复计算逻辑，基于真实交易记录准确反映资产变化
@@ -240,5 +256,5 @@ MIT License - 详见 LICENSE 文件
 ---
 
 **作者**: Joshua
-**更新时间**: 2025-01-16
-**版本**: v3.0
+**更新时间**: 2026-08-11
+**版本**: v3.1.0
