@@ -35,9 +35,8 @@ Local use needs no hosted account; shared books run on a NAS you control.
 | Importing or saving leaves you unsure what changed, whether a row was duplicated, or whether a save completed | Import previews show errors and duplicates; native saves have confirmation; NAS conflicts retain drafts and unknown-result retries do not create a second write |
 | A converted total looks precise but the rate or forecast assumptions are unclear | Original currencies remain visible, missing rates stay unconverted, and analysis states its calculation assumptions |
 
-The advantage is the combination: **clear bookkeeping structure, ownership of
-your data, deliberate sharing, and visible import/save outcomes** in one
-open-source workflow. The comparison describes workflow trade-offs; use the scope table below to decide whether this approach fits your needs.
+Enter each purchase once. Review it by account, project or period, and keep
+personal records and shared household spending in separate books.
 
 ### Where it fits
 
@@ -52,7 +51,7 @@ open-source workflow. The comparison describes workflow trade-offs; use the scop
 
 ![Asset overview with synthetic demonstration data](docs/images/overview.png)
 
-*All published screenshots and examples use fictional demonstration data.*
+*Screenshots use fictional demo data.*
 
 ## Install
 
@@ -66,13 +65,12 @@ Download **v3.2.1** from [Releases](https://github.com/QiushanHuang/Asset-Tracke
 | `AssetTracker-v3.2.1-nas-linux-amd64.tar.gz` | Prebuilt image for an x86-64 NAS; useful when the NAS cannot pull build images |
 | `SHA256SUMS.txt` | SHA-256 checksums for these downloads |
 
-The application interface currently uses Simplified Chinese; the README and guides are bilingual.
+The app interface is in Simplified Chinese. Choose English or Chinese in this README and the operating guides.
 
-The macOS application is **unsigned and not notarized**. Verify the checksum,
-unzip the application, and use the macOS security controls to allow it if
-required. Installation instructions and data locations are in the
-[user guide](docs/user-guide.md#installation). Intel macOS binaries and native
-Windows/Linux applications are not included in this release.
+The macOS download is **unsigned and not notarized**. After checking its checksum
+and unzipping it, approve it in macOS Privacy & Security if prompted. See the
+[user guide](docs/user-guide.md#installation) for installation and updates.
+Use the web package on other computers.
 
 ### Run the local web interface
 
@@ -82,23 +80,21 @@ Extract the web archive, open a terminal in its directory, then run:
 python3 -m http.server 8000 --bind 127.0.0.1
 ```
 
-Open `http://127.0.0.1:8000`. Use a local server rather than opening `index.html`
-directly. Each browser profile and origin has its own local book.
+Open `http://127.0.0.1:8000`. Keep using the same browser profile and address to
+return to the same book. Start the local server whenever you use this package.
 
 ### Build the macOS application
 
-With Xcode Command Line Tools and Node.js 24.11.0 installed:
+With Xcode Command Line Tools installed:
 
 ```sh
 git clone https://github.com/QiushanHuang/Asset-Tracker.git
 cd Asset-Tracker
-npm ci --prefix app
 ASSET_TRACKER_CONFIGURATION=release ./script/build_and_run.sh --stage-only
 open dist/AssetTracker.app
 ```
 
-The `app/` directory contains the separate TypeScript/IndexedDB development
-track. It is not the default web or macOS interface distributed here.
+
 
 ## Start here
 
@@ -118,8 +114,8 @@ track. It is not the default web or macOS interface distributed here.
 | Expense category | What the money was spent on, within that project |
 | Personal/shared/family book | A NAS book's membership and visibility boundary |
 
-A project is not a security boundary. Use separate NAS books and membership
-permissions when records must be private.
+Use projects to organize activities within a book. Use separate NAS books and
+member permissions to choose who can see those records.
 
 <details>
 <summary>See a project bookkeeping example</summary>
@@ -135,10 +131,10 @@ permissions when records must be private.
 - **Future & scenarios** — deterministic forecasts from recorded rules and explicit assumptions.
 - **Structure & inventory** — composition, inventory anchors, category trees and summaries.
 
-Rates are entered by the user; this is not a live exchange-rate feed. Historical
-reference rates and calculation assumptions are shown explicitly. Missing rates
-remain unconverted. Forecasts are estimates derived from your inputs, not
-verified future results.
+Enter the exchange rates you want to use, then review the rate and calculation
+notes beside each analysis. Amounts with missing rates stay separate so you can
+complete the rates before comparing totals. Forecasts follow your rules and
+assumptions; update them as your plans change.
 
 <details>
 <summary>See the local analysis workspace</summary>
@@ -152,12 +148,12 @@ verified future results.
 | Capability | Local macOS / local web | NAS collaboration |
 | --- | --- | --- |
 | Personal asset book | Yes | Yes, with a separate service account |
-| Project/category management and four analysis workspaces | Full local interface | Select categories from imported projects; full editors/analysis are not yet ported |
-| Recurring rules | Local rule management and catch-up | Rule data can be retained in JSON; no NAS scheduling engine |
+| Project/category management and four analysis workspaces | Full local interface | Categories from imported projects; use the local app for detailed analysis and category setup |
+| Recurring rules | Local rule management and catch-up | Rule data stays in JSON exports; recurring bookkeeping runs in the local app |
 | Members and shared books | No | Owner, editor and viewer roles; private books cannot be shared |
 | Import/export | Excel, CSV and full JSON | Full JSON, imported as a new private book |
 | Storage | Native macOS ledger / browser localStorage | SQLite on your NAS's persistent Docker volume |
-| Synchronization | No automatic synchronization with NAS books | Online shared service; conflict detection and idempotent retries |
+| Synchronization | Move a book deliberately with JSON export/import | Online shared books, revision checks and duplicate-safe retries |
 
 ### Personal, shared and family books
 
@@ -166,28 +162,25 @@ require an invitation. Owners manage members, editors can change records, and
 viewers can read and export. Invitations expire after 24 hours and can be used
 once; removed members lose service access immediately.
 
-Household summaries include only the shared/family books you select. They keep
-currencies separate and exclude paired internal transfers. A household summary
-is a cash-flow summary, not a consolidated net-worth statement or an IOU/AA
-settlement system. Transfers currently support two non-liability accounts in
-the same currency within one book.
+Select the shared/family books you want to include in a household summary. It
+shows income, spending and net cash flow by currency, with paired internal
+transfers left out of income/spending. Use transfers to move money between two
+non-liability accounts in the same currency within one book.
 
 ### Open from a UGREEN NAS
 
 Use the [NAS deployment guide](deploy/ugreen/README.md#english) to deploy the
 service and create a **Family Ledger / 家庭记账** Docker desktop shortcut.
-The shortcut may open the system browser. No purchased domain is required for
-the explicitly configured **trusted-LAN** setup.
+The shortcut opens the bookkeeping page, sometimes in your system browser.
+The **trusted-LAN** setup works with your NAS’s local address, without buying a domain.
 
-The LAN template enables HTTP only for the NAS's configured private IPv4
-address and the page served from that same origin. **HTTP traffic is not
-encrypted.** Use this mode only on a trusted local network; do not forward its
-port to the public internet. HTTPS remains the default for other remote
-connections. No Tailscale, domain or public endpoint is created automatically.
+For the LAN template, enter your NAS’s private IPv4 address and open the page
+from that address. **HTTP traffic is unencrypted**, so use it on a trusted local
+network and keep its port off the public internet. Use HTTPS for other remote connections.
 
-The NAS module is an early collaboration release. Phone layouts have been
-checked at a narrow viewport; that does not establish physical-phone or
-UGREENlink remote-access compatibility on every device.
+On a phone, open the NAS entry from the same trusted network. Before relying on
+a different UGREENlink or remote-access route, check opening, signing in and
+saving a record through that route.
 
 ## Import, export and recovery
 
@@ -195,9 +188,8 @@ UGREENlink remote-access compatibility on every device.
   missing/ambiguous accounts and invalid project references block the import.
   Identical stable IDs are skipped; changed content under the same ID is a conflict.
   Content-only duplicates require an explicit choice.
-- **Excel export:** intended for inspection and transaction round trips. It is
-  not a complete backup of rules, settings, members or recovery history. Internal
-  transfers and legacy debt balance-delta records require full JSON import.
+- **Excel export:** inspect transactions and re-import supported rows. Use full
+  JSON for a complete book backup, internal transfers and legacy debt records.
 - **Full JSON:** preserves the local book's accounts, transactions, projects,
   rules and settings. Local replacement first requests an export of the current
   book. Confirm that the backup file was actually saved.
@@ -222,6 +214,9 @@ See [release notes](docs/releases/v3.2.1.md#english), the [changelog](CHANGELOG.
 and the [user guide](docs/user-guide.md#english) for details and limitations.
 
 ## Develop and contribute
+
+The shipped web UI lives at the repository root; the macOS build stages those files.
+`app/` contains the separate TypeScript/IndexedDB development track and shared test dependencies. Use Node.js 24.11.0 for the checks and NAS service.
 
 ```sh
 npm ci --prefix app
@@ -267,8 +262,7 @@ See [contributors](CONTRIBUTORS.md). Licensed under the [MIT License](LICENSE).
 | 导入怕重复、保存后不知道是否成功，多人修改又担心相互覆盖 | 先预览错误与重复项；原生保存有确认；NAS冲突保留输入，结果未知时重试同一操作 |
 | 折算总额和预测看起来很精确，却不知道汇率或计算假设 | 保留原币，缺失汇率明确标成未折算，分析展示计算口径和假设 |
 
-主要优势是把**账目结构清楚、数据自己掌握、共享边界明确、导入保存有反馈**放在同一套开源流程里。
-上表比较的是记账流程的取舍，可以结合下方功能范围判断是否适合你。
+一笔账只录一次，回看时按账户、项目或时间查看。个人记录留在自己的账本，家庭开销放进共享账本。
 
 ### 快速看看适不适合你
 
@@ -279,7 +273,7 @@ See [contributors](CONTRIBUTORS.md). Licensed under the [MIT License](LICENSE).
 
 ![使用虚构演示数据的资产概览](docs/images/overview.png)
 
-*公开截图和示例全部使用虚构数据，不包含个人真实账目。*
+*截图使用虚构演示数据。*
 
 ### 下载安装
 
@@ -293,8 +287,8 @@ See [contributors](CONTRIBUTORS.md). Licensed under the [MIT License](LICENSE).
 | `AssetTracker-v3.2.1-nas-linux-amd64.tar.gz` | x86-64 NAS 的预构建镜像，可免去 NAS 上的在线构建 |
 | `SHA256SUMS.txt` | 下载文件的 SHA-256 校验值 |
 
-macOS 应用**未签名、未公证**。核对校验值、解压应用，必要时通过 macOS 的安全设置允许打开。
-详细步骤见[使用手册](docs/user-guide.md#中文)。本次未提供 Intel Mac、Windows 或 Linux 的原生安装包。
+macOS 安装包**未签名、未公证**。核对校验值并解压后，如系统提示，请在“隐私与安全性”中允许打开。
+安装和更新步骤见[使用手册](docs/user-guide.md#中文)；其他电脑可选择网页包。
 
 网页包解压后，在目录内运行：
 
@@ -302,19 +296,18 @@ macOS 应用**未签名、未公证**。核对校验值、解压应用，必要�
 python3 -m http.server 8000 --bind 127.0.0.1
 ```
 
-浏览器打开 `http://127.0.0.1:8000`。不要直接双击 `index.html`；不同浏览器、用户配置和访问地址拥有各自独立的本地账本。
+浏览器打开 `http://127.0.0.1:8000`。每次使用时启动本地服务，并保持相同的浏览器配置和访问地址，就能回到同一本账。
 
-从源码构建 macOS 版（需要 Xcode Command Line Tools 和 Node.js 24.11.0）：
+从源码构建 macOS 版（需要 Xcode Command Line Tools）：
 
 ```sh
 git clone https://github.com/QiushanHuang/Asset-Tracker.git
 cd Asset-Tracker
-npm ci --prefix app
 ASSET_TRACKER_CONFIGURATION=release ./script/build_and_run.sh --stage-only
 open dist/AssetTracker.app
 ```
 
-`app/` 是单独的 TypeScript/IndexedDB 演进实现，并非本次默认网页和 macOS 安装包的入口。
+
 
 ### 从第一笔账开始
 
@@ -325,7 +318,7 @@ open dist/AssetTracker.app
 5. 在**数据分析**查看结果，并定期导出完整 JSON 备份。
 
 **资金账户**回答“钱在哪里”，**项目**回答“属于哪件事”，**消费分类**回答“花在什么地方”。
-NAS 的个人/共同/家庭**账本**才是成员权限边界；同一本账里的项目不提供隐私隔离。
+需要决定谁可以查看记录时，使用单独的 NAS **账本**和成员权限；项目用于整理同一本账里的活动。
 
 ### 四个分析面板
 
@@ -334,41 +327,40 @@ NAS 的个人/共同/家庭**账本**才是成员权限边界；同一本账里�
 - **未来与假设**：根据已记录规则与明确假设进行确定性推演。
 - **结构与盘点**：资产构成、盘点锚点、分类树及自定义汇总。
 
-汇率由使用者维护，不是实时行情服务。历史参考汇率、计算口径会明确显示；缺少汇率的金额保留为未折算项。
-预测来自输入数据和假设，不代表已验证的未来结果。
+填入你希望采用的汇率，在分析面板中查看历史参考值和计算口径。缺少汇率的金额会单独保留，补齐后再比较总额。
+预测跟随你输入的规则和假设，计划变化时也可以随时调整。
 
 ### 本地账本与 NAS 共同记账
 
 | 能力 | macOS / 本地网页 | NAS 协作版 |
 | --- | --- | --- |
 | 个人资产记账 | 支持 | 支持，使用单独的记账服务账户 |
-| 项目分类管理与四大分析 | 完整本地界面 | 可选择导入项目的分类；完整编辑器和分析尚未迁移 |
-| 自动记账规则 | 本地规则管理与补记 | JSON 可保留规则数据，暂无 NAS 定时执行器 |
+| 项目分类管理与四大分析 | 完整本地界面 | 可选择导入项目的分类；详细分析和分类维护在本地应用中完成 |
+| 自动记账规则 | 本地规则管理与补记 | JSON 保留规则数据，周期记账在本地应用中执行 |
 | 多人成员权限 | 无 | 拥有者、可记账、只读；个人账本禁止共享 |
 | 导入导出 | Excel、CSV、完整 JSON | 完整 JSON，导入为新的个人私有账本 |
 | 存储位置 | Mac 原生账本 / 浏览器 localStorage | NAS 独立 Docker 数据卷中的 SQLite |
-| 同步方式 | 不自动与 NAS 账本互相同步 | 在线共享服务，版本冲突保护与幂等重试 |
+| 同步方式 | 通过 JSON 导出/导入迁移账本 | 在线共同记账，检查版本冲突并避免重复提交 |
 
 个人 NAS 账本仅拥有者可见；共同和家庭账本通过邀请加入。拥有者管理成员，编辑者记账，只读成员可查看与导出。
 邀请口令 24 小时有效，只能使用一次；移除成员后会立即撤销其服务端访问权限。
 
-家庭汇总仅包含你主动勾选的共同/家庭账本，按原币分别计算，排除成对的内部转账。
-它是**收支汇总**，不是合并净资产报表，也不是 AA 债务结算。
-转账目前支持同一本账中两个同币种、非负债账户之间的资金移动。
+勾选需要统计的共同/家庭账本，即可按原币查看收入、支出和收支结余；成对内部转账不计入收入和支出。
+同一本账中的两个同币种、非负债账户，可以通过“转账”记录资金移动。
 
 按照 [NAS 部署说明](deploy/ugreen/README.md#中文)部署后，在绿联 Docker 中创建“**家庭记账**”桌面快捷方式。
-点击后可能由系统浏览器打开；明确配置的**可信局域网**模式不要求购买域名。
+点击后打开记账页面，部分客户端会调用系统浏览器；**可信局域网**模式使用 NAS 的内网地址，无需购买域名。
 
-局域网模板只允许 NAS 指定的私有 IPv4 地址和当前同源页面使用 HTTP。**HTTP 传输不加密**，只用于可信内网，不能把端口直接映射到公网。
-其他远程地址仍要求 HTTPS。程序不会自动设置域名、公网入口或 Tailscale。
+使用局域网模板时，填入 NAS 的私有 IPv4 地址，并从该地址打开页面。**HTTP 传输不加密**，请在可信内网使用，并保持该端口不向公网开放。
+其他远程连接使用 HTTPS。
 
-NAS 模块属于早期协作版本。窄屏布局已检查，但不能据此声称所有真实手机或 UGREENlink 外网访问方式均已验证。
+手机可以从同一可信网络中的 NAS 入口打开账本。若使用其他 UGREENlink 或远程连接方式，先沿这条连接完成打开、登录和保存检查，再用于日常记账。
 
 ### 导入、导出与恢复
 
 - **Excel / CSV 追加**：先看预览。无效日期/金额、缺失或歧义账户、错误项目引用会阻止写入。
   相同稳定 ID 的重复项跳过；同 ID 内容不同则报告冲突。只有内容相同、没有相同 ID 的疑似重复项需要你明确选择。
-- **Excel 导出**：用于查看与账单回导，不是规则、设置、成员权限及恢复历史的完整备份；内部转账及旧负债余额记录须用完整JSON导入。
+- **Excel 导出**：查看账单并回导支持的记录；完整账本备份、内部转账和旧负债记录使用完整 JSON。
 - **完整 JSON**：保留本地账本的账户、账单、项目、规则与设置。替换当前账本前会先请求导出原账本，请确认备份文件确实已经保存。
 - **NAS JSON**：导入为新私有账本；服务账号、成员权限和版本历史需通过 [SQLite 全服务备份](deploy/ugreen/README.md#中文)保留。
 

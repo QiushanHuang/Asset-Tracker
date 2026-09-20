@@ -380,7 +380,18 @@ test('strict known fields reject invalid shapes, non-finite money, rates, freque
     }
 });
 
-test('calendar fixture is deterministic in Node V8 and osascript JavaScriptCore without Date APIs', () => {
+test('calendar fixture is deterministic in Node V8 without Date APIs', () => {
+    const fixtures = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'calendar-values.json'), 'utf8'));
+    for (const fixture of fixtures) {
+        const input = validLegacy({transactions:[{id:'calendar',category:'cash',amount:1,date:fixture.value}]});
+        assert.equal(safety.validateBookText(JSON.stringify(input)).status === 'valid', fixture.valid);
+    }
+    assert.doesNotMatch(fs.readFileSync(path.join(__dirname, '..', 'legacy-safety.js'), 'utf8'), /\bDate(?:\.parse)?\b/);
+});
+
+test('calendar fixture matches Node V8 in JavaScriptCore without Date APIs', {
+    skip: process.platform !== 'darwin' ? 'JavaScriptCore parity runs in the macOS CI job' : false
+}, () => {
     const fixtures = JSON.parse(fs.readFileSync(
         path.join(__dirname, 'fixtures', 'calendar-values.json'),
         'utf8'

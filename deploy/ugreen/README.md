@@ -4,9 +4,9 @@
 
 [English](#english) · [简体中文](#中文) · [Main README](../../README.md)
 
-Asset Tracker runs as an independent Docker project with its own persistent
-SQLite volume. No NAS administrator password, Docker socket, personal desktop
-book or unrelated shared directory is mounted into the container.
+Run Asset Tracker in its own Docker project and persistent SQLite volume.
+Create a separate bookkeeping account, then invite the people who should have
+access to each shared or family book.
 
 ## Pick a deployment mode
 
@@ -21,8 +21,8 @@ publish or port-forward it to the internet. Other remote connections continue
 to require HTTPS. No domain, public tunnel or Tailscale configuration is created.
 
 The prebuilt release image is **linux/amd64**, suitable for an x86-64 NAS such as
-UGREEN DXP4800 Plus. Other architectures must build the source for their own
-platform and are not covered by this binary's verification.
+UGREEN DXP4800 Plus. For a different architecture, build the source on that platform and check the
+result before creating your everyday book.
 
 ## Install on a UGREEN NAS
 
@@ -49,14 +49,13 @@ platform and are not covered by this binary's verification.
    Enter the bootstrap token from your own `.env`, choose a username and a
    password of at least 12 characters, and create the first account yourself.
 
-No author-specific address or bootstrap secret is included in the release.
-If the NAS cannot reach Docker Hub, the prebuilt image avoids a network build.
-A container reported as healthy is not proof that a shortcut, firewall or
-remote connection is correct; test the actual route you intend to use.
+Keep your NAS address and bootstrap token in your own `.env`. If the NAS cannot
+reach Docker Hub, import the prebuilt image. Once the container is healthy, open
+the shortcut and sign in to check the connection you will use each day.
 
 [UGREEN's container guide](https://support.ugnas.com/detail/article/en-US/289)
 describes desktop shortcuts and the conditions for UGREENlink remote access.
-This release does not claim physical-phone or every remote-client compatibility.
+Check opening, signing in and saving on each phone or remote connection you plan to use.
 
 ## Command-line deployment
 
@@ -91,7 +90,7 @@ checkout configuration resolves the repository root via `../..`.
   capabilities, no-new-privileges, 512 MB memory and one CPU limit.
 - LAN opt-in: `ASSET_LAN_ORIGIN` must be an exact private IPv4 HTTP origin.
   The server reports it only to matching host requests; the browser must also
-  be on that same origin. This does not replace account authentication.
+  be on that same origin. Users still sign in and receive the permissions assigned to their books.
 - `ASSET_ALLOWED_ORIGINS` accepts exact additional origins, separated by commas.
   Same-origin NAS pages need no addition. `ASSET_ALLOW_DESKTOP=1` permits a
   bundled file-origin desktop client, still requiring authentication; it is
@@ -104,10 +103,10 @@ or a shared JSON file over SMB/WebDAV. The UI retains 12-hour session tokens in
 memory, offers a single-use 24-hour invitation workflow, and uses server-side
 membership checks, revisions and operation IDs.
 
-The service preserves all ledger revisions. The UI lists the latest 100, but
-that is not automatic pruning. Monitor disk usage and keep separate backups.
-Node 24.11.0's built-in SQLite emits an experimental-feature warning; the
-runtime version is pinned and this remains an early collaboration module.
+The service keeps all ledger revisions and shows the latest 100 in the UI.
+Monitor volume usage and keep separate backups. Node 24.11.0 prints an
+experimental-feature warning when SQLite starts; check container health and the
+application page for service readiness.
 
 ## Backup and restore
 
@@ -161,7 +160,7 @@ notes before changing it.
 
 [English](#english) · [简体中文](#中文) · [返回主 README](../../README.md#中文)
 
-记账服务作为独立 Docker 项目运行，使用自己的 SQLite 数据卷，不挂载 NAS 管理员密码、Docker socket、本地正式账本或其他应用目录。
+将记账服务放在独立 Docker 项目和 SQLite 数据卷中，创建自己的记账服务账户，再邀请家人加入需要共同使用的账本。
 
 ### 三种配置
 
@@ -186,7 +185,7 @@ notes before changing it.
 7. 在容器菜单创建“**家庭记账**”桌面快捷方式，端口填所配置的主机端口。PC客户端可能会调用系统浏览器打开。
 8. 空服务会显示“首次初始化”。输入你自己的 `.env` 中的初始化口令，设置用户名和至少12位密码，创建首个记账服务账户。
 
-发布包不包含作者设备的地址或初始化秘密。NAS下载Docker Hub失败时可使用预构建镜像。绿联官方的[容器说明](https://support.ugnas.com/detail/article/en-US/289)介绍了快捷方式与UGREENlink条件；本版本不据此承诺所有手机及外网客户端已验证。
+把自己的 NAS 地址和初始化口令保存在 `.env` 中。NAS 下载 Docker Hub 失败时可导入预构建镜像。容器启动后，实际打开快捷方式并登录；每台手机或远程连接也沿自己的访问路径检查一次。绿联官方的[容器说明](https://support.ugnas.com/detail/article/en-US/289)介绍了快捷方式与 UGREENlink 的使用条件。
 
 ### 命令行方式
 
@@ -211,7 +210,7 @@ docker compose -p asset-tracker -f compose.nas-lan.yaml up -d
 - NAS地址改变时，同时核对端口绑定和允许来源，不要直接改成全接口监听。
 - 登录令牌在页面内存中，有效期12小时；邀请24小时有效且单次使用。版本冲突和结果未知的写入由版本号与操作编号保护。
 - 服务保留全部账本版本，页面只显示最近100个并不意味着只保留100个；需要关注容量。
-- Node 24.11.0内置SQLite会输出experimental提示；运行版本已经固定，NAS功能仍属于早期协作模块。
+- Node 24.11.0 启动 SQLite 时会输出 experimental 提示；通过容器健康状态和实际应用页面检查服务是否就绪。
 
 ### 备份与恢复
 
