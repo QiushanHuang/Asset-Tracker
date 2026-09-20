@@ -21,6 +21,11 @@ jobs:
       - run: ASSET_TRACKER_VERIFY_STAGED=1 node --test tests/*.test.js
       - run: node --test tests/nas/*.test.cjs
       - run: npm --prefix app test
+      - name: Local calendar filtering across time zones
+        run: |
+          for calendar_zone in Asia/Shanghai America/New_York; do
+            TZ="$calendar_zone" npm --prefix app test -- tests/domain/transactionFiltering.test.ts tests/shared/datetimeLocal.test.ts
+          done
       - run: npm --prefix app run build
       - run: python3 script/check-release-docs.py
   macos:

@@ -151,21 +151,23 @@ describe('transaction filtering', () => {
       currency: 'CNY'
     });
 
-    await createTransaction(db, {
-      bookId: book.id,
-      categoryId: cash.id,
-      amount: 50,
-      currency: 'CNY',
-      direction: 'expense',
-      purpose: '深夜外卖',
-      description: '',
-      occurredAt: '2026-04-21T16:30:00.000Z'
-    });
+    for (const [hour, purpose] of [[0, '凌晨外卖'], [23, '深夜外卖']] as const) {
+      await createTransaction(db, {
+        bookId: book.id,
+        categoryId: cash.id,
+        amount: 50,
+        currency: 'CNY',
+        direction: 'expense',
+        purpose,
+        description: '',
+        occurredAt: new Date(2026, 3, 22, hour, 30).toISOString()
+      });
+    }
 
     const filtered = await listTransactionsForBook(db, book.id, {
       date: '2026-04-22'
     });
 
-    expect(filtered.map((item) => item.purpose)).toEqual(['深夜外卖']);
+    expect(filtered.map((item) => item.purpose)).toEqual(['深夜外卖', '凌晨外卖']);
   });
 });
