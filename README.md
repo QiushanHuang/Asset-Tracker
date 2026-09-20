@@ -32,7 +32,7 @@ Local use needs no hosted account; shared books run on a NAS you control.
 | Balances, daily spending and trip costs live in separate sheets, so you keep reconciling them manually | One transaction can identify its funding account, project and expense category; the local analysis reads those records together |
 | A broad “travel” category cannot explain one particular trip or renovation | Each project gets its own category tree and drill-down totals, while your funding accounts keep their own meaning |
 | Sharing a household book makes personal privacy an ongoing chore | Personal NAS books stay private; shared/family books use explicit invitations and roles, and household summaries include only selected shared books |
-| Importing or saving leaves you unsure what changed, whether a row was duplicated, or whether a save completed | Import previews show errors and duplicates; native saves have confirmation; NAS conflicts retain drafts and unknown-result retries do not create a second write |
+| Importing or saving leaves you unsure what changed, whether a row was duplicated, or whether a save completed | Import previews show errors and duplicates; native saves have confirmation; NAS conflicts keep your input, and retrying an uncertain save avoids duplicate records |
 | A converted total looks precise but the rate or forecast assumptions are unclear | Original currencies remain visible, missing rates stay unconverted, and analysis states its calculation assumptions |
 
 Enter each purchase once. Review it by account, project or period, and keep
@@ -93,8 +93,6 @@ cd Asset-Tracker
 ASSET_TRACKER_CONFIGURATION=release ./script/build_and_run.sh --stage-only
 open dist/AssetTracker.app
 ```
-
-
 
 ## Start here
 
@@ -197,11 +195,12 @@ saving a record through that route.
   [SQLite backup procedure](deploy/ugreen/README.md#backup-and-restore), which also
   preserves users, memberships and revision history.
 
-macOS saves use a serialized queue and durable native receipts. Corrupt or
-unsupported books enter a recovery state rather than being silently replaced.
-NAS writes compare revisions: conflicts keep the draft, and a retry after an
-unknown response reuses its operation ID. Restoring a NAS revision creates a new
-revision; it does not roll back membership permissions.
+On macOS, the app confirms when your book has been saved. If a book cannot be
+opened, the recovery screen helps you choose the next step while preserving the
+original file. On NAS, a conflicting edit keeps your draft so you can review the
+latest book and try again. If a connection drops during saving, retry without
+creating a duplicate record. Restoring an earlier version keeps current member
+permissions and adds the restored content to the version history.
 
 ## What's new in v3.2.1
 
@@ -211,7 +210,7 @@ on a NAS, and a new ledger-inspired identity. This release also updates the
 bundled spreadsheet parser from SheetJS 0.18.5 to 0.20.3.
 
 See [release notes](docs/releases/v3.2.1.md#english), the [changelog](CHANGELOG.md)
-and the [user guide](docs/user-guide.md#english) for details and limitations.
+and the [user guide](docs/user-guide.md#english) for upgrade steps and feature details.
 
 ## Develop and contribute
 
@@ -258,18 +257,18 @@ See [contributors](CONTRIBUTORS.md). Licensed under the [MIT License](LICENSE).
 | --- | --- |
 | 余额、日常流水和旅行费用散在不同表格里，经常需要手工对账 | 一笔记录分别关联资金账户、项目和消费分类，本地分析直接使用同一批数据 |
 | 一个笼统的“旅游”分类，算不清某次旅行、装修或活动具体花在哪里 | 每个项目有自己的分类树和逐层汇总，不把用途和银行账户混在一起 |
-| 想共同记家庭账，又不想把全部个人记录给家人看 | NAS个人账本默认私有，共同/家庭账本通过邀请分配权限，家庭汇总只包含主动选择的共享账本 |
-| 导入怕重复、保存后不知道是否成功，多人修改又担心相互覆盖 | 先预览错误与重复项；原生保存有确认；NAS冲突保留输入，结果未知时重试同一操作 |
+| 想共同记家庭账，又不想把全部个人记录给家人看 | NAS 个人账本默认私有，共同/家庭账本通过邀请分配权限，家庭汇总只包含主动选择的共享账本 |
+| 导入怕重复、保存后不知道是否成功，多人修改又担心相互覆盖 | 先预览错误与重复项；原生保存有确认；NAS 修改冲突时保留输入，保存结果不明确时可重试，避免重复记账 |
 | 折算总额和预测看起来很精确，却不知道汇率或计算假设 | 保留原币，缺失汇率明确标成未折算，分析展示计算口径和假设 |
 
 一笔账只录一次，回看时按账户、项目或时间查看。个人记录留在自己的账本，家庭开销放进共享账本。
 
 ### 快速看看适不适合你
 
-- **日常生活与多币种收支：**现金、银行卡分别记录，原币保留，回看净资产变化。
-- **旅行、活动或装修：**建一个项目，分清交通、餐饮、住宿等用途，结束后算清这一件事的开销。
-- **家庭共同记账：**个人账目保持私有，邀请家人记录共同支出，再按所选账本查看家庭汇总。
-- **从多份表格迁移：**先检查 Excel/CSV 预览，再追加记录，并用完整 JSON 保留可迁移的备份。
+- **日常生活与多币种收支**：现金、银行卡分别记录，原币保留，回看净资产变化。
+- **旅行、活动或装修**：建一个项目，分清交通、餐饮、住宿等用途，结束后算清这一件事的开销。
+- **家庭共同记账**：个人账目保持私有，邀请家人记录共同支出，再按所选账本查看家庭汇总。
+- **从多份表格迁移**：先检查 Excel/CSV 预览，再追加记录，并用完整 JSON 保留可迁移的备份。
 
 ![使用虚构演示数据的资产概览](docs/images/overview.png)
 
@@ -306,8 +305,6 @@ cd Asset-Tracker
 ASSET_TRACKER_CONFIGURATION=release ./script/build_and_run.sh --stage-only
 open dist/AssetTracker.app
 ```
-
-
 
 ### 从第一笔账开始
 
@@ -364,9 +361,9 @@ open dist/AssetTracker.app
 - **完整 JSON**：保留本地账本的账户、账单、项目、规则与设置。替换当前账本前会先请求导出原账本，请确认备份文件确实已经保存。
 - **NAS JSON**：导入为新私有账本；服务账号、成员权限和版本历史需通过 [SQLite 全服务备份](deploy/ugreen/README.md#中文)保留。
 
-macOS 使用串行保存队列和原生耐久保存回执；损坏或不兼容的账本进入恢复界面，不会静默替换为空账本。
-NAS 并发修改通过版本号检查；冲突和刷新保留输入，结果未知的保存使用同一操作编号重试。
-恢复旧版本会生成新版本，不回滚成员权限。
+macOS 会在账本保存完成后给出确认。账本无法打开时，可以在恢复界面选择下一步，原文件会被保留。
+NAS 上遇到修改冲突时会保留草稿，你可以查看最新账本后再提交；保存中断、结果不明确时，也可以重试，避免重复记账。
+恢复旧版本后，成员权限保持不变，恢复的内容会作为新版本保存在历史记录中。
 
 ### v3.2.1 更新
 
