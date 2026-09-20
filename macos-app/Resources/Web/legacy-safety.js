@@ -5,6 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function build() {
     'use strict';
 
+    const ProjectModel = typeof module === 'object' && module.exports ? require('./expense-projects.js') : globalThis.AssetTrackerProjects;
     const BOOK_FORMAT = 'qiushan.asset-book';
     const SUPPORTED_VERSION = 1;
     const DANGEROUS_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
@@ -2377,6 +2378,10 @@
             issue(issues, '$', 'unknown-root', 'No known legacy root field is present');
             return;
         }
+        if (payload.expenseProjects !== undefined || (Array.isArray(payload.transactions) && payload.transactions.some(item => item && (Object.prototype.hasOwnProperty.call(item, 'projectId') || Object.prototype.hasOwnProperty.call(item, 'expenseCategoryId'))))) {
+            const errors = ProjectModel ? ProjectModel.validate(payload) : ['Project module unavailable'];
+            for (const message of errors) issue(issues, '$.expenseProjects', 'invalid-project', message);
+        }
         if (Object.prototype.hasOwnProperty.call(payload, 'categories')) {
             validateCategoryMap(payload.categories, '$.categories', issues);
         }
@@ -2405,6 +2410,19 @@
         }
         if (Object.prototype.hasOwnProperty.call(payload, 'settings')) {
             validateSettings(payload.settings, '$.settings', issues);
+            if (isRecord(payload.settings) && Object.prototype.hasOwnProperty.call(payload.settings, 'exchangeRateHistory')) {
+                const rows = payload.settings.exchangeRateHistory;
+                if (!Array.isArray(rows)) issue(issues, '$.settings.exchangeRateHistory', 'invalid-type', 'Historical rates must be an array');
+                else rows.forEach((row,index) => {
+                    const path = `$.settings.exchangeRateHistory[${index}]`;
+                    if (!isRecord(row)) { issue(issues,path,'invalid-type','Invalid historical rate'); return; }
+                    for (const field of ['currency','baseCurrency']) {
+                        if (typeof row[field] !== 'string' || !/^[A-Z]{3}$/.test(row[field])) issue(issues,path+'.'+field,'invalid-currency','Invalid currency');
+                    }
+                    if (!Number.isFinite(row.rate) || row.rate <= 0) issue(issues,path+'.rate','invalid-number','Exchange rate must be positive');
+                    requireDate(row,'effectiveFrom',path,issues);
+                });
+            }
         }
         validateStringIfPresent(payload, 'memo', '$', issues);
     }

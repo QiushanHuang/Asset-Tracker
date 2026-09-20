@@ -1,0 +1,14 @@
+.git
+app
+legacy
+记账
+macos-app
+dist
+output
+docs
+tests
+server/data
+**/.env
+**/*.sqlite*
+**/*.log
+.playwright-cli

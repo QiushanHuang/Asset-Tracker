@@ -3,6 +3,7 @@ const ASSET_BOOK_FORMAT_VERSION = 1;
 const ASSET_BOOK_SCHEMA_VERSION = 1;
 const ASSET_BOOK_PROTOCOL_VERSION = 2;
 const LegacySafety = globalThis.AssetTrackerLegacySafety;
+const ProjectLedger = globalThis.AssetTrackerProjects;
 const adapterReflectGet = Reflect.get;
 const adapterReflectApply = Reflect.apply;
 const adapterPromiseThen = Promise.prototype.then;
@@ -718,6 +719,7 @@ class AssetTrackerFileAdapter {
             const cleanup = () => {
                 fileInput.value = '';
                 fileInput.removeEventListener('change', onChange);
+                fileInput.removeEventListener('cancel', onCancel);
             };
 
             const onChange = () => {
@@ -728,6 +730,7 @@ class AssetTrackerFileAdapter {
                     return;
                 }
 
+                if (file.size > 12 * 1024 * 1024) { cleanup(); reject(new Error('导入文件不能超过 12 MB')); return; }
                 const reader = new FileReader();
 
                 reader.onload = (e) => {
@@ -770,6 +773,8 @@ class AssetTrackerFileAdapter {
                 readBinary();
             };
 
+            const onCancel = () => { cleanup(); resolve(null); };
+            fileInput.addEventListener('cancel', onCancel);
             fileInput.addEventListener('change', onChange);
             fileInput.value = '';
             fileInput.click();
@@ -797,7 +802,11 @@ class AssetTrackerFileAdapter {
     }
 
     normalizeImportedContent(text, encoding = 'text', { output = 'binary' } = {}) {
-        if (encoding !== 'base64' && encoding !== 'binary') {
+        if (encoding === 'binary') {
+            const binary = String(text || '');
+            return output === 'binary' ? binary : new TextDecoder('utf-8').decode(Uint8Array.from(binary, char => char.charCodeAt(0)));
+        }
+        if (encoding !== 'base64') {
             if (output === 'binary') {
                 return text || '';
             }
@@ -1338,6 +1347,20 @@ class AssetTrackerStorageAdapter {
 }
 
 // 资产记账应用主逻辑
+function escapeHTML(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[char]);
+}
+
+function inlineArgument(value) {
+    return escapeHTML(JSON.stringify(String(value ?? '')));
+}
+
+function localDateKey(date = new Date()) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
 class AssetTracker {
     constructor() {
         this.data = this.getDefaultState();
@@ -1942,7 +1965,8 @@ class AssetTracker {
             initialAssets: [],
             settings: this.getDefaultSettings(),
             memo: '',
-            transactionTemplates: []
+            transactionTemplates: [],
+            expenseProjects: []
         };
     }
 
@@ -2214,9 +2238,13 @@ class AssetTracker {
     initializeApp() {
         this.setupNavigation();
         this.setupEventListeners();
+        this.setupProjectUI();
+        const folderButton = document.getElementById('reveal-storage-folder-main-btn');
+        if (folderButton) folderButton.hidden = !this.storageAdapter.supportsNative;
+        this.initializeTransactionFilters();
         this.renderCategories();
         this.renderTransactions();
-        this.updateDashboard();
+        this.updateDashboard(false);
         this.setupCharts();
         this.renderAutomationRules();
         this.updateAnalyticsOptions();
@@ -2224,7 +2252,6 @@ class AssetTracker {
         this.populateInitAssetCategoryOptions();
         this.renderInitialAssetsList();
         this.renderMemo();
-        this.initializeTransactionFilters();
     }
 
     // 导航设置
@@ -2240,6 +2267,8 @@ class AssetTracker {
                 // 更新导航状态
                 navLinks.forEach(l => l.classList.remove('active'));
                 link.classList.add('active');
+                navLinks.forEach(item => item.removeAttribute('aria-current'));
+                link.setAttribute('aria-current', 'page');
 
                 // 切换内容区域
                 sections.forEach(s => s.classList.remove('active'));
@@ -2248,18 +2277,31 @@ class AssetTracker {
                 // 更新标题
         const titles = {
                     'dashboard': '资产概览',
-                    'categories': '分类管理',
+                    'categories': '资金账户',
+                    'projects': '项目账本',
                     'transactions': '账单记录',
                     'automation': '自动记账',
                     'analytics': '数据分析',
                     'settings': '系统设置',
-                    'import-export': '导入导出'
+                    'import-export': '导入导出',
+                    'nas': 'NAS 与家庭账本'
                 };
                 document.getElementById('section-title').textContent = titles[targetSection];
 
+                const remoteSection = targetSection === 'nas';
+                const localActions = document.querySelector('.header-right');
+                if (localActions) localActions.hidden = remoteSection;
+                const projectStatus = document.getElementById('active-project-status');
+                if (projectStatus) projectStatus.hidden = remoteSection;
+                const eyebrow = document.querySelector('.header-left .eyebrow');
+                if (eyebrow) eyebrow.textContent = remoteSection ? 'NAS 协作' : '我的账本';
                 // 特殊处理
-                if (targetSection === 'dashboard') {
+                if (targetSection === 'projects') {
+                    this.renderProjectWorkspace();
+                } else if (targetSection === 'dashboard') {
                     this.updateDashboard();
+                } else if (targetSection === 'transactions') {
+                    this.renderTransactions();
                 } else if (targetSection === 'analytics') {
                     this.updateAnalyticsOptions();
                 }
@@ -2269,6 +2311,31 @@ class AssetTracker {
 
     // 事件监听器设置
     setupEventListeners() {
+        document.getElementById('transactions-tbody')?.addEventListener('click', event => {
+            const button = event.target.closest('button');
+            if (!button) return;
+            if (button.hasAttribute('data-edit-transaction')) this.editTransaction(button.dataset.editTransaction);
+            if (button.hasAttribute('data-delete-transaction')) this.deleteTransaction(button.dataset.deleteTransaction);
+        });
+        document.getElementById('transaction-search')?.addEventListener('input', () => {
+            clearTimeout(this.transactionSearchTimer);
+            this.transactionSearchTimer = setTimeout(() => this.filterTransactions(), 150);
+        });
+        document.getElementById('clear-transaction-filters')?.addEventListener('click', () => this.resetTransactionFilters());
+        document.getElementById('previous-transactions')?.addEventListener('click', () => this.changeTransactionPage(-1));
+        document.getElementById('next-transactions')?.addEventListener('click', () => this.changeTransactionPage(1));
+        document.getElementById('pie-chart-level')?.addEventListener('change', () => this.updateAssetPieChart());
+        document.addEventListener('keydown', event => {
+            const modal = document.getElementById('modal');
+            if (modal?.style.display !== 'block') return;
+            if (event.key === 'Escape') { event.preventDefault(); this.closeModal(); return; }
+            if (event.key !== 'Tab') return;
+            const controls = Array.from(modal.querySelectorAll('button, input, select, textarea, [tabindex="0"]'))
+                .filter(item => !item.disabled && item.type !== 'hidden' && !item.closest('[hidden]') && !item.closest('[style*="display: none"]') && !item.closest('details:not([open])'));
+            const first = controls[0], last = controls[controls.length - 1];
+            if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+            else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+        });
         // 添加交易按钮
         document.getElementById('add-transaction-btn').addEventListener('click', () => {
             this.showTransactionModal();
@@ -2440,6 +2507,7 @@ class AssetTracker {
     }
 
     refreshDataViews() {
+        this.renderProjectWorkspace();
         this.renderCategories();
         this.renderTransactions();
         this.updateDashboard();
@@ -2689,7 +2757,7 @@ class AssetTracker {
             displayBalance = this.formatCurrency(balanceInBaseCurrency);
 
             const currencyTag = category.currency !== this.data.settings.baseCurrency ?
-                `<span class="currency-tag">${category.currency}</span>` : '';
+                `<span class="currency-tag">${escapeHTML(category.currency)}</span>` : '';
             const originalAmount = category.currency !== this.data.settings.baseCurrency ?
                 `<span class="original-amount">(${this.formatCurrency(category.balance, category.currency)})</span>` : '';
 
@@ -2701,19 +2769,19 @@ class AssetTracker {
         const isEditable = !hasChildren; // 只有叶子节点可编辑
 
         div.innerHTML = `
-            <div class="category-header" onclick="window.assetTracker.toggleCategoryCollapse('${category.id}')">
+            <div class="category-header" onclick="window.assetTracker.toggleCategoryCollapse(${inlineArgument(category.id)})">
                 <span class="drag-handle" title="拖拽排序" onclick="event.stopPropagation()">⋮⋮</span>
                 <span class="collapse-icon">${collapseIcon}</span>
-                <span class="category-name">${category.name} ${debtIndicator}</span>
+                <span class="category-name">${escapeHTML(category.name)} ${debtIndicator}</span>
                 <div class="category-balance-container">
                     <span class="category-balance ${category.isDebt ? 'debt' : ''}">${displayBalance}</span>
                     ${currencyInfo}
                 </div>
                 <div class="category-actions">
-                    <button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.editCategoryName('${category.id}')">改名</button>
-                    ${isEditable ? `<button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.editCategory('${category.id}')">编辑</button>` : ''}
-                    <button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.deleteCategory('${category.id}')">删除</button>
-                    ${isEditable ? `<button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.showExchangeRateModal('${category.id}')">汇率</button>` : ''}
+                    <button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.editCategoryName(${inlineArgument(category.id)})">改名</button>
+                    ${isEditable ? `<button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.editCategory(${inlineArgument(category.id)})">编辑</button>` : ''}
+                    <button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.deleteCategory(${inlineArgument(category.id)})">删除</button>
+                    ${isEditable ? `<button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.showExchangeRateModal(${inlineArgument(category.id)})">汇率</button>` : ''}
                 </div>
             </div>
             ${debtInfo}
@@ -2823,7 +2891,7 @@ class AssetTracker {
         }
 
         // 防止将分类拖拽到自己的子分类中
-        if (this.isDescendant(targetCategory.id, draggedCategory.id)) {
+        if (draggedCategory.id === targetCategory.id || this.isDescendant(draggedCategory.id, targetCategory.id)) {
             this.showMessage('不能将分类移动到其子分类中', 'error');
             return;
         }
@@ -2978,64 +3046,21 @@ class AssetTracker {
 
     // 计算分类汇总信息
     calculateCategorySummary(category) {
-        let totalAssets = 0;
-        let currentBalance = 0;
-        let totalDebt = 0;
+        const totals = this.calculateTotals({ root: category });
         const foreignCurrencies = {};
-
-        // 分别计算人民币和外币
-        let baseCurrencyTotal = 0;  // 人民币总值（不算外币部分）
-        let baseCurrencyBalance = 0;  // 人民币现余额
-        let baseCurrencyDebt = 0;     // 人民币债务
-
-        const processCategoryRecursive = (cat) => {
-            if (!cat.children || Object.keys(cat.children).length === 0) {
-                // 叶子节点
-                const balanceInBaseCurrency = this.convertToBaseCurrency(cat.balance, cat.currency);
-                const isBaseCurrency = cat.currency === this.data.settings.baseCurrency;
-
-                // 记录外币
-                if (!foreignCurrencies[cat.currency]) {
-                    foreignCurrencies[cat.currency] = 0;
-                }
-                foreignCurrencies[cat.currency] += cat.balance;
-
-                // 分别计算基准货币和总计
-                if (isBaseCurrency) {
-                    if (cat.isDebt) {
-                        baseCurrencyDebt += Math.abs(cat.balance);
-                    } else {
-                        baseCurrencyBalance += cat.balance;
-                    }
-                    baseCurrencyTotal += Math.abs(cat.balance);
-                }
-
-                // 计算总计（包含外币）
-                if (cat.isDebt) {
-                    totalDebt += Math.abs(balanceInBaseCurrency);
-                } else {
-                    currentBalance += balanceInBaseCurrency;
-                }
-                totalAssets += Math.abs(balanceInBaseCurrency);
-            } else {
-                // 非叶子节点，递归处理
-                Object.values(cat.children).forEach(processCategoryRecursive);
+        let baseCurrencyTotal = 0, baseCurrencyBalance = 0, baseCurrencyDebt = 0;
+        this.traverseCategories({ root: category }, item => {
+            if (item.children && Object.keys(item.children).length) return;
+            const balance = item.balance || 0;
+            const currency = item.currency || this.data.settings.baseCurrency;
+            const net = item.isDebt ? -balance : balance;
+            foreignCurrencies[currency] = (foreignCurrencies[currency] || 0) + net;
+            if (currency === this.data.settings.baseCurrency) {
+                baseCurrencyTotal += net;
+                if (item.isDebt) baseCurrencyDebt += Math.max(balance, 0); else baseCurrencyBalance += balance;
             }
-        };
-
-        if (category.children) {
-            Object.values(category.children).forEach(processCategoryRecursive);
-        }
-
-        return {
-            totalAssets,
-            currentBalance: totalAssets - totalDebt,
-            totalDebt,
-            foreignCurrencies,
-            baseCurrencyTotal,      // 人民币总值
-            baseCurrencyBalance,    // 人民币现余额
-            baseCurrencyDebt        // 人民币债务
-        };
+        });
+        return { ...totals, foreignCurrencies, baseCurrencyTotal, baseCurrencyBalance, baseCurrencyDebt };
     }
 
     // 切换分类折叠状态
@@ -3049,18 +3074,26 @@ class AssetTracker {
     }
 
     // 交易记录管理
-    addTransaction(transaction) {
-        transaction.id = Date.now().toString();
+    appendTransaction(transaction) {
+        this.transactionIdCounter = (this.transactionIdCounter || 0) + 1;
+        const prefix = Date.now().toString();
+        let id = `${prefix}-${this.transactionIdCounter}`;
+        while (this.data.transactions.some(item => item.id === id)) id = `${prefix}-${++this.transactionIdCounter}`;
+        transaction.id = id;
         transaction.timestamp = new Date().toISOString();
         this.data.transactions.push(transaction);
         this.updateCategoryBalance(transaction);
-        this.persistData();
+    }
+
+    async addTransaction(transaction) {
+        this.appendTransaction(transaction);
+        await this.persistData();
         this.renderTransactions();
         this.updateDashboard();
     }
 
     updateCategoryBalance(transaction) {
-        const categoryPath = this.findCategoryPath(transaction.category, transaction.subcategory);
+        const categoryPath = this.findCategoryPath(transaction.category, transaction.subcategory, transaction.accountId);
         if (categoryPath) {
             let current = this.data.categories;
 
@@ -3074,7 +3107,7 @@ class AssetTracker {
                 // 只在最后一级分类更新余额
                 if (i === categoryPath.length - 1) {
                     // 转换交易金额到分类的货币
-                    let amountToAdd = transaction.amount;
+                    let amountToAdd = transaction.accountId && current.isDebt ? -transaction.amount : transaction.amount;
                     const transactionCurrency = transaction.currency || this.data.settings.baseCurrency;
                     const categoryCurrency = current.currency || this.data.settings.baseCurrency;
 
@@ -3098,7 +3131,18 @@ class AssetTracker {
         }
     }
 
-    findCategoryPath(categoryName, subcategoryName) {
+    findCategoryPath(categoryName, subcategoryName, accountId = null) {
+        if (accountId) {
+            const visit = (nodes, path = []) => {
+                for (const [key, node] of Object.entries(nodes)) {
+                    const next = [...path, key];
+                    if (node.id === accountId && (!node.children || !Object.keys(node.children).length)) return next;
+                    if (node.children) { const found = visit(node.children, next); if (found) return found; }
+                }
+                return null;
+            };
+            return visit(this.data.categories);
+        }
         for (const [key, category] of Object.entries(this.data.categories)) {
             if (category.name === categoryName) {
                 if (!subcategoryName) return [key];
@@ -3125,99 +3169,67 @@ class AssetTracker {
 
     renderTransactions() {
         const tbody = document.getElementById('transactions-tbody');
-        tbody.innerHTML = '';
-
-        // 获取筛选条件
-        const categoryFilter = document.getElementById('category-filter')?.value || '';
-        const dateFrom = document.getElementById('date-from')?.value;
-        const dateTo = document.getElementById('date-to')?.value;
-
-        // 应用筛选
-        let filteredTransactions = this.data.transactions;
-
-        if (categoryFilter) {
-            filteredTransactions = filteredTransactions.filter(t => t.category === categoryFilter);
+        const category = document.getElementById('category-filter')?.value || '';
+        const from = document.getElementById('date-from')?.value || '';
+        const to = document.getElementById('date-to')?.value || '';
+        const query = (document.getElementById('transaction-search')?.value || '').trim().toLocaleLowerCase();
+        const projectFilter = document.getElementById('project-filter')?.value || '';
+        const projectCategory = document.getElementById('project-category-filter')?.value || '';
+        const invalidRange = from && to && from > to;
+        const records = invalidRange ? [] : this.data.transactions.filter(item => {
+            const day = item.date.slice(0, 10);
+            return ProjectLedger.matches(this.data, item, projectFilter, projectCategory) && (!category || item.category === category) && (!from || day >= from) && (!to || day <= to)
+                && (!query || [item.category, item.subcategory, item.description, item.purpose, item.currency, item.amount, this.projectDescription(item)]
+                    .some(value => String(value ?? '').toLocaleLowerCase().includes(query)));
+        }).sort((a, b) => b.date.localeCompare(a.date));
+        const pageSize = 50;
+        const pages = Math.max(1, Math.ceil(records.length / pageSize));
+        this.transactionPage = Math.min(Math.max(0, this.transactionPage || 0), pages - 1);
+        const start = this.transactionPage * pageSize;
+        const page = records.slice(start, start + pageSize);
+        // Bound DOM work independently of the size of the ledger. All ledger text is encoded.
+        tbody.innerHTML = page.map(item => `<tr>
+            <td>${escapeHTML(item.date.replace('T', ' ').slice(0, item.includeTime ? 16 : 10))}</td>
+            <td>${escapeHTML(item.category)}</td><td>${escapeHTML(item.subcategory || '—')}</td>
+            <td class="${item.amount >= 0 ? 'positive' : 'negative'} amount-cell">${escapeHTML(this.formatCurrency(item.amount, item.currency))}<small>${escapeHTML(item.currency || this.data.settings.baseCurrency)}</small></td>
+            <td>${escapeHTML(item.type)}</td><td>${escapeHTML(item.projectId ? this.projectDescription(item) : item.purpose || '—')}</td>
+            <td class="description-cell">${escapeHTML(item.description || '—')}</td>
+            <td class="row-actions"><button class="btn btn-sm" data-edit-transaction="${escapeHTML(item.id)}">编辑</button><button class="btn btn-sm btn-danger" data-delete-transaction="${escapeHTML(item.id)}">删除</button></td>
+        </tr>`).join('');
+        if (!page.length) {
+            const message = invalidRange ? '开始日期不能晚于结束日期，请调整筛选范围。'
+                : this.data.transactions.length ? '没有符合条件的账单，试试清除筛选或更换关键词。' : '暂无账单，点击“添加账单”记录第一笔收支。';
+            tbody.innerHTML = `<tr><td colspan="8" class="empty-state">${message}</td></tr>`;
         }
-
-        if (dateFrom) {
-            filteredTransactions = filteredTransactions.filter(t => {
-                const transactionDate = t.date.includes('T') ? t.date.split('T')[0] : t.date;
-                return transactionDate >= dateFrom;
-            });
-        }
-
-        if (dateTo) {
-            filteredTransactions = filteredTransactions.filter(t => {
-                const transactionDate = t.date.includes('T') ? t.date.split('T')[0] : t.date;
-                return transactionDate <= dateTo;
-            });
-        }
-
-        // 按日期排序（最新在前）
-        const sortedTransactions = [...filteredTransactions].sort((a, b) => {
-            const dateA = a.date.includes('T') ? a.date : a.date + 'T00:00:00';
-            const dateB = b.date.includes('T') ? b.date : b.date + 'T00:00:00';
-            return new Date(dateB) - new Date(dateA);
-        });
-
-        sortedTransactions.forEach(transaction => {
-            const row = document.createElement('tr');
-
-            // 格式化日期和时间显示
-            let dateDisplay;
-            if (transaction.includeTime && transaction.date.includes('T')) {
-                const dateTime = new Date(transaction.date);
-                dateDisplay = dateTime.toLocaleString();
-            } else {
-                const dateOnly = transaction.date.includes('T') ? transaction.date.split('T')[0] : transaction.date;
-                dateDisplay = new Date(dateOnly).toLocaleDateString();
-            }
-
-            row.innerHTML = `
-                <td>${dateDisplay}</td>
-                <td>${transaction.category}</td>
-                <td>${transaction.subcategory || '-'}</td>
-                <td class="${transaction.amount >= 0 ? 'positive' : 'negative'}">
-                    ${this.formatCurrency(transaction.amount, transaction.currency || this.data.settings.baseCurrency)}
-                </td>
-                <td>${transaction.type}</td>
-                <td>${transaction.purpose || '-'}</td>
-                <td>${transaction.description}</td>
-                <td>
-                    <button class="btn btn-sm" onclick="window.assetTracker.editTransaction('${transaction.id}')">编辑</button>
-                    <button class="btn btn-sm" onclick="window.assetTracker.deleteTransaction('${transaction.id}')">删除</button>
-                </td>
-            `;
-            tbody.appendChild(row);
-        });
-
+        const count = document.getElementById('transaction-count');
+        if (count) count.textContent = `共 ${records.length} 笔 · ${records.length ? start + 1 : 0}–${Math.min(start + pageSize, records.length)} 笔`;
+        const range = document.getElementById('transaction-range');
+        if (range) range.textContent = `${from || '不限起始'} 至 ${to || '不限结束'}${category ? ' · ' + category : ''}`;
+        const previous = document.getElementById('previous-transactions');
+        const next = document.getElementById('next-transactions');
+        if (previous) previous.disabled = this.transactionPage === 0;
+        if (next) next.disabled = this.transactionPage >= pages - 1;
         this.updateRecentTransactions();
     }
 
     updateRecentTransactions() {
         const container = document.getElementById('recent-transactions-list');
-        const recentTransactions = this.data.transactions.slice(-5).reverse();
-
-        if (recentTransactions.length === 0) {
-            container.innerHTML = '<p class="empty-state">暂无交易记录</p>';
-            return;
+        // Keep only the five most recent business dates; backfilled records do not jump to the top.
+        const recent = [];
+        for (const item of this.data.transactions) {
+            const position = recent.findIndex(other => item.date > other.date);
+            if (position < 0) recent.push(item); else recent.splice(position, 0, item);
+            if (recent.length > 5) recent.pop();
         }
-
-        container.innerHTML = recentTransactions.map(transaction => `
-            <div class="transaction-item">
-                <div class="transaction-info">
-                    <div class="transaction-category">${transaction.category}</div>
-                    <div class="transaction-description">${transaction.description}</div>
-                </div>
-                <div class="transaction-amount ${transaction.amount >= 0 ? 'positive' : 'negative'}">
-                    ¥${transaction.amount.toFixed(2)}
-                </div>
-            </div>
-        `).join('');
+        container.innerHTML = recent.length ? recent.map(item => `<div class="transaction-item">
+            <div class="transaction-info"><div class="transaction-category">${escapeHTML(item.category)}</div>
+            <div class="transaction-description">${escapeHTML(item.description || item.purpose || '未填写描述')}</div>
+            <small>${escapeHTML(item.date.slice(0, 10))}</small></div>
+            <div class="transaction-amount ${item.amount >= 0 ? 'positive' : 'negative'}">${escapeHTML(this.formatCurrency(item.amount, item.currency))}<small>${escapeHTML(item.currency || this.data.settings.baseCurrency)}</small></div>
+        </div>`).join('') : '<p class="empty-state">还没有账单。点击右上角“添加账单”，记录第一笔收支。</p>';
     }
 
-    // 仪表板更新
-    updateDashboard() {
+    updateDashboard(renderCharts = true) {
         const totals = this.calculateTotals();
         const baseCurrency = this.data.settings.baseCurrency;
 
@@ -3233,10 +3245,14 @@ class AssetTracker {
             currentBalanceElement.textContent = `${this.formatCurrency(totals.currentBalance, baseCurrency)}`;
         }
 
+        const note = document.getElementById('net-assets-note');
+        if (note) note.textContent = `净资产 = 现余额 − 待还款${totals.debtCredit ? ' + 负债溢缴 ' + this.formatCurrency(totals.debtCredit) : ''} · 按当前设置汇率折算`;
         // 悬停功能已移除，改为点击查看详情
 
-        this.updateAssetPieChart();
-        this.updateAssetTrendChart();
+        if (renderCharts) {
+            this.updateAssetPieChart();
+            this.updateAssetTrendChart();
+        }
     }
 
     // 汇率转换功能
@@ -3396,53 +3412,17 @@ class AssetTracker {
         const earliestDate = new Date(sortedTransactions[0].date);
         const latestDate = new Date(sortedTransactions[sortedTransactions.length - 1].date);
 
-        // 获取当前各分类余额
-        const currentBalances = {};
-        this.collectLeafBalances(this.data.categories, currentBalances);
-
-        // 反向计算：从当前余额减去所有历史交易
-        const historicalBalances = { ...currentBalances };
-
-        // 按时间倒序处理交易，从当前状态往回推算
-        for (let i = sortedTransactions.length - 1; i >= 0; i--) {
-            const transaction = sortedTransactions[i];
-            const categoryPath = this.findCategoryPath(transaction.category, transaction.subcategory);
-
-            if (categoryPath) {
-                // 找到对应的叶子分类
-                const leafCategoryId = this.getLeafCategoryId(categoryPath);
-                if (leafCategoryId && historicalBalances[leafCategoryId] !== undefined) {
-                    // 反向操作：减去这笔交易的影响
-                    historicalBalances[leafCategoryId] -= transaction.amount;
-                }
-            }
-        }
-
-        // 计算历史资产汇总
-        let historicalTotalAssets = 0;
-        let historicalCurrentBalance = 0;
-        let historicalTotalDebt = 0;
-
-        Object.entries(historicalBalances).forEach(([categoryId, balance]) => {
-            const category = this.findCategoryById(categoryId);
-            if (category) {
-                const balanceInBaseCurrency = this.convertToBaseCurrency(balance, category.currency);
-
-                if (category.isDebt) {
-                    historicalTotalDebt += Math.abs(balanceInBaseCurrency);
-                } else {
-                    historicalCurrentBalance += balanceInBaseCurrency;
-                }
-                historicalTotalAssets += Math.abs(balanceInBaseCurrency);
-            }
-        });
+        const historical = this.calculateDailyAssetBalance([]);
+        const historicalTotalAssets = historical.totalAssets;
+        const historicalCurrentBalance = historical.currentBalance;
+        const historicalTotalDebt = historical.totalDebt;
 
         // 显示结果
         this.displayHistoricalResult({
             earliestDate,
             latestDate,
             historicalTotalAssets,
-            historicalCurrentBalance: historicalTotalAssets - historicalTotalDebt,
+            historicalCurrentBalance,
             historicalTotalDebt,
             currentTotals: this.calculateTotals(),
             transactionCount: sortedTransactions.length
@@ -3510,7 +3490,7 @@ class AssetTracker {
                         </thead>
                         <tbody>
                             <tr>
-                                <td>总资产</td>
+                                <td>净资产</td>
                                 <td>${this.formatCurrency(result.historicalTotalAssets)}</td>
                                 <td>${this.formatCurrency(result.currentTotals.totalAssets)}</td>
                                 <td class="${totalChange >= 0 ? 'positive' : 'negative'}">${this.formatCurrency(totalChange)}</td>
@@ -3555,58 +3535,24 @@ class AssetTracker {
         this.showMessage('历史资产分析完成！', 'success');
     }
 
-    calculateTotals() {
-        let totalAssets = 0;  // 现总资产：所有在账上的钱
-        let currentBalance = 0;  // 现余额：扣除待还的总资产
-        let totalDebt = 0;  // 待还款总额
-        let digital = 0;
-        let cash = 0;
-
-        const calculateCategoryTotal = (category) => {
-            // 只计算叶子节点（没有子分类的分类）的余额
-            if (!category.children || Object.keys(category.children).length === 0) {
-                const balanceInBaseCurrency = this.convertToBaseCurrency(category.balance, category.currency);
-
-                // 计算现总资产（不区分是否为债务）
-                totalAssets += Math.abs(balanceInBaseCurrency);
-
-                // 区分资产和债务
-                if (category.isDebt) {
-                    totalDebt += Math.abs(balanceInBaseCurrency);
-                } else {
-                    currentBalance += balanceInBaseCurrency;
-
-                    // 分类资产类型
-                    if (category.id && category.id.includes('cash')) {
-                        cash += balanceInBaseCurrency;
-                    } else {
-                        digital += balanceInBaseCurrency;
-                    }
-                }
+    calculateTotals(categories = this.data.categories) {
+        let currentBalance = 0, totalDebt = 0, debtCredit = 0, digital = 0, cash = 0;
+        this.traverseCategories(categories, category => {
+            if (category.children && Object.keys(category.children).length) return;
+            const balance = this.convertToBaseCurrency(category.balance, category.currency);
+            if (category.isDebt) {
+                totalDebt += Math.max(balance, 0);
+                debtCredit += Math.max(-balance, 0);
+            } else {
+                currentBalance += balance;
+                if (category.id?.includes('cash')) cash += balance; else digital += balance;
             }
-
-            // 递归处理子分类
-            if (category.children) {
-                Object.values(category.children).forEach(calculateCategoryTotal);
-            }
-        };
-
-        Object.values(this.data.categories).forEach(calculateCategoryTotal);
-
-        // 根据新规则：总资产 = 现余额 - 待还款（即：现余额 = 总正资产）
-        const realTotalAssets = currentBalance + totalDebt;  // 这是真正的"现总资产"
-        const realCurrentBalance = currentBalance;           // 这是"现余额"
-
-        return {
-            totalAssets: realTotalAssets,    // 现总资产 = 现余额 + 待还
-            currentBalance: realCurrentBalance, // 现余额 = 所有正资产
-            totalDebt,                       // 待还款
-            digital,
-            cash
-        };
+        });
+        return { totalAssets: currentBalance + debtCredit - totalDebt, currentBalance, totalDebt, debtCredit, digital, cash };
     }
 
     // 图表设置
+
     setupCharts() {
         this.updateAssetPieChart();
         this.updateAssetTrendChart();
@@ -3621,6 +3567,8 @@ class AssetTracker {
 
         const level = document.getElementById('pie-chart-level')?.value || 'all';
         const categoryData = this.getPieChartData(level);
+        const empty = document.getElementById('asset-pie-empty');
+        if (empty) empty.hidden = categoryData.length > 0;
 
         this.charts.assetPie = new Chart(ctx, {
             type: 'pie',
@@ -3764,7 +3712,7 @@ class AssetTracker {
                 labels: dailyTotals.labels,
                 datasets: [
                     {
-                        label: '总资产',
+                        label: '净资产',
                         data: dailyTotals.totalAssets,
                         borderColor: '#667eea',
                         backgroundColor: 'rgba(102, 126, 234, 0.1)',
@@ -3813,9 +3761,7 @@ class AssetTracker {
                     y: {
                         beginAtZero: true,
                         ticks: {
-                            callback: function(value) {
-                                return '¥' + value.toFixed(0);
-                            }
+                            callback: value => this.formatCurrency(value)
                         }
                     },
                     x: {
@@ -3894,9 +3840,7 @@ class AssetTracker {
             // 获取到该日期为止的所有交易
             const transactionsUpToDate = this.data.transactions.filter(t => {
                 const transactionDateStr = t.date.includes('T') ? t.date.split('T')[0] : t.date;
-                const transactionDate = new Date(transactionDateStr);
-                const targetDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-                return transactionDate <= targetDate;
+                return transactionDateStr <= localDateKey(date);
             });
 
             // 基于交易记录重建当日的资产状况
@@ -3920,35 +3864,15 @@ class AssetTracker {
         const tempBalances = JSON.parse(JSON.stringify(this.data.categories));
 
         // 获取所有不在范围内的交易（即需要减去的交易）
-        const transactionsToSubtract = this.data.transactions.filter(t =>
-            !transactionsUpToDate.find(included => included.id === t.id)
-        );
+        const included = new Set(transactionsUpToDate.map(item => item.id));
+        const transactionsToSubtract = this.data.transactions.filter(item => !included.has(item.id));
 
         // 从当前余额减去不在范围内的交易
         transactionsToSubtract.forEach(transaction => {
             this.subtractTransactionFromBalance(tempBalances, transaction);
         });
 
-        // 计算总额
-        let totalAssets = 0;
-        let currentBalance = 0;
-        let totalDebt = 0;
-
-        this.traverseCategories(tempBalances, (category) => {
-            if (!category.children || Object.keys(category.children).length === 0) {
-                // 叶子节点，转换货币并累加
-                const balanceInBaseCurrency = this.convertToBaseCurrency(category.balance, category.currency);
-                totalAssets += Math.abs(balanceInBaseCurrency);
-
-                if (category.isDebt) {
-                    totalDebt += Math.abs(balanceInBaseCurrency);
-                } else {
-                    currentBalance += balanceInBaseCurrency;
-                }
-            }
-        });
-
-        return { totalAssets, currentBalance, totalDebt };
+        return this.calculateTotals(tempBalances);
     }
 
     resetCategoryBalances(categories) {
@@ -3957,15 +3881,26 @@ class AssetTracker {
         });
     }
 
+    findCategoryByIdInTree(categories, id) {
+        for (const node of Object.values(categories)) {
+            if (node.id === id) return node;
+            if (node.children) { const found = this.findCategoryByIdInTree(node.children, id); if (found) return found; }
+        }
+        return null;
+    }
+
     subtractTransactionFromBalance(categories, transaction) {
         // 找到对应的分类
         let targetCategory = null;
 
+        if (transaction.accountId) targetCategory = this.findCategoryByIdInTree(categories, transaction.accountId);
         // 首先找到主分类
         const mainCategory = Object.values(categories).find(cat => cat.name === transaction.category);
         if (!mainCategory) return;
 
-        if (transaction.subcategory) {
+        if (targetCategory) {
+            // Stable account identity already resolved.
+        } else if (transaction.subcategory) {
             // 找子分类
             targetCategory = this.findSubcategoryByName(mainCategory, transaction.subcategory);
         } else {
@@ -3975,7 +3910,7 @@ class AssetTracker {
         if (targetCategory) {
             // 从余额中减去交易金额（注意：减去是因为我们在逆向计算）
             // 交易金额需要根据汇率转换到分类的货币
-            let amountToSubtract = transaction.amount;
+            let amountToSubtract = transaction.accountId && targetCategory.isDebt ? -transaction.amount : transaction.amount;
             const transactionCurrency = transaction.currency || 'CNY';
             const categoryCurrency = targetCategory.currency || 'CNY';
 
@@ -4019,13 +3954,13 @@ class AssetTracker {
 
     // Zoom 功能
     zoomIn() {
-        if (this.charts.assetTrend) {
+        if (typeof this.charts.assetTrend?.zoom === 'function') {
             this.charts.assetTrend.zoom(1.1);
         }
     }
 
     zoomOut() {
-        if (this.charts.assetTrend) {
+        if (typeof this.charts.assetTrend?.zoom === 'function') {
             this.charts.assetTrend.zoom(0.9);
         }
     }
@@ -4045,7 +3980,7 @@ class AssetTracker {
             <form id="transaction-form">
                 <div class="form-group">
                     <label>日期</label>
-                    <input type="date" id="transaction-date" value="${new Date().toISOString().split('T')[0]}" required>
+                    <input type="date" id="transaction-date" value="${localDateKey()}" required>
                 </div>
                 <div class="form-group">
                     <label>
@@ -4061,7 +3996,7 @@ class AssetTracker {
                     <select id="transaction-category" required>
                         <option value="">请选择类别</option>
                         ${Object.values(this.data.categories).map(cat =>
-                            `<option value="${cat.name}">${cat.name}</option>`
+                            `<option value="${escapeHTML(cat.name)}">${escapeHTML(cat.name)}</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -4074,7 +4009,7 @@ class AssetTracker {
                 <div class="form-group">
                     <label>金额</label>
                     <div class="amount-input-group">
-                        <input type="number" id="transaction-amount" step="0.01" required>
+                        <input type="number" id="transaction-amount" step="0.01" aria-describedby="amount-hint" required>
                         <select id="transaction-currency" class="currency-selector">
                             <option value="CNY">CNY ¥</option>
                             <option value="SGD">SGD S$</option>
@@ -4083,6 +4018,7 @@ class AssetTracker {
                         </select>
                     </div>
                 </div>
+                <p class="helper-text form-wide" id="amount-hint">支出填负数（如 -25），收入填正数。金额使用所选币种。</p>
                 <div class="form-group">
                     <label>类型</label>
                     <select id="transaction-type" required>
@@ -4097,7 +4033,7 @@ class AssetTracker {
                     <select id="transaction-purpose" required>
                         <option value="">请选择用途</option>
                         ${this.data.purposeCategories.map(purpose =>
-                            `<option value="${purpose}">${purpose}</option>`
+                            `<option value="${escapeHTML(purpose)}">${escapeHTML(purpose)}</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -4129,6 +4065,7 @@ class AssetTracker {
         });
 
         this.showModal();
+        this.enhanceEntryForm();
     }
 
     updateSubcategoryOptions(categoryName) {
@@ -4159,7 +4096,8 @@ class AssetTracker {
         });
     }
 
-    submitTransaction() {
+    async submitTransaction(keepOpen = false) {
+        if (this.transactionSubmitting) return;
         let dateValue = document.getElementById('transaction-date').value;
         const includeTime = document.getElementById('include-time').checked;
 
@@ -4172,7 +4110,7 @@ class AssetTracker {
             date: dateValue,
             category: document.getElementById('transaction-category').value,
             subcategory: document.getElementById('transaction-subcategory').value,
-            amount: parseFloat(document.getElementById('transaction-amount').value),
+            amount: Math.abs(parseFloat(document.getElementById('transaction-amount').value)) * (document.querySelector('input[name="entry-direction"]:checked')?.value === 'income' ? 1 : -1),
             currency: document.getElementById('transaction-currency').value,
             type: document.getElementById('transaction-type').value,
             purpose: document.getElementById('transaction-purpose').value,
@@ -4180,9 +4118,33 @@ class AssetTracker {
             includeTime: includeTime
         };
 
-        this.addTransaction(transaction);
-        this.closeModal();
-        this.showMessage('账单添加成功！', 'success');
+        Object.assign(transaction, this.readProjectEntry());
+        transaction.accountId = document.getElementById('entry-account')?.value || null;
+        if (transaction.projectId) {
+            const project = this.data.expenseProjects.find(p => p.id === transaction.projectId);
+            transaction.purpose = transaction.expenseCategoryId ? ProjectLedger.path(project, transaction.expenseCategoryId) : '未分类';
+        }
+        const projectErrors = ProjectLedger.validate({...this.data, transactions:[transaction]});
+        if (projectErrors.length) { document.getElementById('entry-error').textContent = projectErrors[0]; return; }
+        if (!Number.isFinite(transaction.amount) || transaction.amount === 0 || !transaction.category || !transaction.date || !transaction.purpose) {
+            this.showMessage('请填写日期、分类、用途和非零金额；支出填负数，收入填正数。', 'error');
+            return;
+        }
+        const submit = document.querySelector('#transaction-form button[type="submit"]');
+        this.transactionSubmitting = true;
+        if (submit) { submit.disabled = true; submit.textContent = '正在保存…'; }
+        try {
+            await this.addTransaction(transaction);
+            this.transactionSubmitting = false;
+            this.lastEntryAccountId = transaction.accountId;
+            if (transaction.projectId) (this.lastProjectCategories ||= {})[transaction.projectId] = transaction.expenseCategoryId;
+            if (keepOpen) this.completeContinuousEntry(); else this.closeModal();
+            this.showMessage('账单已保存', 'success');
+        } catch (error) {
+            // The persistence queue owns recovery; do not enqueue a duplicate after an unknown outcome.
+            if (submit) submit.textContent = '保存未确认';
+            this.showMessage('保存未确认，输入已保留。请按顶部的数据保护提示处理后重新打开账本。', 'error');
+        }
     }
 
     showCategoryModal() {
@@ -4222,7 +4184,7 @@ class AssetTracker {
     generateCategoryOptions(categories = this.data.categories, prefix = '') {
         let options = '';
         Object.values(categories).forEach(category => {
-            options += `<option value="${category.id}">${prefix}${category.name}</option>`;
+            options += `<option value="${escapeHTML(category.id)}">${escapeHTML(prefix)}${escapeHTML(category.name)}</option>`;
             if (category.children) {
                 options += this.generateCategoryOptions(category.children, prefix + category.name + ' - ');
             }
@@ -4286,14 +4248,14 @@ class AssetTracker {
             <h3>修改分类名称</h3>
             <form id="edit-category-name-form">
                 <div class="form-group">
-                    <label>当前名称: <strong>${category.name}</strong></label>
+                    <label>当前名称: <strong>${escapeHTML(category.name)}</strong></label>
                 </div>
                 <div class="form-group">
                     <label>新名称</label>
-                    <input type="text" id="new-category-name" value="${category.name}" placeholder="请输入新的分类名称" required>
+                    <input type="text" id="new-category-name" value="${escapeHTML(category.name)}" placeholder="请输入新的分类名称" required>
                 </div>
                 <div class="form-group">
-                    <button type="button" class="btn btn-primary" onclick="window.assetTracker.updateCategoryName('${categoryId}')">保存名称</button>
+                    <button type="button" class="btn btn-primary" onclick="window.assetTracker.updateCategoryName(${inlineArgument(categoryId)})">保存名称</button>
                     <button type="button" class="btn btn-secondary" onclick="window.assetTracker.closeModal()">取消</button>
                 </div>
             </form>
@@ -4369,11 +4331,11 @@ class AssetTracker {
 
         const modalBody = document.getElementById('modal-body');
         modalBody.innerHTML = `
-            <h3>编辑分类: ${category.name}</h3>
+            <h3>编辑分类: ${escapeHTML(category.name)}</h3>
             <form id="edit-category-form">
                 <div class="form-group">
                     <label>分类名称</label>
-                    <input type="text" id="edit-category-name" value="${category.name}" required>
+                    <input type="text" id="edit-category-name" value="${escapeHTML(category.name)}" required>
                 </div>
                 <div class="form-group">
                     <label>当前余额</label>
@@ -4474,22 +4436,22 @@ class AssetTracker {
 
         const modalBody = document.getElementById('modal-body');
         modalBody.innerHTML = `
-            <h3>设置汇率: ${category.name}</h3>
+            <h3>设置汇率: ${escapeHTML(category.name)}</h3>
             <div class="exchange-rate-modal">
                 <div class="form-group">
-                    <label>当前币种: ${category.currency}</label>
+                    <label>当前币种: ${escapeHTML(category.currency)}</label>
                 </div>
                 <div class="form-group">
                     <label>相对于基准币种 ${this.data.settings.baseCurrency} 的汇率</label>
                     <div class="rate-input-group">
-                        <span>1 ${category.currency} = </span>
+                        <span>1 ${escapeHTML(category.currency)} = </span>
                         <input type="number" id="exchange-rate-input" step="0.0001"
                                value="${this.data.settings.exchangeRates[category.currency] || 1}">
                         <span>${this.data.settings.baseCurrency}</span>
                     </div>
                 </div>
                 <div class="form-group">
-                    <button class="btn btn-primary" onclick="window.assetTracker.updateExchangeRate('${category.currency}')">保存汇率</button>
+                    <button class="btn btn-primary" onclick="window.assetTracker.updateExchangeRate(${inlineArgument(category.currency)})">保存汇率</button>
                     <button class="btn btn-secondary" onclick="window.assetTracker.closeModal()">取消</button>
                 </div>
             </div>
@@ -4557,7 +4519,7 @@ class AssetTracker {
                     <select id="edit-transaction-category" required>
                         <option value="">请选择类别</option>
                         ${Object.values(this.data.categories).map(cat =>
-                            `<option value="${cat.name}" ${cat.name === transaction.category ? 'selected' : ''}>${cat.name}</option>`
+                            `<option value="${escapeHTML(cat.name)}" ${cat.name === transaction.category ? 'selected' : ''}>${escapeHTML(cat.name)}</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -4593,13 +4555,13 @@ class AssetTracker {
                     <select id="edit-transaction-purpose" required>
                         <option value="">请选择用途</option>
                         ${this.data.purposeCategories.map(purpose =>
-                            `<option value="${purpose}" ${purpose === transaction.purpose ? 'selected' : ''}>${purpose}</option>`
+                            `<option value="${escapeHTML(purpose)}" ${purpose === transaction.purpose ? 'selected' : ''}>${escapeHTML(purpose)}</option>`
                         ).join('')}
                     </select>
                 </div>
                 <div class="form-group">
                     <label>描述</label>
-                    <textarea id="edit-transaction-description" rows="3">${transaction.description}</textarea>
+                    <textarea id="edit-transaction-description" rows="3">${escapeHTML(transaction.description)}</textarea>
                 </div>
                 <div class="form-group">
                     <button type="submit" class="btn btn-primary">保存修改</button>
@@ -4628,6 +4590,7 @@ class AssetTracker {
         });
 
         this.showModal();
+        this.enhanceEntryForm(transaction);
     }
 
     // 更新编辑模式下的子分类选项
@@ -4647,16 +4610,29 @@ class AssetTracker {
     }
 
     // 更新交易记录
-    updateTransaction(transactionId) {
+    async updateTransaction(transactionId) {
+        if (this.transactionEditPending) return;
         const transaction = this.data.transactions.find(t => t.id === transactionId);
         if (!transaction) return;
 
+        const amount = Number(document.getElementById('edit-transaction-amount').value);
+        if (!Number.isFinite(amount) || amount === 0) {
+            this.showMessage('请输入有效的非零金额。', 'error');
+            return;
+        }
+        this.transactionEditPending = true;
+        const submit = document.querySelector('#edit-transaction-form button[type="submit"]');
+        if (submit) { submit.disabled = true; submit.textContent = '正在保存…'; }
+        const projectFields = this.readProjectEntry();
+        const projectErrors = ProjectLedger.validate({...this.data, transactions:[{...transaction,...projectFields}]});
+        if (projectErrors.length) { this.transactionEditPending = false; if (submit) submit.disabled = false; document.getElementById('entry-error').textContent=projectErrors[0]; return; }
         // 先恢复原来的分类余额
         this.updateCategoryBalance({
             category: transaction.category,
             subcategory: transaction.subcategory,
             amount: -transaction.amount,
-            currency: transaction.currency || 'CNY'
+            currency: transaction.currency || 'CNY',
+            accountId: transaction.accountId
         });
 
         // 处理日期和时间
@@ -4672,22 +4648,34 @@ class AssetTracker {
         transaction.date = dateValue;
         transaction.category = document.getElementById('edit-transaction-category').value;
         transaction.subcategory = document.getElementById('edit-transaction-subcategory').value;
-        transaction.amount = parseFloat(document.getElementById('edit-transaction-amount').value);
+        transaction.amount = Math.abs(amount) * (document.querySelector('input[name="entry-direction"]:checked')?.value === 'income' ? 1 : -1);
         transaction.currency = document.getElementById('edit-transaction-currency').value;
         transaction.type = document.getElementById('edit-transaction-type').value;
         transaction.purpose = document.getElementById('edit-transaction-purpose').value;
         transaction.description = document.getElementById('edit-transaction-description').value;
         transaction.includeTime = includeTime;
 
+        Object.assign(transaction, projectFields);
+        transaction.accountId = document.getElementById('entry-account')?.value || null;
+        if (transaction.projectId) {
+            const project = this.data.expenseProjects.find(p => p.id === transaction.projectId);
+            transaction.purpose = transaction.expenseCategoryId ? ProjectLedger.path(project,transaction.expenseCategoryId) : '未分类';
+        }
         // 应用新的分类余额
         this.updateCategoryBalance(transaction);
 
-        this.persistData();
-        this.renderTransactions();
-        this.renderCategories();
-        this.updateDashboard();
-        this.closeModal();
-        this.showMessage('交易记录更新成功！', 'success');
+        try {
+            await this.persistData();
+            this.renderTransactions();
+            this.renderCategories();
+            this.updateDashboard();
+            this.closeModal();
+            this.showMessage('交易记录已保存', 'success');
+            this.transactionEditPending = false;
+        } catch (error) {
+            if (submit) submit.textContent = '保存未确认';
+            this.showMessage('修改保存未确认，输入已保留。请按数据保护提示处理。', 'error');
+        }
     }
 
     // 删除交易
@@ -4722,16 +4710,7 @@ class AssetTracker {
         const workbook = XLSX.utils.book_new();
 
         // 交易记录工作表
-        const transactionsData = this.data.transactions.map(t => ({
-            '日期': t.date,
-            '类别': t.category,
-            '子类别': t.subcategory || '',
-            '金额': t.amount,
-            '货币类型': t.currency || 'CNY',
-            '类型': t.type,
-            '用途分类': t.purpose || '',
-            '描述': t.description
-        }));
+        const transactionsData = globalThis.AssetTrackerImport.rows(this.data);
 
         const transactionsSheet = XLSX.utils.json_to_sheet(transactionsData);
         XLSX.utils.book_append_sheet(workbook, transactionsSheet, '交易记录');
@@ -4741,7 +4720,7 @@ class AssetTracker {
         const categoriesSheet = XLSX.utils.json_to_sheet(categoriesData);
         XLSX.utils.book_append_sheet(workbook, categoriesSheet, '分类余额');
 
-        const outputFileName = `资产记录_${new Date().toISOString().split('T')[0]}.xlsx`;
+        const outputFileName = `资产记录_${localDateKey()}.xlsx`;
         const excelBinary = XLSX.write(workbook, {
             bookType: 'xlsx',
             type: 'base64'
@@ -4780,7 +4759,7 @@ class AssetTracker {
         const dataStr = JSON.stringify(packageData, null, 2);
 
         this.fileAdapter.saveFile({
-            suggestedName: `资产账本_${new Date().toISOString().split('T')[0]}.json`,
+            suggestedName: `资产账本_${localDateKey()}.json`,
             mimeType: 'application/json',
             text: dataStr
         }).then(() => {
@@ -4858,120 +4837,91 @@ class AssetTracker {
     }
 
     async importData() {
-        const previousState = JSON.stringify(this.data);
-
+        if (this.importOpening || this.importCommitPending) return;
+        this.importOpening = true;
         try {
-            const result = await this.fileAdapter.openImport({
-            acceptedTypes: '.xlsx,.csv',
-            fileInputId: 'import-file',
-            readAs: 'binary'
-            });
-            if (!result) {
-                return;
-            }
-
-            const rawData = this.fileAdapter.normalizeImportedContent(
-                result.text,
-                result.encoding || 'binary',
-                { output: 'binary' }
-            );
-            const workbook = XLSX.read(rawData, { type: 'binary' });
-            const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-            const data = XLSX.utils.sheet_to_json(firstSheet);
-
-            let importCount = 0;
-            data.forEach(row => {
-                if (row['日期'] && row['类别'] && row['金额'] !== undefined) {
-                    const transaction = {
-                        id: Date.now().toString() + importCount,
-                        date: row['日期'],
-                        category: row['类别'],
-                        subcategory: row['子类别'] || '',
-                        amount: parseFloat(row['金额']) || 0,
-                        currency: row['货币类型'] || 'CNY',
-                        type: row['类型'] || '单次',
-                        purpose: row['用途分类'] || '其他',
-                        description: row['描述'] || '',
-                        includeTime: row['日期'] && row['日期'].includes('T')
-                    };
-
-                    this.data.transactions.push(transaction);
-                    this.updateCategoryBalance(transaction);
-                    importCount++;
-                }
-            });
-
-            if (importCount === 0) {
-                this.showMessage('未检测到可导入记录', 'error');
-                return;
-            }
-
-            await this.saveData({ reason: 'import-excel' });
-            this.refreshDataViews();
-            this.showMessage(`成功导入 ${importCount} 条记录！`, 'success');
-            const fileInput = document.getElementById('import-file');
-            if (fileInput) {
-                fileInput.value = '';
-            }
+            this.assertWritable();
+            const result = await this.fileAdapter.openImport({ acceptedTypes: '.xlsx,.csv', fileInputId: 'import-file', readAs: 'binary' });
+            if (!result) return;
+            if (result.text.length > 16 * 1024 * 1024) throw new Error('导入文件不能超过 12 MB');
+            const raw = this.fileAdapter.normalizeImportedContent(result.text, result.encoding || 'binary', {output:'binary'});
+            const workbook = XLSX.read(raw, {type:'binary', codepage:65001, raw:true, sheetRows:50002});
+            const rows = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {defval:''});
+            this.importPreview = globalThis.AssetTrackerImport.prepare(this.data, rows);
+            const p = this.importPreview;
+            document.getElementById('modal-body').innerHTML = `<h3>导入预览</h3>
+                <p class="helper-text">检查通过后才会一次性追加账单，不替换现有记录。收入为正数，支出为负数。</p>
+                <div class="project-metrics"><div>可新增<strong>${p.accepted.length}</strong></div><div>已存在<strong>${p.duplicates.length}</strong></div><div>需要检查<strong>${p.errors.length + p.suspected.length}</strong></div></div>
+                ${p.suspected.length ? `<label class="import-duplicate-choice"><input id="import-include-suspected" type="checkbox">仍导入 ${p.suspected.length} 笔内容相同但无相同 ID 的记录（仅确认是不同消费时勾选）</label>`:''}
+                <div class="import-review-list">${p.errors.slice(0,100).map(e=>`<p class="negative">第 ${e.row} 行：${escapeHTML(e.message)}</p>`).join('')}
+                ${[...p.accepted,...p.suspected].slice(0,30).map(({row,transaction:t})=>`<p>第 ${row} 行 · ${escapeHTML(t.date)} · ${escapeHTML(t.category)} · ${escapeHTML(t.amount)} ${escapeHTML(t.currency)} · ${escapeHTML(t.description)}</p>`).join('')}</div>
+                <p class="helper-text">共 ${p.total} 行；预览最多显示 30 笔、100 个错误。相同 ID 的重复记录始终跳过。${p.errors.length?'请修正错误后重新选择文件，当前没有写入任何账目。':''}</p>
+                <p id="import-preview-status" role="status" aria-live="polite"></p>
+                <div class="entry-submit-actions"><button type="button" class="btn btn-secondary" id="cancel-import-preview">取消</button><button type="button" class="btn btn-primary" id="confirm-import-preview" ${p.errors.length || !p.accepted.length&&!p.suspected.length?'disabled':''}>确认追加</button></div>`;
+            document.getElementById('cancel-import-preview').onclick = () => this.closeModal();
+            document.getElementById('confirm-import-preview').onclick = () => this.commitImportPreview();
+            this.showModal();
         } catch (error) {
-            this.data = this.normalizeLoadedData(JSON.parse(previousState));
-            this.refreshDataViews();
-            if (error instanceof Error && error.message === '用户取消了操作') {
-                return;
-            }
-            if (this.lastError === error) {
-                return;
-            }
-            console.error(error);
-            this.showMessage(error?.message || '文件格式错误，请检查文件内容！', 'error');
+            if (error?.message !== '用户取消了操作') this.showMessage(error?.message || '文件无法读取', 'error');
+        } finally { this.importOpening = false; }
+    }
+
+    async commitImportPreview() {
+        if (!this.importPreview || this.importCommitPending) return;
+        const status = document.getElementById('import-preview-status');
+        let previous, mutated = false;
+        try {
+            this.assertWritable();
+            const next = globalThis.AssetTrackerImport.apply(this.data, this.importPreview, Boolean(document.getElementById('import-include-suspected')?.checked));
+            const added = next.transactions.length - this.data.transactions.length;
+            if (!added) { status.textContent = '没有需要新增的记录。'; return; }
+            const valid = this.validateRawBook(JSON.stringify(next));
+            if (valid.status !== 'valid') throw new Error('导入结果未通过完整账本校验，请检查文件');
+            previous = this.data;
+            this.importCommitPending = true;
+            document.getElementById('confirm-import-preview').disabled = true;
+            document.getElementById('cancel-import-preview').disabled = true;
+            status.textContent = '正在安全保存，请稍候…';
+            this.data = next; mutated = true;
+            await this.saveData({reason:'import-excel'});
+            this.importCommitPending = false; this.importPreview = null;
+            this.refreshDataViews(); this.renderProjectWorkspace(); this.closeModal();
+            this.showMessage(`已保存 ${added} 笔账单。`, 'success');
+        } catch (error) {
+            if (mutated) this.data = previous;
+            this.importCommitPending = false;
+            status.textContent = error?.message || '保存失败，请重试';
+            document.getElementById('cancel-import-preview').disabled = false;
+            document.getElementById('confirm-import-preview').disabled = false;
         }
     }
 
     async importFullBook() {
-        const previousState = JSON.stringify(this.data);
-
+        if (this.fullBookImportPending) return;
+        this.fullBookImportPending = true;
+        let previousState, mutated = false;
         try {
-            const result = await this.fileAdapter.openImport({
-                acceptedTypes: '.json',
-                fileInputId: 'import-book-file',
-                readAs: 'text'
-            });
-
-            if (!result) {
-                return;
-            }
-
-            const text = this.fileAdapter.normalizeImportedContent(
-                result.text,
-                result.encoding || 'text',
-                { output: 'text' }
-            );
+            this.assertWritable();
+            const result = await this.fileAdapter.openImport({acceptedTypes:'.json',fileInputId:'import-book-file',readAs:'text'});
+            if (!result) return;
+            if (result.text.length > 12 * 1024 * 1024) throw new Error('完整账本超过 12 MB');
+            const text = this.fileAdapter.normalizeImportedContent(result.text,result.encoding||'text',{output:'text'});
             const parsed = this.parseBookPayload(text);
-            if (!parsed || !parsed.payload) {
-                this.showMessage('该文件不是完整账本 JSON，导入已取消。', 'error');
-                return;
-            }
-
+            if (parsed.status !== 'valid') throw new Error('该 JSON 未通过完整账本校验，未修改任何账目。');
             const nextState = this.normalizeLoadedData(parsed.payload);
-            if (!window.confirm('导入完整账本将覆盖当前所有数据，是否继续？')) {
-                return;
-            }
-
-            this.data = nextState;
-            await this.saveData({ reason: 'import-book' });
+            if (!window.confirm(`当前 ${this.data.transactions.length} 笔账单将被文件中的 ${nextState.transactions.length} 笔替换。接下来先导出当前完整备份，再替换账本。是否继续？`)) return;
+            previousState = JSON.stringify(this.data);
+            await this.fileAdapter.saveFile({suggestedName:`替换前账本备份_${localDateKey()}.json`,mimeType:'application/json',text:JSON.stringify(this.getBookExportPackage(),null,2)});
+            if (JSON.stringify(this.data) !== previousState) throw new Error('备份期间账本已有变化，请重新导入。');
+            this.assertWritable();
+            this.data = nextState; mutated = true;
+            await this.saveData({reason:'import-book'});
             this.refreshDataViews();
-            this.showMessage('完整账本导入成功，已替换当前数据。', 'success');
-        } catch (error) {
-            this.data = this.normalizeLoadedData(JSON.parse(previousState));
-            this.refreshDataViews();
-            if (error instanceof Error && error.message === '用户取消了操作') {
-                return;
-            }
-            if (this.lastError === error) {
-                return;
-            }
-            this.showMessage(error?.message || '完整账本导入失败', 'error');
-        }
+            this.showMessage('完整账本已替换，请妥善保存替换前备份。','success');
+        } catch(error) {
+            if (mutated) { this.data = this.normalizeLoadedData(JSON.parse(previousState)); this.refreshDataViews(); }
+            if(error?.message !== '用户取消了操作' && this.lastError !== error) this.showMessage(error?.message || '完整账本导入失败','error');
+        } finally { this.fullBookImportPending = false; }
     }
 
     async revealStorageFolder() {
@@ -5037,11 +4987,33 @@ class AssetTracker {
 
     // 工具方法
     showModal() {
-        document.getElementById('modal').style.display = 'block';
+        const modal = document.getElementById('modal');
+        const wasOpen = modal.style.display === 'block';
+        if (!wasOpen) this.modalTrigger = document.activeElement;
+        modal.style.display = 'block';
+        modal.setAttribute('role', 'dialog');
+        modal.setAttribute('aria-modal', 'true');
+        const heading = modal.querySelector('h3');
+        if (heading) { heading.id = 'modal-title'; modal.setAttribute('aria-labelledby', heading.id); }
+        // Associate existing labels with fields without changing the saved data format.
+        modal.querySelectorAll('.form-group').forEach(group => {
+            const label = group.querySelector('label');
+            const field = group.querySelector('input, select, textarea');
+            if (label && field?.id && !label.contains(field)) label.htmlFor = field.id;
+        });
+        const shell = document.getElementById('normal-app-shell');
+        if (shell) { if (!wasOpen) this.modalShellWasInert = shell.inert; shell.inert = true; }
+        document.body.style.overflow = 'hidden';
+        modal.querySelector('.close')?.focus();
     }
 
     closeModal() {
+        if (this.importCommitPending) return;
         document.getElementById('modal').style.display = 'none';
+        const shell = document.getElementById('normal-app-shell');
+        if (shell && !shell.hidden) shell.inert = Boolean(this.modalShellWasInert);
+        document.body.style.overflow = '';
+        this.modalTrigger?.focus?.();
     }
 
     showMessage(text, type = 'success') {
@@ -5074,7 +5046,7 @@ class AssetTracker {
                     <label>类别</label>
                     <select id="rule-category" required>
                         ${Object.values(this.data.categories).map(cat =>
-                            `<option value="${cat.name}">${cat.name}</option>`
+                            `<option value="${escapeHTML(cat.name)}">${escapeHTML(cat.name)}</option>`
                         ).join('')}
                     </select>
                 </div>
@@ -5143,19 +5115,19 @@ class AssetTracker {
         container.innerHTML = this.data.automationRules.map(rule => `
             <div class="rule-item">
                 <div class="rule-header">
-                    <span class="rule-name">${rule.name}</span>
+                    <span class="rule-name">${escapeHTML(rule.name)}</span>
                     <span class="rule-frequency">${this.getFrequencyText(rule.frequency)}</span>
                 </div>
                 <div class="rule-details">
-                    类别: ${rule.category} | 金额: ¥${rule.amount} |
-                    ${rule.startDate} ${rule.endDate ? `至 ${rule.endDate}` : ''}
+                    类别: ${escapeHTML(rule.category)} | 金额: ¥${rule.amount} |
+                    ${escapeHTML(rule.startDate)} ${rule.endDate ? `至 ${escapeHTML(rule.endDate)}` : ''}
                 </div>
                 <div class="rule-actions">
-                    <button class="btn btn-sm" onclick="window.assetTracker.toggleRule('${rule.id}')">
+                    <button class="btn btn-sm" onclick="window.assetTracker.toggleRule(${inlineArgument(rule.id)})">
                         ${rule.active ? '暂停' : '启用'}
                     </button>
-                    <button class="btn btn-sm btn-primary" onclick="window.assetTracker.fillToToday('${rule.id}')">补齐到今天</button>
-                    <button class="btn btn-sm" onclick="window.assetTracker.deleteRule('${rule.id}')">删除</button>
+                    <button class="btn btn-sm btn-primary" onclick="window.assetTracker.fillToToday(${inlineArgument(rule.id)})">补齐到今天</button>
+                    <button class="btn btn-sm" onclick="window.assetTracker.deleteRule(${inlineArgument(rule.id)})">删除</button>
                 </div>
             </div>
         `).join('');
@@ -5172,7 +5144,8 @@ class AssetTracker {
     }
 
     // 补齐到今天功能
-    fillToToday(ruleId) {
+    async fillToToday(ruleId) {
+        if (this.ruleCatchUpPending) return;
         const rule = this.data.automationRules.find(r => r.id === ruleId);
         if (!rule || !rule.active) {
             this.showMessage('规则不存在或已禁用！', 'error');
@@ -5197,16 +5170,20 @@ class AssetTracker {
             return;
         }
 
-        // 批量添加缺失的交易
-        missingTransactions.forEach(transaction => {
-            this.addTransaction(transaction);
-        });
-
-        // 更新最后执行时间
-        rule.lastExecuted = actualEndDate.toISOString();
-        this.persistData();
-
-        this.showMessage(`成功补齐 ${missingTransactions.length} 条交易记录！`, 'success');
+        this.ruleCatchUpPending = true;
+        try {
+            missingTransactions.forEach(transaction => this.appendTransaction(transaction));
+            rule.lastExecuted = actualEndDate.toISOString();
+            await this.persistData();
+            this.renderTransactions();
+            this.renderCategories();
+            this.updateDashboard();
+            this.showMessage(`已保存 ${missingTransactions.length} 条补齐记录`, 'success');
+            this.ruleCatchUpPending = false;
+        } catch (error) {
+            // Keep this action locked until the persistence recovery flow resolves the outcome.
+            this.showMessage('补齐保存未确认，请按数据保护提示处理，勿重复补齐。', 'error');
+        }
     }
 
     getMissingTransactions(rule, startDate, endDate) {
@@ -5299,52 +5276,44 @@ class AssetTracker {
                 plugins: {
                     title: {
                         display: true,
-                        text: `${selectedCategories.join(', ')} - 最近${timeRange}天`
+                        text: `实际账单每日净变动 · 最近${timeRange}天`
                     }
                 },
                 scales: chartType !== 'pie' ? {
                     y: {
                         beginAtZero: true,
                         ticks: {
-                            callback: function(value) {
-                                return '¥' + value.toFixed(0);
-                            }
+                            callback: value => this.formatCurrency(value)
                         }
                     }
                 } : {}
             }
         });
 
-        this.generatePredictionChart(selectedCategories);
+        // Predictions stay unavailable until a validated model exists.
     }
 
     prepareChartData(categories, timeRange) {
-        const endDate = new Date();
-        const startDate = new Date();
-        startDate.setDate(endDate.getDate() - timeRange);
-
-        const labels = [];
-        const datasets = [];
-
-        // 生成日期标签
-        for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-            labels.push(`${d.getMonth() + 1}/${d.getDate()}`);
-        }
-
-        // 为每个分类生成数据
-        categories.forEach((categoryName, index) => {
-            const categoryData = labels.map(() => Math.random() * 1000); // 模拟数据
-
-            datasets.push({
-                label: categoryName,
-                data: categoryData,
-                borderColor: this.getChartColor(index),
-                backgroundColor: this.getChartColor(index, 0.1),
-                fill: false
-            });
+        const end = new Date();
+        const days = Math.max(1, Math.min(365, Number(timeRange) || 30));
+        const labels = Array.from({ length: days }, (_, index) => {
+            const date = new Date(end);
+            date.setDate(date.getDate() - days + 1 + index);
+            return localDateKey(date);
         });
-
-        return { labels, datasets };
+        const indices = new Map(labels.map((day, index) => [day, index]));
+        const values = new Map(categories.map(name => [name, Array(days).fill(0)]));
+        for (const item of this.data.transactions) {
+            const index = indices.get(item.date.slice(0, 10));
+            if (index !== undefined && values.has(item.category)) {
+                values.get(item.category)[index] += this.convertToBaseCurrency(item.amount, item.currency);
+            }
+        }
+        return { labels, datasets: categories.map((name, index) => ({
+            label: `${name} · 每日净变动 (${this.data.settings.baseCurrency})`,
+            data: values.get(name), borderColor: this.getChartColor(index),
+            backgroundColor: this.getChartColor(index, 0.1), fill: false
+        })) };
     }
 
     getChartColor(index, alpha = 1) {
@@ -5797,11 +5766,11 @@ class AssetTracker {
             return `
                 <div class="initial-asset-item">
                     <div class="asset-info">
-                        <strong>${categoryPath}</strong>
+                        <strong>${escapeHTML(categoryPath)}</strong>
                         <span class="time">${timeStr}</span>
                         <span class="amount">${this.formatCurrency(asset.amount, asset.currency)}</span>
                     </div>
-                    <button class="btn btn-sm btn-danger" onclick="window.assetTracker.deleteInitialAsset('${asset.id}')">删除</button>
+                    <button class="btn btn-sm btn-danger" onclick="window.assetTracker.deleteInitialAsset(${inlineArgument(asset.id)})">删除</button>
                 </div>
             `;
         }).join('');
@@ -5831,7 +5800,7 @@ class AssetTracker {
         select.innerHTML = '<option value="">请选择分类</option>';
 
         Object.values(this.data.categories).forEach(category => {
-            select.innerHTML += `<option value="${category.name}">${category.name}</option>`;
+            select.innerHTML += `<option value="${escapeHTML(category.name)}">${escapeHTML(category.name)}</option>`;
         });
     }
 
@@ -5843,8 +5812,8 @@ class AssetTracker {
 
         return this.data.transactionTemplates.map(template =>
             `<button type="button" class="btn btn-sm btn-primary template-btn"
-                onclick="window.assetTracker.applyTransactionTemplate('${template.id}', '${formType}')">
-                ${template.name}
+                onclick="window.assetTracker.applyTransactionTemplate(${inlineArgument(template.id)}, '${formType}')">
+                ${escapeHTML(template.name)}
             </button>`
         ).join('');
     }
@@ -5951,7 +5920,7 @@ class AssetTracker {
             <form id="memo-form">
                 <div class="form-group">
                     <label>备忘录内容</label>
-                    <textarea id="memo-text" rows="8" placeholder="请输入备忘录内容...">${currentMemo}</textarea>
+                    <textarea id="memo-text" rows="8" placeholder="请输入备忘录内容...">${escapeHTML(currentMemo)}</textarea>
                 </div>
                 <div class="form-group">
                     <button type="submit" class="btn btn-primary">保存备忘录</button>
@@ -5983,28 +5952,23 @@ class AssetTracker {
             memoContent.innerHTML = '<p class="empty-state">点击编辑添加备忘录内容</p>';
         } else {
             // 将换行符转换为HTML换行
-            const formattedMemo = this.data.memo.replace(/\n/g, '<br>');
+            const formattedMemo = escapeHTML(this.data.memo).replace(/\n/g, '<br>');
             memoContent.innerHTML = `<div class="memo-text">${formattedMemo}</div>`;
         }
     }
 
     // 交易筛选功能
     initializeTransactionFilters() {
-        // 设置默认时间范围：最近一个月
-        const today = new Date();
-        const oneMonthAgo = new Date(today.getFullYear(), today.getMonth() - 1, today.getDate());
-
-        const dateFromInput = document.getElementById('date-from');
-        const dateToInput = document.getElementById('date-to');
-
-        if (dateFromInput) {
-            dateFromInput.value = oneMonthAgo.toISOString().split('T')[0];
+        if (!this.transactionFiltersInitialized) {
+            const today = new Date();
+            const start = new Date(today);
+            start.setDate(start.getDate() - 29);
+            const from = document.getElementById('date-from');
+            const to = document.getElementById('date-to');
+            if (from) from.value = localDateKey(start);
+            if (to) to.value = localDateKey(today);
+            this.transactionFiltersInitialized = true;
         }
-        if (dateToInput) {
-            dateToInput.value = today.toISOString().split('T')[0];
-        }
-
-        // 填充分类筛选选项
         this.populateCategoryFilter();
     }
 
@@ -6012,14 +5976,30 @@ class AssetTracker {
         const categoryFilter = document.getElementById('category-filter');
         if (!categoryFilter) return;
 
+        const selected = categoryFilter.value;
         categoryFilter.innerHTML = '<option value="">全部分类</option>';
         Object.values(this.data.categories).forEach(category => {
-            categoryFilter.innerHTML += `<option value="${category.name}">${category.name}</option>`;
+            categoryFilter.innerHTML += `<option value="${escapeHTML(category.name)}">${escapeHTML(category.name)}</option>`;
         });
+        categoryFilter.value = selected;
     }
 
     filterTransactions() {
+        this.transactionPage = 0;
         this.renderTransactions();
+    }
+
+    changeTransactionPage(delta) {
+        this.transactionPage = Math.max(0, (this.transactionPage || 0) + delta);
+        this.renderTransactions();
+    }
+
+    resetTransactionFilters() {
+        for (const id of ['category-filter', 'date-from', 'date-to', 'transaction-search', 'project-filter', 'project-category-filter']) {
+            const field = document.getElementById(id);
+            if (field) field.value = '';
+        }
+        this.filterTransactions();
     }
 
     // 计算货币细分数据
@@ -6029,8 +6009,8 @@ class AssetTracker {
         let title = '';
 
         switch(assetType) {
-            case 'total': title = '总资产明细'; break;
-            case 'digital': title = '数字资产明细'; break;
+            case 'total': title = '净资产明细'; break;
+            case 'digital': title = '非现金资产明细'; break;
             case 'cash': title = '现金明细'; break;
             case 'debt': title = '待还款明细'; break;
             case 'balance': title = '现余额明细'; break;
@@ -6080,10 +6060,10 @@ class AssetTracker {
                     shouldInclude = true;
                     break;
                 case 'digital':
-                    shouldInclude = category.name && category.name.includes('数字');
+                    shouldInclude = !category.isDebt && !category.id?.includes('cash');
                     break;
                 case 'cash':
-                    shouldInclude = category.name && category.name.includes('现金');
+                    shouldInclude = !category.isDebt && category.id?.includes('cash');
                     break;
                 case 'debt':
                     shouldInclude = category.isDebt;
@@ -6097,7 +6077,7 @@ class AssetTracker {
                 if (!breakdown[currency]) {
                     breakdown[currency] = 0;
                 }
-                breakdown[currency] += assetType === 'total' ? Math.abs(balance) : balance;
+                breakdown[currency] += assetType === 'total' && category.isDebt ? -balance : assetType === 'debt' ? Math.max(balance, 0) : balance;
             }
         } else {
             Object.values(category.children).forEach(child => {
@@ -6106,6 +6086,9 @@ class AssetTracker {
         }
     }
 }
+
+globalThis.AssetTrackerProjectUI.install(AssetTracker);
+globalThis.AssetTrackerAnalyticsUI.install(AssetTracker);
 
 // 初始化应用
 document.addEventListener('DOMContentLoaded', () => {

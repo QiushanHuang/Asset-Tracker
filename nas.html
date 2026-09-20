@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Asset Tracker · NAS 协作</title>
+    <link rel="icon" href="assets/asset-tracker-logo-v3.png" />
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="nas.css" />
+    <script defer src="expense-projects.js"></script>
+    <script defer src="ledger-import.js"></script>
+    <script defer src="legacy-safety.js"></script>
+    <script defer src="nas-connection.js"></script>
+    <script defer src="nas-model.js"></script>
+    <script defer src="nas-ui.js"></script>
+  </head>
+  <body class="nas-standalone">
+    <main class="nas-page">
+      <header class="nas-brand">
+        <img src="assets/asset-tracker-logo-v3.png" alt="" />
+        <div>
+          <h1>Asset Tracker</h1>
+          <p class="helper-text">自己的账，家人的账，都有清楚的边界。</p>
+        </div>
+      </header>
+      <div data-nas-root data-standalone="true"></div>
+      <noscript>请启用 JavaScript 以使用记账服务。</noscript>
+    </main>
+  </body>
+</html>

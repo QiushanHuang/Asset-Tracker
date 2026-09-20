@@ -5,13 +5,14 @@ MODE="${1:-run}"
 APP_NAME="AssetTracker"
 BUNDLE_NAME="AssetTracker.app"
 BUNDLE_ID="com.qiushan.AssetTracker"
-APP_VERSION="${ASSET_TRACKER_VERSION:-3.1.1}"
-APP_BUILD="${ASSET_TRACKER_BUILD:-2}"
+APP_VERSION="${ASSET_TRACKER_VERSION:-3.2.1}"
+APP_BUILD="${ASSET_TRACKER_BUILD:-3}"
+BUILD_CONFIGURATION="${ASSET_TRACKER_CONFIGURATION:-debug}"
 MIN_SYSTEM_VERSION="14.0"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE_DIR="$ROOT_DIR/macos-app"
-DIST_DIR="$ROOT_DIR/dist"
+DIST_DIR="${ASSET_TRACKER_DIST_DIR:-$ROOT_DIR/dist}"
 STAGING_WEB_DIR="$PACKAGE_DIR/Resources/Web"
 APP_BUNDLE="$DIST_DIR/$BUNDLE_NAME"
 APP_CONTENTS="$APP_BUNDLE/Contents"
@@ -21,16 +22,16 @@ APP_BINARY="$APP_MACOS/$APP_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 
 "$ROOT_DIR/script/sync_web_assets.sh"
-pkill -x "$APP_NAME" >/dev/null 2>&1 || true
 
-swift build --package-path "$PACKAGE_DIR" --product "$APP_NAME"
-BUILD_BINARY="$(swift build --package-path "$PACKAGE_DIR" --show-bin-path)/$APP_NAME"
+swift build --package-path "$PACKAGE_DIR" -c "$BUILD_CONFIGURATION" --product "$APP_NAME"
+BUILD_BINARY="$(swift build --package-path "$PACKAGE_DIR" -c "$BUILD_CONFIGURATION" --show-bin-path)/$APP_NAME"
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
 cp -R "$STAGING_WEB_DIR" "$APP_RESOURCES/Web"
+cp "$PACKAGE_DIR/Resources/AssetTracker-v3.icns" "$APP_RESOURCES/AssetTracker.icns"
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -51,6 +52,8 @@ cat >"$INFO_PLIST" <<PLIST
   <string>$APP_BUILD</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>AssetTracker</string>
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_SYSTEM_VERSION</string>
   <key>NSPrincipalClass</key>

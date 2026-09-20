@@ -271,6 +271,11 @@ function loadAssetTracker({
 } = {}) {
     const scriptPath = path.join(__dirname, '..', '..', 'script.js');
     const safetyPath = path.join(__dirname, '..', '..', 'legacy-safety.js');
+    const projectContent = fs.readFileSync(path.join(__dirname, '..', '..', 'expense-projects.js'), 'utf8');
+    const projectUIContent = fs.readFileSync(path.join(__dirname, '..', '..', 'project-ui.js'), 'utf8');
+    const analyticsContent = fs.readFileSync(path.join(__dirname, '..', '..', 'ledger-insights.js'), 'utf8');
+    const analyticsUIContent = fs.readFileSync(path.join(__dirname, '..', '..', 'insights-ui.js'), 'utf8');
+    const importContent = fs.readFileSync(path.join(__dirname, '..', '..', 'ledger-import.js'), 'utf8');
     const safetyContent = fs.readFileSync(safetyPath, 'utf8');
     const scriptContent = fs.readFileSync(scriptPath, 'utf8');
     const domEvents = {};
@@ -514,7 +519,7 @@ function loadAssetTracker({
             };
         `, context);
     }
-    vm.runInContext(`${safetyContent}\n${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
+    vm.runInContext(`${projectContent}\n${projectUIContent}\n${analyticsContent}\n${analyticsUIContent}\n${safetyContent}\n${importContent}\n${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
 
     return {
         AssetTracker: context.__AssetTracker,

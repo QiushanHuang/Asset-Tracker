@@ -1,0 +1,163 @@
+{
+  "format": "qiushan.asset-book",
+  "formatVersion": 1,
+  "schemaVersion": 1,
+  "domainCapabilityVersion": 1,
+  "minimumReaderVersion": 1,
+  "source": "fictional-release-demo",
+  "payload": {
+    "categories": {
+      "cash": {
+        "id": "demo-cash",
+        "name": "现金",
+        "balance": 2200,
+        "currency": "CNY",
+        "isDebt": false
+      },
+      "bank": {
+        "id": "demo-bank",
+        "name": "银行存款",
+        "balance": 15000,
+        "currency": "CNY",
+        "isDebt": false
+      },
+      "usd": {
+        "id": "demo-usd",
+        "name": "外币储蓄",
+        "balance": 1200,
+        "currency": "USD",
+        "isDebt": false
+      },
+      "credit": {
+        "id": "demo-credit",
+        "name": "信用卡",
+        "balance": 800,
+        "currency": "CNY",
+        "isDebt": true
+      }
+    },
+    "transactions": [
+      {
+        "id": "demo-salary",
+        "date": "2026-09-01",
+        "category": "银行存款",
+        "accountId": "demo-bank",
+        "amount": 8500,
+        "currency": "CNY",
+        "type": "单次",
+        "purpose": "工资",
+        "description": "演示收入"
+      },
+      {
+        "id": "demo-hotel-bill",
+        "date": "2026-09-16",
+        "category": "银行存款",
+        "accountId": "demo-bank",
+        "amount": -680,
+        "currency": "CNY",
+        "type": "单次",
+        "purpose": "旅行",
+        "description": "演示住宿",
+        "projectId": "demo-trip",
+        "expenseCategoryId": "demo-hotel"
+      },
+      {
+        "id": "demo-meal-bill",
+        "date": "2026-09-17",
+        "category": "现金",
+        "accountId": "demo-cash",
+        "amount": -125.8,
+        "currency": "CNY",
+        "type": "单次",
+        "purpose": "旅行",
+        "description": "演示晚餐",
+        "projectId": "demo-trip",
+        "expenseCategoryId": "demo-meal"
+      },
+      {
+        "id": "demo-transit-bill",
+        "date": "2026-09-17",
+        "category": "现金",
+        "accountId": "demo-cash",
+        "amount": -45,
+        "currency": "CNY",
+        "type": "单次",
+        "purpose": "旅行",
+        "description": "演示交通",
+        "projectId": "demo-trip",
+        "expenseCategoryId": "demo-transit"
+      },
+      {
+        "id": "demo-groceries",
+        "date": "2026-09-19",
+        "category": "现金",
+        "accountId": "demo-cash",
+        "amount": -180,
+        "currency": "CNY",
+        "type": "单次",
+        "purpose": "日常消费",
+        "description": "演示采购"
+      },
+      {
+        "id": "demo-usd-bill",
+        "date": "2026-09-19",
+        "category": "外币储蓄",
+        "accountId": "demo-usd",
+        "amount": -32,
+        "currency": "USD",
+        "type": "单次",
+        "purpose": "日常消费",
+        "description": "演示外币消费"
+      }
+    ],
+    "automationRules": [],
+    "purposeCategories": [
+      "工资",
+      "旅行",
+      "日常消费"
+    ],
+    "initialAssets": [],
+    "settings": {
+      "baseCurrency": "CNY",
+      "exchangeRates": {
+        "CNY": 1,
+        "USD": 7.1,
+        "SGD": 5.2,
+        "MYR": 1.6
+      },
+      "autoBackup": false,
+      "backupInterval": 24
+    },
+    "memo": "此账本全部为虚构演示数据，用于产品截图和功能体验。",
+    "transactionTemplates": [],
+    "expenseProjects": [
+      {
+        "id": "demo-trip",
+        "name": "周末旅行 · 演示",
+        "archived": false,
+        "categories": [
+          {
+            "id": "demo-food",
+            "name": "餐饮",
+            "parentId": null
+          },
+          {
+            "id": "demo-meal",
+            "name": "正餐",
+            "parentId": "demo-food"
+          },
+          {
+            "id": "demo-hotel",
+            "name": "住宿",
+            "parentId": null
+          },
+          {
+            "id": "demo-transit",
+            "name": "交通",
+            "parentId": null
+          }
+        ]
+      }
+    ]
+  }
+}

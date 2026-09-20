@@ -2,6 +2,37 @@
 
 All notable product changes are recorded here.
 
+## [3.2.1] - 2026-09-20
+
+### Added
+
+- Project-specific expense categories and fast consecutive entry.
+- Four complete local analysis workspaces with explicit ranges and rate assumptions.
+- Optional NAS personal/shared/family books, invitations, role enforcement, revisions, transfers and household cash-flow summaries.
+- Safe import review, standalone NAS setup, new logo/icon and bilingual operating guides.
+
+### Fixed
+
+- CSV/binary decoding, cancelled file pickers, duplicate/conflicting spreadsheet rows and stale imports.
+- Transaction time/lineage loss and premature account-balance rounding during NAS edits.
+- Hidden-panel recomputation during pagination and unnecessary NAS summary recalculation.
+- Trusted-LAN NAS entry and identifier generation outside HTTPS secure contexts, behind explicit origin configuration.
+- Updated the bundled SheetJS parser from 0.18.5 to 0.20.3; retained upstream license notices.
+
+- Corrected debt balance direction in NAS entry/edit/delete and spreadsheet imports; preserved legacy reversal semantics.
+- Spreadsheet exports now mark internal transfers and legacy debt deltas; unsupported appends require full JSON instead of losing financial meaning.
+
+### Distribution and scope
+
+- Apple-silicon macOS app, local web archive, NAS source/configuration archive and linux/amd64 image.
+- The macOS app is unsigned; NAS collaboration remains early-stage, with trusted-LAN HTTP available only by explicit opt-in.
+- No personal ledger, bootstrap secret, device-specific configuration or internal diagnostics are included.
+
+### 中文摘要
+
+新增项目分类、四大本地分析、连续记账和NAS家庭协作；修复导入编码、重复记录、保存反馈及历史精度问题。
+更新Logo、同文件中英切换README、操作手册和表格解析库。详见[完整更新说明](docs/releases/v3.2.1.md#中文)。
+
 ## [3.1.1] - 2026-08-11
 
 ### Fixed

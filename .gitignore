@@ -19,3 +19,21 @@ dist/
 
 # Dependency folders
 node_modules/
+
+# NAS state and deployment secrets
+server/data/
+deploy/ugreen/.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Private operational receipts, draft art and machine-specific deployment files
+/docs/qa/
+/output/
+/deploy/ugreen/compose.qiushan-nas.yaml
+/docs/superpowers/specs/2026-09-19-nas-household-design.md
+/docs/superpowers/specs/2026-09-19-project-ledger.md
+
+# Superseded draft branding retained locally
+/assets/asset-tracker-logo.png
+/macos-app/Resources/AssetTracker.icns

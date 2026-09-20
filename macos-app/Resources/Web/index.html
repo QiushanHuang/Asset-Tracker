@@ -4,7 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>智能资产记账 - Asset Tracker</title>
+    <link rel="icon" type="image/png" href="assets/asset-tracker-logo-v3.png">
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="nas.css">
     <script src="vendor/chart.umd.min.js"></script>
     <script src="vendor/xlsx.full.min.js"></script>
 </head>
@@ -30,19 +32,25 @@
 
     <div class="app-container" id="normal-app-shell" hidden inert aria-hidden="true">
         <!-- 侧边栏导航 -->
-        <nav class="sidebar">
+        <nav class="sidebar" aria-label="主导航">
             <div class="logo">
-                <h1>💰 Asset Tracker</h1>
+                <img class="brand-icon" src="assets/asset-tracker-logo-v3.png" alt="" width="56" height="56">
+                <h1>Asset Tracker</h1><p>个人资产账本</p>
             </div>
             <ul class="nav-menu">
-                <li><a href="#dashboard" class="nav-link active" data-section="dashboard">📊 资产概览</a></li>
-                <li><a href="#categories" class="nav-link" data-section="categories">🏷️ 分类管理</a></li>
-                <li><a href="#transactions" class="nav-link" data-section="transactions">💳 账单记录</a></li>
-                <li><a href="#automation" class="nav-link" data-section="automation">⚙️ 自动记账</a></li>
-                <li><a href="#analytics" class="nav-link" data-section="analytics">📈 数据分析</a></li>
-                <li><a href="#settings" class="nav-link" data-section="settings">⚙️ 系统设置</a></li>
-                <li><a href="#import-export" class="nav-link" data-section="import-export">📁 导入导出</a></li>
+                <li class="nav-section-label">我的账本</li>
+                <li><a href="#dashboard" class="nav-link active" aria-current="page" data-section="dashboard">资产概览</a></li>
+                <li><a href="#transactions" class="nav-link" data-section="transactions">账单记录</a></li>
+                <li><a href="#projects" class="nav-link" data-section="projects">项目账本</a></li>
+                <li><a href="#categories" class="nav-link" data-section="categories">资金账户</a></li>
+                <li class="nav-section-label">分析与管理</li>
+                <li><a href="#analytics" class="nav-link" data-section="analytics">数据分析</a></li>
+                <li><a href="#automation" class="nav-link" data-section="automation">自动记账</a></li>
+                <li><a href="#import-export" class="nav-link" data-section="import-export">导入导出</a></li>
+                <li><a href="#nas" class="nav-link" data-section="nas">NAS 与家庭账本</a></li>
+                <li><a href="#settings" class="nav-link" data-section="settings">系统设置</a></li>
             </ul>
+            <div class="sidebar-footer"><span class="local-badge">本地账本</span><p>收支有迹可循，资产心中有数。</p></div>
         </nav>
 
         <!-- 主内容区域 -->
@@ -50,43 +58,49 @@
             <!-- 头部工具栏 -->
             <header class="header">
                 <div class="header-left">
-                    <h2 id="section-title" tabindex="-1">资产概览</h2>
+                    <p class="eyebrow">我的账本</p><h2 id="section-title" tabindex="-1">资产概览</h2>
                 </div>
                 <div class="header-right">
                     <button class="btn btn-primary" id="add-transaction-btn">+ 添加账单</button>
                     <button class="btn btn-secondary" id="backup-btn">备份数据</button>
-                    <div id="storage-path-display" class="storage-path-display">当前数据存储：初始化中...</div>
+
                 </div>
             </header>
 
+            <div id="active-project-status" class="active-project-status" role="status" aria-live="polite"></div>
+            <section id="projects" class="content-section">
+                <div class="card-header"><div><h3>为一件事，记一本明白账</h3><p class="helper-text">项目独立分类 · 最多三级 · 与资金账户分开</p></div><button type="button" class="btn btn-primary" data-project-action="new">新建项目</button></div>
+                <div class="project-workspace"><aside id="project-list" aria-label="项目列表"></aside><div id="project-detail" class="card"></div></div>
+            </section>
             <!-- 资产概览页面 -->
             <section id="dashboard" class="content-section active">
                 <div class="dashboard-grid">
                     <!-- 总资产卡片 -->
                     <div class="card asset-summary">
-                        <h3>资产总览</h3>
+                        <div class="card-header"><h3>资产总览</h3><span class="section-meta">当前余额</span></div>
                         <div class="summary-grid">
-                            <div class="summary-item" onclick="assetTracker.showAssetDetails('total')" style="cursor: pointer;" title="点击查看详情">
-                                <span class="label">总资产</span>
+                            <button type="button" class="summary-item" onclick="assetTracker.showAssetDetails('total')" style="cursor: pointer;" title="点击查看详情">
+                                <span class="label">净资产</span>
                                 <span class="value total-assets">¥0.00</span>
-                            </div>
-                            <div class="summary-item" onclick="assetTracker.showAssetDetails('digital')" style="cursor: pointer;" title="点击查看详情">
-                                <span class="label">数字资产</span>
+                            </button>
+                            <button type="button" class="summary-item" onclick="assetTracker.showAssetDetails('digital')" style="cursor: pointer;" title="点击查看详情">
+                                <span class="label">非现金资产</span>
                                 <span class="value digital-assets">¥0.00</span>
-                            </div>
-                            <div class="summary-item" onclick="assetTracker.showAssetDetails('cash')" style="cursor: pointer;" title="点击查看详情">
+                            </button>
+                            <button type="button" class="summary-item" onclick="assetTracker.showAssetDetails('cash')" style="cursor: pointer;" title="点击查看详情">
                                 <span class="label">现金</span>
                                 <span class="value cash-assets">¥0.00</span>
-                            </div>
-                            <div class="summary-item" onclick="assetTracker.showAssetDetails('balance')" style="cursor: pointer;" title="点击查看详情">
+                            </button>
+                            <button type="button" class="summary-item" onclick="assetTracker.showAssetDetails('balance')" style="cursor: pointer;" title="点击查看详情">
                                 <span class="label">现余额</span>
                                 <span class="value current-balance">¥0.00</span>
-                            </div>
-                            <div class="summary-item" onclick="assetTracker.showAssetDetails('debt')" style="cursor: pointer;" title="点击查看详情">
+                            </button>
+                            <button type="button" class="summary-item" onclick="assetTracker.showAssetDetails('debt')" style="cursor: pointer;" title="点击查看详情">
                                 <span class="label">待还款</span>
                                 <span class="value debt-assets">¥0.00</span>
-                            </div>
+                            </button>
                         </div>
+                        <p id="net-assets-note" class="helper-text">净资产 = 现余额 − 待还款 · 按当前设置汇率折算</p>
                     </div>
 
                     <!-- 资产分布饼图 -->
@@ -94,7 +108,7 @@
                         <div class="chart-header">
                             <h3>资产分布</h3>
                             <div class="chart-controls">
-                                <select id="pie-chart-level">
+                                <select id="pie-chart-level" aria-label="资产分布层级">
                                     <option value="top">顶级分类</option>
                                     <option value="all" selected>所有子分类</option>
                                     <option value="leaf">最底层分类</option>
@@ -102,7 +116,7 @@
                                 <button class="btn btn-sm" onclick="assetTracker.updateAssetPieChart()">刷新</button>
                             </div>
                         </div>
-                        <canvas id="assetPieChart"></canvas>
+                        <div class="chart-plot"><p id="asset-pie-empty" class="chart-empty" hidden>暂无正资产分布<br>记录账单或设置分类余额后显示</p><canvas id="assetPieChart" role="img" aria-label="资产分类分布；金额明细见资产总览与分类管理"></canvas></div>
                     </div>
 
                     <!-- 趋势图 -->
@@ -110,7 +124,7 @@
                         <div class="chart-header">
                             <h3>资产趋势</h3>
                             <div class="chart-controls">
-                                <select id="trend-time-range">
+                                <select id="trend-time-range" aria-label="趋势时间范围">
                                     <option value="7">最近7天</option>
                                     <option value="30" selected>最近30天</option>
                                     <option value="90">最近90天</option>
@@ -118,12 +132,10 @@
                                     <option value="365">最近一年</option>
                                     <option value="all">全部历史</option>
                                 </select>
-                                <button class="btn btn-sm" onclick="assetTracker.zoomOut()">缩小</button>
-                                <button class="btn btn-sm" onclick="assetTracker.zoomIn()">放大</button>
                                 <button class="btn btn-sm" onclick="assetTracker.updateAssetTrendChart()">刷新</button>
                             </div>
                         </div>
-                        <canvas id="assetTrendChart"></canvas>
+                        <div class="chart-plot"><canvas id="assetTrendChart" role="img" aria-label="净资产、余额与债务趋势"></canvas></div><p class="helper-text">按当前余额与已记录账单回推，使用当前汇率。</p>
                     </div>
 
                     <!-- 最近交易 -->
@@ -152,7 +164,7 @@
                 <div class="categories-container">
                     <div class="card">
                         <div class="card-header">
-                            <h3>资产分类管理</h3>
+                            <h3>资金账户</h3><p class="helper-text">这里管理钱存在哪里；餐饮、住宿等消费用途在项目账本中分类。</p>
                             <button class="btn btn-primary" id="add-category-btn">+ 添加分类</button>
                         </div>
                         <div class="categories-tree" id="categories-tree">
@@ -167,26 +179,30 @@
                 <div class="transactions-container">
                     <div class="card">
                         <div class="card-header">
-                            <h3>账单记录</h3>
+                            <div><h3>账单记录</h3><p id="transaction-range" class="helper-text"></p></div>
+                        </div>
+                        <div class="project-filter-bar"><label for="project-filter">项目</label><select id="project-filter"><option value="">全部项目</option></select><select id="project-category-filter" aria-label="筛选项目消费分类" hidden><option value="">全部消费分类</option></select><span class="helper-text">选择项目时查看该项目全部日期</span></div>
+                        <div class="transaction-toolbar">
+                            <input type="search" id="transaction-search" placeholder="搜索描述、分类或金额" aria-label="搜索账单">
                             <div class="filter-controls">
-                                <select id="category-filter">
+                                <select id="category-filter" aria-label="筛选分类">
                                     <option value="">全部分类</option>
                                 </select>
-                                <input type="date" id="date-from">
-                                <input type="date" id="date-to">
-                                <button class="btn btn-secondary" id="filter-btn">筛选</button>
+                                <label>从 <input type="date" id="date-from" aria-label="开始日期"></label>
+                                <label>至 <input type="date" id="date-to" aria-label="结束日期"></label>
+                                <button class="btn btn-secondary" id="filter-btn">筛选</button><button class="btn btn-secondary" id="clear-transaction-filters">清除筛选</button>
                             </div>
                         </div>
-                        <div class="transactions-table">
+                        <div class="transactions-table" tabindex="0" role="region" aria-label="账单列表，可横向滚动">
                             <table id="transactions-table">
                                 <thead>
                                     <tr>
                                         <th>日期</th>
-                                        <th>类别</th>
-                                        <th>子类别</th>
+                                        <th>账户组</th>
+                                        <th>资金账户</th>
                                         <th>金额</th>
                                         <th>类型</th>
-                                        <th>用途</th>
+                                        <th>用途 / 项目分类</th>
                                         <th>描述</th>
                                         <th>操作</th>
                                     </tr>
@@ -196,6 +212,7 @@
                                 </tbody>
                             </table>
                         </div>
+                        <div class="table-footer"><span id="transaction-count" role="status" aria-live="polite"></span><div class="pagination"><button type="button" id="previous-transactions" class="btn btn-secondary">上一页</button><button type="button" id="next-transactions" class="btn btn-secondary">下一页</button></div></div>
                     </div>
                 </div>
             </section>
@@ -217,46 +234,55 @@
 
             <!-- 数据分析页面 -->
             <section id="analytics" class="content-section">
-                <div class="analytics-container">
-                    <div class="analytics-controls">
-                        <div class="card">
-                            <h3>图表配置</h3>
-                            <div class="chart-config">
-                                <select id="chart-type">
-                                    <option value="line">折线图</option>
-                                    <option value="bar">柱状图</option>
-                                    <option value="pie">饼图</option>
-                                    <option value="area">面积图</option>
-                                </select>
-                                <select id="chart-categories" multiple>
-                                    <!-- 分类选项将动态生成 -->
-                                </select>
-                                <select id="time-range">
-                                    <option value="7">最近7天</option>
-                                    <option value="30">最近30天</option>
-                                    <option value="90">最近90天</option>
-                                    <option value="365">最近一年</option>
-                                </select>
-                                <button class="btn btn-primary" id="generate-chart-btn">生成图表</button>
-                                <button class="btn btn-secondary" id="hypothesis-btn">设置假设</button>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="chart-display">
-                        <div class="card">
-                            <h3>自定义图表</h3>
-                            <canvas id="customChart"></canvas>
-                        </div>
-                        <div class="card">
-                            <h3>未来预测</h3>
-                            <canvas id="predictionChart"></canvas>
-                        </div>
-                    </div>
+                <div class="analysis-tabs" id="analytics-tabs" aria-label="分析方式">
+                    <button class="btn active" data-analysis-view="trend" aria-pressed="true">历史与趋势</button>
+                    <button class="btn" data-analysis-view="spending" aria-pressed="false">收支去向</button>
+                    <button class="btn" data-analysis-view="forecast" aria-pressed="false">未来与假设</button>
+                    <button class="btn" data-analysis-view="structure" aria-pressed="false">结构与盘点</button>
                 </div>
+                <div class="card analysis-controls">
+                    <div class="analysis-control-grid">
+                        <label>观察日期<input type="date" id="analytics-asof" required></label>
+                        <label>对比日期<input type="date" id="analytics-compare" required></label>
+                        <label>趋势指标<select id="analytics-metric"><option value="net">净资产</option><option value="asset">资产余额</option><option value="debt">待还款</option></select></label>
+                        <label>趋势范围<select id="time-range"><option value="7">最近7天</option><option value="30" selected>最近30天</option><option value="90">最近90天</option><option value="365">最近一年</option></select></label>
+                        <label>图表类型<select id="chart-type"><option value="line">折线图</option><option value="bar">柱状图</option><option value="area">面积图</option><option value="pie">饼图</option></select></label>
+                        <button class="btn btn-primary" id="generate-chart-btn">生成图表</button>
+                    </div>
+                    <details class="analysis-advanced"><summary>账户范围、历史口径与预测天数</summary><div class="analysis-control-grid">
+                        <label>账户组（不选为全部）<select id="chart-categories" multiple aria-label="分析账户组，可多选"></select></label>
+                        <label>历史计算<select id="analytics-basis"><option value="current">从当前余额回推</option><option value="anchors">优先使用盘点锚点</option></select></label>
+                        <label>估值汇率<select id="analytics-rate-mode"><option value="current">当前设置汇率</option><option value="historical">历史参考汇率（缺失则不折算）</option></select></label>
+                        <label>预测范围<select id="analytics-forecast-days"><option value="14">未来14天</option><option value="30" selected>未来30天</option><option value="60">未来60天</option><option value="90">未来90天</option></select></label>
+                    </div></details>
+                    <div id="analytics-spending-controls" class="analysis-control-grid" hidden>
+                        <label>项目范围<select id="analytics-project"><option value="">全部项目与日常</option></select></label>
+                        <label>支出分组<select id="analytics-group"><option value="purpose">消费分类</option><option value="account">资金账户</option><option value="project">项目</option></select></label>
+                    </div>
+                    <div id="analytics-scenario-controls" class="analysis-control-grid" hidden>
+                        <label>假设方式<select id="analytics-scenario-type"><option value="linear">每天固定增减金额</option><option value="percentage">每日增长率 %</option><option value="fixed">固定目标金额</option><option value="compound">月复合增长率 %（30天）</option></select></label>
+                        <label>假设数值<input type="number" step="any" id="analytics-scenario-value" value="0"></label>
+                        <p class="helper-text">仅做数学情景推演，不更改账本；负数表示减少，增长率须大于 -100%。</p>
+                    </div>
+                    <p id="analytics-error" class="form-error" role="alert"></p>
+                </div>
+                <div class="analysis-meta"><p id="analytics-context" class="helper-text"></p><button class="btn btn-secondary" id="analytics-export">导出分析数据</button></div>
+                <div id="analytics-warnings" class="analysis-notes" role="status"></div>
+                <div id="analytics-output"></div>
+                <details class="card analysis-advanced"><summary>补充历史参考汇率</summary>
+                    <p class="helper-text">手动参考值仅用于历史分析，不修改当前汇率或任何原币账单。相同币种与生效日再次保存会更新该参考值。</p>
+                    <form id="analytics-rate-form" class="analysis-control-grid">
+                        <label>币种<select id="analytics-rate-currency"><option value="CNY">CNY</option><option value="SGD">SGD</option><option value="USD">USD</option><option value="MYR">MYR</option></select></label>
+                        <label>生效日期<input type="date" id="analytics-rate-date" required></label>
+                        <label>1 外币 = 基准币<input type="number" step="any" min="0.00000001" id="analytics-rate-value" required></label>
+                        <button id="analytics-rate-submit" class="btn btn-primary" type="submit">保存参考汇率</button>
+                    </form><p id="analytics-rate-error" class="helper-text" role="status"></p>
+                </details>
             </section>
 
+            <section id="nas" class="content-section"><div data-nas-root></div></section>
             <!-- 系统设置页面 -->
-            <section id="settings" class="content-section">
+            <section id="settings" class="content-section"><div id="storage-path-display" class="storage-path-display">当前数据存储：初始化中...</div>
                 <div class="settings-container">
                     <div class="card">
                         <h3>汇率设置</h3>
@@ -346,34 +372,35 @@
             <section id="import-export" class="content-section">
                 <div class="import-export-container">
                     <div class="card">
-                        <h3>数据导入</h3>
+                        <h3>追加账单</h3><p class="helper-text">Excel / CSV：先预览，检查账户、错误与重复，再确认追加。不会覆盖现有账单。</p>
                         <div class="import-section">
-                            <input type="file" id="import-file" accept=".xlsx,.csv">
-                            <button class="btn btn-primary" id="import-btn">导入数据</button>
+                            <input type="file" id="import-file" accept=".xlsx,.csv" hidden aria-label="选择账单表格">
+                            <button class="btn btn-primary" id="import-btn">选择 Excel / CSV 并预览</button>
                             <input type="file" id="import-book-file" accept=".json" style="display:none">
                             <button class="btn btn-secondary" id="import-book-btn">导入完整账本（替换）</button>
                             <a href="#" id="download-template" class="btn btn-secondary">下载Excel模板</a>
                         </div>
                     </div>
                     <div class="card">
-                        <h3>数据导出</h3>
+                        <h3>导出与备份</h3><p class="helper-text">Excel 用于查看与追加账单；完整 JSON 包含账户、项目、规则与设置，可用于完整恢复。</p>
                         <div class="export-section">
                             <button class="btn btn-primary" id="export-excel-btn">导出Excel</button>
                             <button class="btn btn-secondary" id="export-json-btn">导出完整账本(JSON)</button>
                             <button class="btn btn-secondary" id="reveal-storage-folder-main-btn">打开数据目录</button>
-                            <button class="btn btn-secondary" id="reset-data-btn">恢复默认账本</button>
-                            <button class="btn btn-secondary" id="export-chart-btn">导出图表</button>
+
+
                         </div>
                     </div>
                 </div>
+                <details class="card danger-zone"><summary>恢复与重置</summary><p class="helper-text">恢复默认会清空当前账本。请先导出完整 JSON 备份，再进行重置。</p><button type="button" class="btn btn-danger" id="reset-data-btn">恢复默认账本</button></details>
             </section>
         </main>
     </div>
 
     <!-- 弹窗模态框 -->
-    <div id="modal" class="modal">
+    <div id="modal" class="modal" role="dialog" aria-modal="true" aria-label="编辑账本">
         <div class="modal-content">
-            <span class="close">&times;</span>
+            <button type="button" class="close" aria-label="关闭对话框">&times;</button>
             <div id="modal-body">
                 <!-- 弹窗内容将动态插入 -->
             </div>
@@ -381,7 +408,15 @@
     </div>
 
 
+    <script src="expense-projects.js"></script>
+    <script src="project-ui.js"></script>
+    <script src="ledger-insights.js"></script>
+    <script src="insights-ui.js"></script>
+    <script src="ledger-import.js"></script>
     <script src="legacy-safety.js"></script>
     <script src="script.js"></script>
+    <script src="nas-connection.js"></script>
+    <script src="nas-model.js"></script>
+    <script src="nas-ui.js"></script>
 </body>
 </html>

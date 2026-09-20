@@ -73,6 +73,9 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard
             message.name == "assetTrackerHost",
+            message.frameInfo.isMainFrame,
+            let entryURL = Bundle.main.resourceURL?.appendingPathComponent("Web/index.html"),
+            AssetTrackerPagePolicy.allows(message.frameInfo.request.url, entryURL: entryURL),
             let body = message.body as? [String: Any],
             let requestID = body["id"] as? String,
             let type = body["type"] as? String

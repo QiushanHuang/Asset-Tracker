@@ -1,0 +1,35 @@
+name: CI
+on:
+  push:
+    branches: [main, 'codex/**']
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  web-and-nas:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.11.0
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci --prefix app
+      - run: ./script/sync_web_assets.sh
+      - run: ASSET_TRACKER_VERIFY_STAGED=1 node --test tests/*.test.js
+      - run: node --test tests/nas/*.test.cjs
+      - run: npm --prefix app test
+      - run: npm --prefix app run build
+      - run: python3 script/check-release-docs.py
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: swift build --package-path macos-app --product AssetTrackerFaultHarness
+      - name: Native tests including process fault injection
+        run: |
+          export ASSET_TRACKER_FAULT_HARNESS="$(swift build --package-path macos-app --show-bin-path)/AssetTrackerFaultHarness"
+          swift test --package-path macos-app
+      - run: ASSET_TRACKER_CONFIGURATION=release ./script/build_and_run.sh --stage-only

@@ -1,0 +1,318 @@
+.nas-standalone {
+  margin: 0;
+  background: #f4f6fa;
+  color: #202b40;
+}
+.nas-page {
+  max-width: 1280px;
+  margin: auto;
+  padding: 28px;
+}
+.nas-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.nas-brand img {
+  width: 44px;
+  height: 44px;
+}
+.nas-brand h1 {
+  font-size: 22px;
+}
+.nas-status {
+  min-height: 24px;
+  margin: 8px 0 18px;
+  padding: 10px 14px;
+  background: #eeecfb;
+  border-radius: 8px;
+  overflow-wrap: anywhere;
+}
+.nas-status:empty {
+  display: none;
+}
+.nas-status.negative {
+  background: #fceced;
+}
+.nas-intro {
+  margin: 24px 0;
+  max-width: 640px;
+}
+.nas-intro h3 {
+  font-size: 28px;
+  margin: 8px 0 14px;
+}
+.nas-intro p {
+  color: #627088;
+  line-height: 1.8;
+}
+.nas-auth {
+  max-width: 480px;
+}
+[data-nas-root] form {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+}
+[data-nas-root] label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 13px;
+  color: #526079;
+  min-width: 0;
+}
+[data-nas-root] input,
+[data-nas-root] select {
+  min-height: 42px;
+  width: 100%;
+  min-width: 0;
+  padding: 9px 11px;
+  border: 1px solid #d8deea;
+  border-radius: 8px;
+  background: white;
+  font: inherit;
+}
+[data-nas-root] input[type="checkbox"] {
+  width: 18px;
+  min-height: 18px;
+  height: 18px;
+}
+[data-nas-root] .nas-choice {
+  flex-direction: row;
+  align-items: center;
+}
+.nas-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.nas-top p {
+  overflow-wrap: anywhere;
+}
+.nas-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.nas-workspace {
+  display: grid;
+  grid-template-columns: 230px minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+.nas-ledgers {
+  display: grid;
+  gap: 10px;
+}
+.nas-ledgers > .btn {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: left;
+  padding: 16px;
+}
+.nas-ledgers small {
+  display: block;
+  margin-top: 7px;
+  color: #627088;
+  font-weight: 400;
+}
+.nas-ledgers [aria-pressed="true"] {
+  background: #eeecfb;
+  border-color: #a69add;
+  color: #44359c;
+}
+.nas-ledgers .card {
+  margin-bottom: 0;
+  padding: 16px;
+}
+.nas-detail {
+  min-width: 0;
+}
+.nas-empty {
+  padding: 36px;
+  line-height: 1.9;
+}
+.nas-account-balances {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+.nas-account-balances > div {
+  background: #f6f7fb;
+  padding: 14px;
+  border-radius: 8px;
+  min-width: 0;
+}
+.nas-account-balances span,
+.nas-account-balances strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.nas-account-balances span {
+  color: #627088;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+.nas-account-balances strong {
+  font-size: 20px;
+}
+.nas-form-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.nas-wide {
+  grid-column: 1/-1;
+}
+[data-nas-root] details > summary {
+  cursor: pointer;
+  padding: 8px 0;
+  font-weight: 600;
+}
+[data-nas-root] details {
+  margin-top: 16px;
+}
+.nas-record-list article {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 15px 0;
+  border-bottom: 1px solid #e1e6ef;
+  gap: 14px;
+}
+.nas-record-list article > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.nas-record-list small {
+  display: block;
+  color: #627088;
+  font-size: 12px;
+  font-weight: 400;
+  margin-top: 5px;
+}
+.nas-record-list article > strong {
+  white-space: nowrap;
+  text-align: right;
+}
+.nas-record-list {
+  margin-bottom: 16px;
+}
+.nas-member-list > div,
+.nas-version-list > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #e1e6ef;
+}
+.nas-version-list {
+  max-height: 300px;
+  overflow: auto;
+}
+.nas-invite-code {
+  display: block;
+  word-break: break-all;
+  font-family: monospace;
+  margin: 14px 0;
+  user-select: all;
+}
+.nas-currency {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 16px 0;
+  border-bottom: 1px solid #e1e6ef;
+}
+.nas-household .nas-actions {
+  margin: 18px 0;
+}
+[data-nas-root][aria-busy="true"] button {
+  opacity: 0.6;
+  cursor: wait;
+}
+@media (max-width: 780px) {
+  .nas-page {
+    padding: 16px;
+  }
+  .nas-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .nas-ledgers {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .nas-ledgers > .card {
+    grid-column: 1/-1;
+  }
+  .nas-top {
+    align-items: flex-start;
+  }
+  .nas-intro h3 {
+    font-size: 24px;
+  }
+  [data-nas-root] .btn {
+    min-height: 44px;
+  }
+  .nas-currency {
+    gap: 12px;
+  }
+}
+@media (max-width: 480px) {
+  .nas-form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .nas-account-balances {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .nas-account-balances strong {
+    font-size: 18px;
+  }
+  .nas-top > label {
+    width: 100%;
+  }
+  .nas-record-list article {
+    align-items: flex-start;
+  }
+}
+.nas-row-actions {
+  display: flex;
+  gap: 6px;
+}
+.nas-row-actions .btn {
+  padding: 6px 10px;
+}
+@media (max-width: 480px) {
+  .nas-record-list article {
+    flex-wrap: wrap;
+  }
+  .nas-row-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}
+.nas-status {
+  position: sticky;
+  top: 8px;
+  z-index: 5;
+  box-shadow: 0 2px 8px #202b4008;
+}
+@media (max-width: 780px) {
+  .nas-ledgers > .card {
+    grid-column: auto;
+    margin-top: 0;
+    padding: 12px;
+  }
+  .nas-ledgers > details[open] {
+    grid-column: 1/-1;
+  }
+}
+.nas-jump { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 18px; }
+.nas-jump a { text-decoration:none; }
+#nas-entry,#nas-history,#nas-household { scroll-margin-top:70px; }

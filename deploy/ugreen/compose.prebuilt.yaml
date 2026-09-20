@@ -1,0 +1,30 @@
+services:
+  ledger:
+    image: asset-tracker:3.2.1
+    pull_policy: never
+    restart: unless-stopped
+    ports:
+      - "${ASSET_BIND_ADDRESS:-127.0.0.1}:8789:8789"
+    environment:
+      ASSET_BOOTSTRAP_TOKEN: "${ASSET_BOOTSTRAP_TOKEN:?Set a unique random bootstrap token in .env}"
+      ASSET_ALLOWED_ORIGINS: "${ASSET_ALLOWED_ORIGINS:-}"
+      ASSET_ALLOW_DESKTOP: "${ASSET_ALLOW_DESKTOP:-0}"
+    volumes:
+      - ledger-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    mem_limit: 512m
+    cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+volumes:
+  ledger-data:

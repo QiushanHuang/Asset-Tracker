@@ -1,6 +1,17 @@
 index.html
 styles.css
+assets/asset-tracker-logo-v3.png
+expense-projects.js
+project-ui.js
+ledger-insights.js
+insights-ui.js
+ledger-import.js
 legacy-safety.js
 script.js
 vendor/chart.umd.min.js
 vendor/xlsx.full.min.js
+nas.html
+nas.css
+nas-connection.js
+nas-model.js
+nas-ui.js

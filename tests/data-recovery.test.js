@@ -12,6 +12,7 @@ const { deferred, loadAssetTracker } = require('./helpers/asset-tracker-harness'
 const CRITICAL_RENDER_STEPS = [
     'setupNavigation',
     'setupEventListeners',
+    'initializeTransactionFilters',
     'renderCategories',
     'renderTransactions',
     'updateDashboard',
@@ -21,8 +22,7 @@ const CRITICAL_RENDER_STEPS = [
     'initializeSettings',
     'populateInitAssetCategoryOptions',
     'renderInitialAssetsList',
-    'renderMemo',
-    'initializeTransactionFilters'
+    'renderMemo'
 ];
 
 function validLegacy(overrides = {}) {

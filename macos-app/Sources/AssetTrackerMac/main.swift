@@ -4,10 +4,11 @@ import Foundation
 import WebKit
 
 @MainActor
-final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate {
+final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
     private var window: NSWindow?
     private var webView: WKWebView?
     private var bridge: AssetTrackerHostBridge?
+    private var entryURL: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMainMenu()
@@ -42,6 +43,8 @@ final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate {
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.allowsBackForwardNavigationGestures = false
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.setValue(false, forKey: "drawsBackground")
 
         let window = NSWindow(
@@ -50,7 +53,10 @@ final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window.title = "智能资产记账"
+        let isPreview = CommandLine.arguments.contains("--preview")
+        window.title = isPreview ? "智能资产记账 · 独立预览账本" : "智能资产记账"
+        window.minSize = NSSize(width: 520, height: 480)
+        window.setFrameAutosaveName("AssetTrackerMainWindow")
         window.center()
         window.contentView = webView
         window.makeKeyAndOrderFront(nil)
@@ -61,10 +67,10 @@ final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate {
             for: .applicationSupportDirectory,
             in: .userDomainMask
         )[0]
-        let storageDirectoryURL = applicationSupportURL.appendingPathComponent(
-            "com.qiushan.AssetTracker",
-            isDirectory: true
-        )
+        // Preview launches never open or write the user's real ledger.
+        let storageDirectoryURL = isPreview
+            ? FileManager.default.temporaryDirectory.appendingPathComponent("AssetTrackerPreview-" + UUID().uuidString, isDirectory: true)
+            : applicationSupportURL.appendingPathComponent("com.qiushan.AssetTracker", isDirectory: true)
         let bookStore = AssetTrackerBookStore(storageDirectoryURL: storageDirectoryURL)
         self.bridge = AssetTrackerHostBridge.attach(
             to: userContentController,
@@ -86,7 +92,35 @@ final class AssetTrackerAppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        self.entryURL = indexURL
         webView.loadFileURL(indexURL, allowingReadAccessTo: resourcesRoot)
+    }
+
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let entryURL,
+              navigationAction.targetFrame?.isMainFrame == true,
+              AssetTrackerPagePolicy.allows(navigationAction.request.url, entryURL: entryURL)
+        else { decisionHandler(.cancel); return }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        guard frame.isMainFrame, let entryURL,
+              AssetTrackerPagePolicy.allows(frame.request.url, entryURL: entryURL)
+        else { completionHandler(false); return }
+        let alert = NSAlert()
+        alert.messageText = "确认账本操作"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "确认")
+        alert.addButton(withTitle: "取消")
+        if let window {
+            alert.beginSheetModal(for: window) { response in
+                completionHandler(response == .alertFirstButtonReturn)
+            }
+        } else { completionHandler(false) }
     }
 
     private func presentFatalAlert(message: String) {
