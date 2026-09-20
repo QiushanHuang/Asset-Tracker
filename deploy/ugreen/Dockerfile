@@ -2,7 +2,9 @@ FROM node:24.11.0-bookworm-slim
 WORKDIR /app
 COPY --chown=node:node server ./server
 COPY --chown=node:node script/web-assets.manifest ./script/web-assets.manifest
-COPY --chown=node:node nas.html nas.css nas-connection.js nas-model.js nas-ui.js ledger-import.js legacy-safety.js expense-projects.js styles.css ./
+COPY --chown=node:node nas.html nas.css nas-connection.js nas-model.js nas-ui.js ledger-import.js payment-file.js wechat-import.js alipay-import.js wechat-import-ui.js bank-import.js import-audit-ui.js legacy-safety.js expense-projects.js styles.css ./
+COPY --chown=node:node vendor/xlsx.full.min.js ./vendor/xlsx.full.min.js
+COPY --chown=node:node vendor/pdfjs ./vendor/pdfjs
 COPY --chown=node:node assets/asset-tracker-logo-v3.png ./assets/asset-tracker-logo-v3.png
 RUN mkdir -p /data && chown node:node /data
 USER node

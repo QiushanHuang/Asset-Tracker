@@ -275,6 +275,10 @@ function loadAssetTracker({
     const projectUIContent = fs.readFileSync(path.join(__dirname, '..', '..', 'project-ui.js'), 'utf8');
     const analyticsContent = fs.readFileSync(path.join(__dirname, '..', '..', 'ledger-insights.js'), 'utf8');
     const analyticsUIContent = fs.readFileSync(path.join(__dirname, '..', '..', 'insights-ui.js'), 'utf8');
+    const paymentContent = fs.readFileSync(path.join(__dirname, '..', '..', 'payment-file.js'), 'utf8');
+    const alipayContent = fs.readFileSync(path.join(__dirname, '..', '..', 'alipay-import.js'), 'utf8');
+    const wechatContent = fs.readFileSync(path.join(__dirname, '..', '..', 'wechat-import.js'), 'utf8');
+    const wechatUIContent = fs.readFileSync(path.join(__dirname, '..', '..', 'wechat-import-ui.js'), 'utf8');
     const importContent = fs.readFileSync(path.join(__dirname, '..', '..', 'ledger-import.js'), 'utf8');
     const safetyContent = fs.readFileSync(safetyPath, 'utf8');
     const scriptContent = fs.readFileSync(scriptPath, 'utf8');
@@ -519,7 +523,7 @@ function loadAssetTracker({
             };
         `, context);
     }
-    vm.runInContext(`${projectContent}\n${projectUIContent}\n${analyticsContent}\n${analyticsUIContent}\n${safetyContent}\n${importContent}\n${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
+    vm.runInContext(`${projectContent}\n${projectUIContent}\n${analyticsContent}\n${analyticsUIContent}\n${safetyContent}\n${importContent}\n${paymentContent}\n${wechatContent}\n${alipayContent}\n${wechatUIContent}\n${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
 
     return {
         AssetTracker: context.__AssetTracker,

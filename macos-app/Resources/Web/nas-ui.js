@@ -170,6 +170,84 @@
       };
       await retry();
     }
+    let spreadsheetLoader = null;
+    async function ensureSpreadsheetParser() {
+      if (root.XLSX) return root.XLSX;
+      if (!spreadsheetLoader)
+        spreadsheetLoader = new Promise((resolve, reject) => {
+          const script = document.createElement("script");
+          const timer = setTimeout(() => {
+            script.remove();
+            reject(Error("Excel解析器加载超时，请重试"));
+          }, 15000);
+          script.src = "vendor/xlsx.full.min.js";
+          script.onload = () => {
+            clearTimeout(timer);
+            if (root.XLSX) resolve(root.XLSX);
+            else reject(Error("Excel解析器不可用"));
+          };
+          script.onerror = () => {
+            clearTimeout(timer);
+            script.remove();
+            reject(Error("无法加载Excel解析器，请检查网络后重试"));
+          };
+          document.head.append(script);
+        }).catch((error) => {
+          spreadsheetLoader = null;
+          throw error;
+        });
+      return spreadsheetLoader;
+    }
+    async function importWechatBytes(bytes, type, fileName = "") {
+      if (!current || current.role === "viewer")
+        throw Error("请选择可记账的账本");
+      const id = current.id;
+      let parsed;
+      const pdfHeader =
+        typeof bytes === "string"
+          ? bytes.slice(0, 5)
+          : String.fromCharCode(...new Uint8Array(bytes).slice(0, 5));
+      if (pdfHeader === "%PDF-")
+        parsed = await root.AssetTrackerBankImport.read(bytes, fileName);
+      if (!parsed) {
+        await ensureSpreadsheetParser();
+        const { workbook } = root.AssetTrackerPaymentFile.read(
+          bytes,
+          root.XLSX,
+          {
+            type,
+          },
+        );
+        const grids = workbook.SheetNames.map((name) =>
+          root.XLSX.utils.sheet_to_json(workbook.Sheets[name], {
+            header: 1,
+            raw: true,
+            defval: "",
+            blankrows: true,
+          }),
+        );
+        const provider = [
+          root.AssetTrackerWechatImport,
+          root.AssetTrackerAlipayImport,
+        ].find((parser) => grids.some((grid) => parser.detect(grid)));
+        if (!provider) throw Error("未识别到微信或支付宝原始账单");
+        parsed = provider.readWorkbook(workbook, root.XLSX);
+      }
+      parsed.fileName = fileName;
+      const applied = await root.AssetTrackerWechatUI.open({
+        parsed,
+        getBook: () => {
+          if (current?.id !== id) throw Error("当前账本已变化，请重新选择文件");
+          return current.book;
+        },
+        onCommit: async (candidate) => {
+          await commit(candidate);
+        },
+      });
+      if (!applied && pending)
+        throw Error("账单导入的保存结果未确认，请点击重试未确认操作。");
+      if (!applied) notify("已取消账单导入，账本未修改。");
+    }
     async function importBook(text) {
       const validation = root.AssetTrackerLegacySafety.validateBookText(text);
       if (validation.status !== "valid") throw Error("JSON 未通过完整账本校验");
@@ -275,7 +353,7 @@
         .filter((p) => !p.archived)
         .map((p) => `<option value="${h(p.id)}">${h(p.name)}</option>`)
         .join("");
-      return `<section class="card"><div class="nas-top"><div><p class="eyebrow">${kind[c.kind]} · ${roles[c.role]} · 版本 ${c.revision}</p><h3>${h(c.name)}</h3></div>${button("export", "导出完整 JSON")}</div><div class="nas-account-balances">${accounts.map((a) => `<div><span>${h(a.path.join(" / "))}</span><strong>${money(a.node.balance)} <small>${h(a.node.currency)}</small></strong></div>`).join("")}</div>${editable ? `<details><summary>添加资金账户</summary><form data-nas-form="account" class="nas-form-grid"><label>账户名称<input name="name" required maxlength="120"></label><label>币种<select name="currency">${["CNY", "USD", "SGD", "MYR", "HKD", "EUR", "JPY", "GBP"].map((x) => `<option>${x}</option>`).join("")}</select></label><button class="btn btn-secondary" type="submit">添加账户</button></form></details>` : ""}</section>
+      return `<section class="card"><div class="nas-top"><div><p class="eyebrow">${kind[c.kind]} · ${roles[c.role]} · 版本 ${c.revision}</p><h3>${h(c.name)}</h3></div>${editable ? button("import-wechat", "导入微信 / 支付宝 / 银行") : ""}${button("import-audit", "导入核对记录")}${button("export", "导出完整 JSON")}<input type="file" data-nas-wechat-file accept=".xlsx,.csv,.pdf" hidden aria-label="选择支付平台或银行账单"></div><div class="nas-account-balances">${accounts.map((a) => `<div><span>${h(a.path.join(" / "))}</span><strong>${money(a.node.balance)} <small>${h(a.node.currency)}</small></strong></div>`).join("")}</div>${editable ? `<details><summary>添加资金账户</summary><form data-nas-form="account" class="nas-form-grid"><label>账户名称<input name="name" required maxlength="120"></label><label>币种<select name="currency">${["CNY", "USD", "SGD", "MYR", "HKD", "EUR", "JPY", "GBP"].map((x) => `<option>${x}</option>`).join("")}</select></label><button class="btn btn-secondary" type="submit">添加账户</button></form></details>` : ""}</section>
  ${editable ? `<section id="nas-entry" class="card"><h3>记一笔</h3><form data-nas-form="entry" class="nas-form-grid"><label>收支<select name="direction"><option value="expense">支出</option><option value="income">收入</option></select></label><label>金额<input name="amount" type="number" min="0.01" max="1000000000000" step="0.01" required inputmode="decimal" placeholder="0.00"></label><label>资金账户<select name="accountId" required>${opts}</select></label><label>日期<input name="date" type="date" value="${day}" required></label><label>项目<select name="projectId"><option value="">日常账单</option>${projectOpts}</select></label><label>消费分类<select name="expenseCategoryId"><option value="">未分类</option></select></label><label class="nas-wide">备注<input name="description" maxlength="2000" placeholder="这笔钱用在哪里"></label><button type="submit" class="btn btn-primary nas-wide">保存到 NAS</button>${button("cancel-edit", "取消修改并记新账", "hidden")}</form><details><summary>账户之间转账</summary><p class="helper-text">支持同币种、非负债账户之间转账。两笔账户变动在同一版本保存，不计入家庭收支。</p><form data-nas-form="transfer" class="nas-form-grid"><label>转出<select name="from">${opts}</select></label><label>转入<select name="to">${opts}</select></label><label>金额<input name="amount" type="number" min="0.01" step="0.01" required></label><label>日期<input name="date" type="date" value="${day}" required></label><button type="submit" class="btn btn-primary">确认转账</button></form></details></section>` : '<p class="helper-text">你拥有只读权限，可查看和导出账本。</p>'}
  <section id="nas-history" class="card"><div class="nas-top"><h3>账单记录</h3><label>搜索备注或账户<input type="search" data-nas-search value="${h(search)}" placeholder="搜索当前账本"></label></div><div class="nas-records">${records()}</div></section>
  <details class="card"><summary>成员与共享（${members.length} 人）</summary><div class="nas-member-list">${members.map((m) => `<div><span>${h(m.username)} · ${roles[m.role]}</span>${c.role === "owner" && m.role !== "owner" ? button("remove-member", "移除", `data-id="${h(m.id)}"`) : ""}</div>`).join("")}</div>${c.role === "owner" && c.kind !== "personal" ? `<form data-nas-form="invite" class="nas-form-grid"><label>邀请权限<select name="role"><option value="editor">可记账</option><option value="viewer">只读</option></select></label><button type="submit" class="btn btn-secondary">生成 24 小时邀请</button></form><p class="helper-text">口令只能使用一次。仅把它交给你希望共享这本账的人。</p><output class="nas-invite-code"></output>` : '<p class="helper-text">个人账本不能共享；只有账本拥有者可以邀请或移除成员。</p>'}</details>
@@ -452,6 +530,40 @@
             !revoked,
           );
         }
+        if (a === "import-audit") {
+          const ledgerId = current?.id;
+          root.AssetTrackerImportAuditUI.open({
+            getBook: () => {
+              if (current?.id !== ledgerId) throw Error("账本已变化");
+              return current.book;
+            },
+            onCommit: async next => {try{await commit(next);}catch(e){render();throw e;}},
+            readOnly: current?.role === "viewer",
+          });
+        }
+        if (a === "import-wechat") {
+          if (pending) throw Error("请先重试上一笔未确认操作");
+          if (root.assetTracker) {
+            const result = await root.assetTracker.fileAdapter.openImport({
+              acceptedTypes: ".xlsx,.csv,.pdf",
+              fileInputId: "import-file",
+              readAs: "binary",
+            });
+            if (result) {
+              if (result.text.length > 16 * 1024 * 1024)
+                throw Error("文件不能超过12MB");
+              await importWechatBytes(
+                root.assetTracker.fileAdapter.normalizeImportedContent(
+                  result.text,
+                  result.encoding || "binary",
+                  { output: "binary" },
+                ),
+                "binary",
+                result.fileName || "",
+              );
+            }
+          } else view.querySelector("[data-nas-wechat-file]").click();
+        }
         if (a === "import-json") {
           if (root.assetTracker) {
             const result = await root.assetTracker.fileAdapter.openImport({
@@ -578,6 +690,21 @@
       });
     });
     view.addEventListener("change", (event) => {
+      if (event.target.matches("[data-nas-wechat-file]")) {
+        const file = event.target.files[0];
+        event.target.value = "";
+        if (file)
+          action(async () => {
+            if (file.size > 12 * 1024 * 1024) throw Error("文件不能超过12MB");
+            await importWechatBytes(
+              await file.arrayBuffer(),
+              "array",
+              file.name,
+            );
+          });
+        return;
+      }
+
       if (event.target.matches("[data-nas-import]")) {
         const file = event.target.files[0];
         if (file)

@@ -15,3 +15,14 @@ nas.css
 nas-connection.js
 nas-model.js
 nas-ui.js
+payment-file.js
+wechat-import.js
+alipay-import.js
+wechat-import-ui.js
+bank-import.js
+import-audit-ui.js
+vendor/pdfjs/pdf.mjs
+vendor/pdfjs/pdf.worker.mjs
+vendor/pdfjs/LICENSE
+vendor/pdfjs/pdf.classic.js
+vendor/pdfjs/pdf.worker.classic.js

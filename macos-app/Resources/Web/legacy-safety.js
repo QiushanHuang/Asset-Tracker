@@ -2313,6 +2313,27 @@
         requireFinite(item, 'amount', path, issues);
         requireDate(item, 'date', path, issues);
         validateBooleanIfPresent(item, 'includeTime', path, issues);
+        for (const provider of ['wechat','alipay','icbc','ocbc']) {
+            if (!Object.prototype.hasOwnProperty.call(item, provider)) continue;
+            const source = item[provider];
+            const fields = ['transactionId','merchantId','transactionType','counterparty','product','direction','paymentMethod','status','note','timezone','signature'];
+            let valid = isRecord(source) && source.version === 1 && ['history','apply'].includes(source.balanceMode)
+                && fields.every(key => typeof source[key] === 'string' && source[key].length <= 1000)
+                && /^[A-Za-z0-9_-]{1,120}$/.test(source.transactionId)
+                && item.id === provider + ':' + source.transactionId
+                && ['收入','支出'].includes(source.direction) && source.timezone === (provider === 'wechat' ? 'UTC+08:00' : 'source-local')
+                && (source.originalDirection === undefined || typeof source.originalDirection === 'string' && source.originalDirection.length <= 40)
+                && (source.counterpartyAccount === undefined || typeof source.counterpartyAccount === 'string' && source.counterpartyAccount.length <= 1000);
+            if (valid) {
+                try {
+                    const signature = JSON.parse(source.signature);
+                    valid = Array.isArray(signature) && signature.length === 3 && typeof signature[0] === 'string'
+                        && ['收入','支出'].includes(signature[1]) && Number.isSafeInteger(signature[2]) && signature[2] >= 0;
+                } catch (_) { valid = false; }
+            }
+            if (!valid) issue(issues, path + '.' + provider, 'invalid-payment-source', 'Payment import provenance is invalid');
+        }
+
     }
 
     function validateAutomationRule(item, path, issues) {
@@ -2381,6 +2402,26 @@
         if (payload.expenseProjects !== undefined || (Array.isArray(payload.transactions) && payload.transactions.some(item => item && (Object.prototype.hasOwnProperty.call(item, 'projectId') || Object.prototype.hasOwnProperty.call(item, 'expenseCategoryId'))))) {
             const errors = ProjectModel ? ProjectModel.validate(payload) : ['Project module unavailable'];
             for (const message of errors) issue(issues, '$.expenseProjects', 'invalid-project', message);
+        }
+        if (payload.importAudits !== undefined) {
+            if (!Array.isArray(payload.importAudits)) issue(issues,'$.importAudits','invalid-audit','Expected audit array');
+            else payload.importAudits.forEach((a,ai)=>{
+                const path='$.importAudits['+ai+']';
+                if(!isRecord(a)||a.version!==1||typeof a.id!=='string'||!['wechat','alipay','icbc','ocbc'].includes(a.provider)||!['pending','completed'].includes(a.status)||typeof a.adjustBalances!=='boolean'||typeof a.fileName!=='string'||!Array.isArray(a.items)){issue(issues,path,'invalid-audit','Invalid import audit');return;}
+                requireDate(a,'createdAt',path,issues);
+                a.items.forEach((entry,index)=>{
+                    const p=path+'.items['+index+']';
+                    if(!isRecord(entry)||!Number.isInteger(entry.row)||typeof entry.sourceId!=='string'||typeof entry.reason!=='string'||!Array.isArray(entry.matches)||!['pending','imported','excluded','duplicate','skipped'].includes(entry.decision)){issue(issues,p,'invalid-audit-item','Invalid audit decision');return;}
+                    const validEvidence = m => isRecord(m) && typeof m.id==='string' && m.id.length>0 && m.id.length<=160
+                        && (m.amount===undefined || Number.isFinite(m.amount))
+                        && ['date','currency','description','accountId'].every(k=>m[k]===undefined || typeof m[k]==='string' && m[k].length<=2000);
+                    if(!entry.matches.every(validEvidence) || entry.record!==undefined && !validEvidence(entry.record))issue(issues,p,'invalid-audit-evidence','Invalid matching evidence');
+                    if(entry.decision!=='pending')requireDate(entry,'decidedAt',p,issues);
+                    if(entry.decision==='pending'&&!entry.candidate)issue(issues,p,'invalid-audit-item','Missing candidate');
+                    if(entry.candidate){const c=entry.candidate;validateTransaction({...c,[a.provider]:{...c[a.provider],balanceMode:a.adjustBalances?'apply':'history'}},p+'.candidate',issues);}
+                });
+                if(a.status!==(a.items.some(e=>e?.decision==='pending')?'pending':'completed'))issue(issues,path,'invalid-audit-status','Audit status mismatch');
+            });
         }
         if (Object.prototype.hasOwnProperty.call(payload, 'categories')) {
             validateCategoryMap(payload.categories, '$.categories', issues);

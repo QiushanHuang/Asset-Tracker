@@ -2,6 +2,27 @@
 
 All notable product changes are recorded here.
 
+## [3.3.0] - 2026-09-20
+
+### Added
+
+- Original WeChat XLSX and Alipay CSV import, including GB18030 text and long text transaction identifiers.
+- Local PDF text extraction for supported ICBC and OCBC FRANK layouts, with page totals, running balances and original-currency checks.
+- Persistent import review batches, matching evidence and per-record decisions, included in full JSON backups and NAS snapshots.
+- Resume unresolved reviews after reloading; explicit duplicate-only audit saves.
+
+### Fixed
+
+- Historical imports and later edits/deletions preserve current balances in local and NAS ledgers.
+- Native WKWebView PDF loading uses local classic bundles without weakening CORS settings.
+- Unknown NAS save results during review expose the existing idempotent retry flow.
+
+### Limits
+
+- Similar date and amount indicate a candidate, not proof of duplication. Transfers, refunds, combined payments and reversals require review.
+- Account mapping must follow the actual funding account, not just the payment platform name.
+- Supported text PDFs only; no OCR. macOS Apple silicon package is not Apple-notarized.
+
 ## [3.2.1] - 2026-09-20
 
 ### Added

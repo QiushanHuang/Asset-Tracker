@@ -7,6 +7,7 @@ Third-party libraries retain their own licenses and copyright notices.
 | --- | --- | --- | --- |
 | [Chart.js](https://github.com/chartjs/Chart.js) | 4.5.1 | [MIT](vendor/CHARTJS-LICENSE.txt) | Local asset and analysis charts |
 | [SheetJS Community Edition](https://docs.sheetjs.com/) | 0.20.3 | [Apache-2.0](vendor/SHEETJS-LICENSE.txt) | Local Excel/CSV parsing and spreadsheet export |
+| [PDF.js](https://github.com/mozilla/pdf.js) | 6.3.289 | [Apache-2.0](vendor/pdfjs/LICENSE) | Local PDF text extraction; desktop classic bundles generated with esbuild |
 | [Node.js](https://nodejs.org/) | 24.11.0 in the Dockerfile | Node.js distribution licenses | NAS server runtime; distributed by the upstream base image |
 
 SheetJS was retrieved from the official versioned distribution:

@@ -9,7 +9,7 @@
 ### macOS
 
 1. Download the Apple-silicon macOS archive and `SHA256SUMS.txt` from the same release.
-2. In the download directory, compare `shasum -a 256 AssetTracker-v3.2.1-macos-arm64.zip` with its checksum entry.
+2. In the download directory, compare `shasum -a 256 AssetTracker-v3.3.0-macos-arm64.zip` with its checksum entry.
 3. Unzip and move `AssetTracker.app` to Applications if desired. The application is unsigned and not notarized; macOS may require your explicit approval in Privacy & Security.
 4. Open the application. A new installation starts with an empty book and default funding categories; it contains no author's ledger.
 
@@ -249,3 +249,13 @@ NAS单账本上限50,000笔和8MB序列化内容，采用整本版本保存。�
 ### 旧负债记录与表格限制
 
 新支出增加负债，正向入账减少负债。撤销没有稳定账户ID的旧记录时，保留原余额变动记法；旧负债记录在核对迁移前禁止修改，避免静默改变含义。Excel明确标记内部转账及旧负债余额记录，导入时要求改用完整JSON。如果曾用NAS预览版记录负债，请核对实际余额；本版不自动改写既有账本。
+
+## Original statement imports / 原始账单导入
+
+Use **导入微信 / 支付宝 / 银行** for WeChat XLSX, Alipay CSV, supported ICBC PDF or OCBC FRANK PDF. Map each payment method to a leaf funding account with the matching currency. Do not map a bank-funded purchase to a wallet just because it appears in a wallet export.
+
+History-only mode preserves current balances. Save unresolved candidates, then reopen **导入核对记录** to review matching evidence and choose inclusion or exclusion. A date/amount match is not sufficient proof of a duplicate. Transfers, reversals and refunds require attention to both sides of the movement. Keep full JSON backups to preserve provenance and review history.
+
+通过“导入微信 / 支付宝 / 银行”选择原始账单。每种支付方式应对应实际资金账户及币种；通过微信使用银行卡支付，不应仅因来源是微信就归入微信零钱。默认只补历史，不改当前余额。
+
+未选中的需复核项会保存为待核对；之后在“导入核对记录”查看来源和匹配依据，逐笔保留或排除。没有匹配记录、只是摘要出现“转账/支付宝”等字样，也可能触发保守提示，并不代表原账单有错。不要把待核对项一律保留或一律排除。完整 JSON 备份包含全部核对历史。

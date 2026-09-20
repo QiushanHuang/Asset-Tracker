@@ -121,6 +121,7 @@
     );
     const list = I.accounts(b);
     for (const t of removed) {
+      if ((t.wechat || t.alipay || t.icbc || t.ocbc)?.balanceMode === "history") continue;
       const candidates = list.filter((a) =>
         t.accountId
           ? a.node.id === t.accountId
@@ -155,6 +156,10 @@
     if (prior.date.includes("T") && form.date.length === 10)
       nextForm.date += prior.date.slice(10);
     const b = entry(remove(book, transactionId), nextForm);
+    if ((prior.wechat || prior.alipay || prior.icbc || prior.ocbc)?.balanceMode === "history") {
+      const destination = b.transactions[b.transactions.length - 1].accountId;
+      I.accounts(b).find((a) => a.node.id === destination).node.balance = I.accounts(book).find((a) => a.node.id === destination).node.balance;
+    }
     b.transactions[b.transactions.length - 1] = {
       ...prior,
       ...b.transactions[b.transactions.length - 1],

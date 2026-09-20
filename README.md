@@ -55,14 +55,14 @@ personal records and shared household spending in separate books.
 
 ## Install
 
-Download **v3.2.1** from [Releases](https://github.com/QiushanHuang/Asset-Tracker/releases/latest).
+Download **v3.3.0** from [Releases](https://github.com/QiushanHuang/Asset-Tracker/releases/latest).
 
 | Download | Use it for |
 | --- | --- |
-| `AssetTracker-v3.2.1-macos-arm64.zip` | macOS 14 or newer on Apple silicon |
-| `AssetTracker-v3.2.1-web.zip` | The complete local web interface, including bundled chart and spreadsheet libraries |
-| `AssetTracker-v3.2.1-nas.zip` | NAS application sources, Docker configuration and deployment instructions |
-| `AssetTracker-v3.2.1-nas-linux-amd64.tar.gz` | Prebuilt image for an x86-64 NAS; useful when the NAS cannot pull build images |
+| `AssetTracker-v3.3.0-macos-arm64.zip` | macOS 14 or newer on Apple silicon |
+| `AssetTracker-v3.3.0-web.zip` | The complete local web interface, including bundled chart and spreadsheet libraries |
+| `AssetTracker-v3.3.0-nas.zip` | NAS application sources, Docker configuration and deployment instructions |
+| `AssetTracker-v3.3.0-nas-linux-amd64.tar.gz` | Prebuilt image for an x86-64 NAS; useful when the NAS cannot pull build images |
 | `SHA256SUMS.txt` | SHA-256 checksums for these downloads |
 
 The app interface is in Simplified Chinese. Choose English or Chinese in this README and the operating guides.
@@ -202,14 +202,14 @@ latest book and try again. If a connection drops during saving, retry without
 creating a duplicate record. Restoring an earlier version keeps current member
 permissions and adds the restored content to the version history.
 
-## What's new in v3.2.1
+## What's new in v3.3.0
 
-Project bookkeeping, four complete local analysis workspaces, safer import
-review, responsive layouts, durable interaction feedback, optional family books
-on a NAS, and a new ledger-inspired identity. This release also updates the
-bundled spreadsheet parser from SheetJS 0.18.5 to 0.20.3.
+Import original WeChat/Alipay exports and supported ICBC/OCBC PDF statements.
+Keep original currencies, review suspected duplicates, and return to saved
+review decisions later. Historical imports preserve current account balances.
+PDF files are parsed on your device; scanned or inconsistent statements are rejected.
 
-See [release notes](docs/releases/v3.2.1.md#english), the [changelog](CHANGELOG.md)
+See [release notes](docs/releases/v3.3.0.md#english), the [changelog](CHANGELOG.md)
 and the [user guide](docs/user-guide.md#english) for upgrade steps and feature details.
 
 ## Develop and contribute
@@ -276,14 +276,14 @@ See [contributors](CONTRIBUTORS.md). Licensed under the [MIT License](LICENSE).
 
 ### 下载安装
 
-从 [Releases](https://github.com/QiushanHuang/Asset-Tracker/releases/latest) 下载 **v3.2.1**：
+从 [Releases](https://github.com/QiushanHuang/Asset-Tracker/releases/latest) 下载 **v3.3.0**：
 
 | 文件 | 用途 |
 | --- | --- |
-| `AssetTracker-v3.2.1-macos-arm64.zip` | macOS 14 及以上、Apple 芯片 Mac |
-| `AssetTracker-v3.2.1-web.zip` | 完整本地网页界面，图表和表格库已随包提供 |
-| `AssetTracker-v3.2.1-nas.zip` | NAS 程序源码、Docker 配置与操作说明 |
-| `AssetTracker-v3.2.1-nas-linux-amd64.tar.gz` | x86-64 NAS 的预构建镜像，可免去 NAS 上的在线构建 |
+| `AssetTracker-v3.3.0-macos-arm64.zip` | macOS 14 及以上、Apple 芯片 Mac |
+| `AssetTracker-v3.3.0-web.zip` | 完整本地网页界面，图表和表格库已随包提供 |
+| `AssetTracker-v3.3.0-nas.zip` | NAS 程序源码、Docker 配置与操作说明 |
+| `AssetTracker-v3.3.0-nas-linux-amd64.tar.gz` | x86-64 NAS 的预构建镜像，可免去 NAS 上的在线构建 |
 | `SHA256SUMS.txt` | 下载文件的 SHA-256 校验值 |
 
 macOS 安装包**未签名、未公证**。核对校验值并解压后，如系统提示，请在“隐私与安全性”中允许打开。
@@ -365,12 +365,13 @@ macOS 会在账本保存完成后给出确认。账本无法打开时，可以�
 NAS 上遇到修改冲突时会保留草稿，你可以查看最新账本后再提交；保存中断、结果不明确时，也可以重试，避免重复记账。
 恢复旧版本后，成员权限保持不变，恢复的内容会作为新版本保存在历史记录中。
 
-### v3.2.1 更新
+### v3.3.0 更新
 
-新增项目记账、完整本地分析、导入预览、自适应布局和保存反馈，以及可选的 NAS 家庭账本与新版 Logo。
-同时将内置 SheetJS 表格解析库从 0.18.5 更新至官方 0.20.3。
+新增微信 XLSX、支付宝 CSV、工行与 OCBC 文字版 PDF 账单导入，保留原币金额。
+重复判断依据与待核对记录可以保存后继续处理；历史导入默认不改当前账户余额。
+PDF 在本机解析；扫描件、未知版式或合计校验失败的文件会明确报错。
 
-详见[本版更新说明](docs/releases/v3.2.1.md#中文)、[更新日志](CHANGELOG.md)和[完整操作手册](docs/user-guide.md#中文)。
+详见[本版更新说明](docs/releases/v3.3.0.md#中文)、[更新日志](CHANGELOG.md)和[完整操作手册](docs/user-guide.md#中文)。
 开发与检查命令见本页[英文开发部分](#develop-and-contribute)。
 
 ### 贡献者与许可

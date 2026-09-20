@@ -13,7 +13,7 @@ access to each shared or family book.
 | Configuration | Purpose |
 | --- | --- |
 | `compose.yaml` | Build from source; bind to loopback, normally behind an existing HTTPS reverse proxy |
-| `compose.prebuilt.yaml` | Use the imported `asset-tracker:3.2.1` image; same loopback default |
+| `compose.prebuilt.yaml` | Use the imported `asset-tracker:3.3.0` image; same loopback default |
 | `compose.nas-lan.yaml` | Explicit trusted-LAN opt-in, bound to the private IPv4 address in `NAS_IP` |
 
 The LAN mode is **HTTP, not encrypted**. Only use it on a trusted network; do not
@@ -35,7 +35,7 @@ result before creating your everyday book.
    private. For LAN mode, set `NAS_IP` to this NAS's actual private IPv4 address;
    `NAS_PORT` defaults to `8789`. Do not enter a public IP or `0.0.0.0`.
 4. For the prebuilt image, use **Docker → Images → Local images → Add image →
-   Import from NAS** to import `AssetTracker-v3.2.1-nas-linux-amd64.tar.gz`.
+   Import from NAS** to import `AssetTracker-v3.3.0-nas-linux-amd64.tar.gz`.
 5. In **Docker → Project → Create**, name the project `asset-tracker`, select
    the dedicated directory, and paste/import the chosen Compose file. Keep the
    adjacent `.env` file. For trusted-LAN access use `compose.nas-lan.yaml`.
@@ -64,7 +64,7 @@ From the extracted NAS package directory:
 ```sh
 cp .env.example .env
 # Edit .env: unique bootstrap token and, for trusted LAN, your NAS_IP.
-docker load -i /path/to/AssetTracker-v3.2.1-nas-linux-amd64.tar.gz
+docker load -i /path/to/AssetTracker-v3.3.0-nas-linux-amd64.tar.gz
 docker compose -p asset-tracker -f compose.nas-lan.yaml config --quiet
 docker compose -p asset-tracker -f compose.nas-lan.yaml up -d
 ```
@@ -167,7 +167,7 @@ notes before changing it.
 | 文件 | 用途 |
 | --- | --- |
 | `compose.yaml` | 源码构建，默认只监听回环地址，通常接已有 HTTPS 反向代理 |
-| `compose.prebuilt.yaml` | 使用已导入的 `asset-tracker:3.2.1` 镜像，仍默认回环监听 |
+| `compose.prebuilt.yaml` | 使用已导入的 `asset-tracker:3.3.0` 镜像，仍默认回环监听 |
 | `compose.nas-lan.yaml` | 明确选择可信局域网，绑定 `NAS_IP` 指定的私有 IPv4 地址 |
 
 局域网模式使用 **HTTP，传输不加密**，只能在可信内网使用，不能直接映射到公网。程序不会自动创建域名、公网隧道或 Tailscale。
@@ -179,7 +179,7 @@ notes before changing it.
 1. 下载同一版本的 NAS ZIP、镜像归档和校验文件，先核对 SHA-256。
 2. 把 ZIP 解压到新的专用目录，例如 Docker 共享目录下的 `asset-tracker`，不要复用其他应用目录。
 3. 将 `.env.example` 复制为 `.env`。用 `openssl rand -hex 32` 生成自己的随机口令，填入 `ASSET_BOOTSTRAP_TOKEN`，保密保存。内网模式再填写实际私有地址 `NAS_IP`，`NAS_PORT` 默认8789；不能填写公网IP或 `0.0.0.0`。
-4. 在“Docker → 镜像 → 本地镜像 → 添加镜像 → 从NAS导入”中导入 `AssetTracker-v3.2.1-nas-linux-amd64.tar.gz`。
+4. 在“Docker → 镜像 → 本地镜像 → 添加镜像 → 从NAS导入”中导入 `AssetTracker-v3.3.0-nas-linux-amd64.tar.gz`。
 5. “Docker → 项目 → 创建”，项目名设为 `asset-tracker`，选择专用目录，导入所选 Compose。使用可信局域网时选 `compose.nas-lan.yaml`，`.env` 放在相邻位置。
 6. 使用已导入镜像部署，不勾选拉取替代镜像。既要看容器 running/healthy，也要实际打开页面。
 7. 在容器菜单创建“**家庭记账**”桌面快捷方式，端口填所配置的主机端口。PC客户端可能会调用系统浏览器打开。
@@ -194,7 +194,7 @@ notes before changing it.
 ```sh
 cp .env.example .env
 # 编辑 .env，填写自己的初始化口令及内网NAS_IP。
-docker load -i /path/to/AssetTracker-v3.2.1-nas-linux-amd64.tar.gz
+docker load -i /path/to/AssetTracker-v3.3.0-nas-linux-amd64.tar.gz
 docker compose -p asset-tracker -f compose.nas-lan.yaml config --quiet
 docker compose -p asset-tracker -f compose.nas-lan.yaml up -d
 ```

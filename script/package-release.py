@@ -5,19 +5,19 @@ import argparse, hashlib, plistlib, subprocess, zipfile
 
 root = Path(__file__).resolve().parents[1]
 p = argparse.ArgumentParser()
-p.add_argument('--version', default='3.2.1')
+p.add_argument('--version', default='3.3.0')
 p.add_argument('--app', type=Path)
 p.add_argument('--image', type=Path)
 args = p.parse_args()
-if args.version != '3.2.1':
+if args.version != '3.3.0':
     raise SystemExit('Update the versioned public guides before packaging another version.')
 out = root / 'dist' / 'release'
 out.mkdir(parents=True, exist_ok=True)
 prefix = 'AssetTracker-v' + args.version
 assets = (root / 'script/web-assets.manifest').read_text().splitlines()
 public_docs = ['README.md','LICENSE','CONTRIBUTORS.md','CONTRIBUTING.md','SECURITY.md',
- 'THIRD_PARTY_NOTICES.md','docs/user-guide.md','docs/branding.md','docs/releases/v3.2.1.md',
- 'docs/validation/v3.2.1.md','deploy/ugreen/README.md', 'docs/examples/demo-book.json',
+ 'THIRD_PARTY_NOTICES.md','docs/user-guide.md','docs/branding.md','docs/releases/v3.3.0.md',
+ 'docs/validation/v3.3.0.md','deploy/ugreen/README.md', 'docs/examples/demo-book.json',
  'vendor/SHEETJS-LICENSE.txt','vendor/CHARTJS-LICENSE.txt']
 public_docs += [str(p.relative_to(root)) for p in sorted((root/'docs/images').glob('*.png'))]
 
@@ -34,7 +34,11 @@ with zipfile.ZipFile(out/(prefix+'-web.zip'),'w',zipfile.ZIP_DEFLATED) as z:
 nas = ['server/server.cjs','server/backup.cjs','script/web-assets.manifest',
  'nas.html','nas.css','nas-connection.js','nas-model.js','nas-ui.js','ledger-import.js',
  'legacy-safety.js','expense-projects.js','styles.css','assets/asset-tracker-logo-v3.png',
- 'LICENSE']
+ 'LICENSE','payment-file.js','wechat-import.js','alipay-import.js','bank-import.js',
+ 'wechat-import-ui.js','import-audit-ui.js','vendor/xlsx.full.min.js',
+ 'vendor/pdfjs/pdf.mjs','vendor/pdfjs/pdf.worker.mjs','vendor/pdfjs/pdf.classic.js',
+ 'vendor/pdfjs/pdf.worker.classic.js','vendor/pdfjs/LICENSE','vendor/SHEETJS-LICENSE.txt',
+ 'vendor/CHARTJS-LICENSE.txt','THIRD_PARTY_NOTICES.md']
 with zipfile.ZipFile(out/(prefix+'-nas.zip'),'w',zipfile.ZIP_DEFLATED) as z:
     for source in nas:
         put(z, source, 'AssetTracker-nas/'+source)
@@ -43,7 +47,7 @@ with zipfile.ZipFile(out/(prefix+'-nas.zip'),'w',zipfile.ZIP_DEFLATED) as z:
         if name=='compose.yaml':
             content=content.replace('context: ../..','context: .').replace('dockerfile: deploy/ugreen/Dockerfile','dockerfile: Dockerfile')
         z.writestr('AssetTracker-nas/'+name,content)
-    guide=(root/'deploy/ugreen/README.md').read_text().replace('../../README.md','https://github.com/QiushanHuang/Asset-Tracker/blob/v3.2.1/README.md')
+    guide=(root/'deploy/ugreen/README.md').read_text().replace('../../README.md','https://github.com/QiushanHuang/Asset-Tracker/blob/v3.3.0/README.md')
     z.writestr('AssetTracker-nas/README.md',guide)
 
 if args.app:

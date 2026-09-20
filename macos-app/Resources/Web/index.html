@@ -372,17 +372,19 @@
             <section id="import-export" class="content-section">
                 <div class="import-export-container">
                     <div class="card">
-                        <h3>追加账单</h3><p class="helper-text">Excel / CSV：先预览，检查账户、错误与重复，再确认追加。不会覆盖现有账单。</p>
+                        <h3>追加账单</h3><p class="helper-text">微信 / 支付宝 / 工行 PDF / OCBC PDF：先预览，检查账户、错误与重复，再确认追加。不会覆盖现有账单。</p>
                         <div class="import-section">
-                            <input type="file" id="import-file" accept=".xlsx,.csv" hidden aria-label="选择账单表格">
-                            <button class="btn btn-primary" id="import-btn">选择 Excel / CSV 并预览</button>
+                            <input type="file" id="import-file" accept=".xlsx,.csv,.pdf" hidden aria-label="选择账单表格或银行 PDF">
+                            <button class="btn btn-primary" id="import-wechat-btn">导入微信 / 支付宝 / 银行</button>
+                            <button class="btn btn-secondary" id="import-audit-btn">导入核对记录</button>
+                            <button class="btn btn-secondary" id="import-btn">选择 Excel / CSV 并预览</button>
                             <input type="file" id="import-book-file" accept=".json" style="display:none">
                             <button class="btn btn-secondary" id="import-book-btn">导入完整账本（替换）</button>
                             <a href="#" id="download-template" class="btn btn-secondary">下载Excel模板</a>
                         </div>
                     </div>
                     <div class="card">
-                        <h3>导出与备份</h3><p class="helper-text">Excel 用于查看与追加账单；完整 JSON 包含账户、项目、规则与设置，可用于完整恢复。</p>
+                        <h3>导出与备份</h3><p class="helper-text">Excel 用于查看与追加账单；完整 JSON 包含账户、项目、导入核对记录、规则与设置，可用于完整恢复。</p>
                         <div class="export-section">
                             <button class="btn btn-primary" id="export-excel-btn">导出Excel</button>
                             <button class="btn btn-secondary" id="export-json-btn">导出完整账本(JSON)</button>
@@ -413,7 +415,13 @@
     <script src="ledger-insights.js"></script>
     <script src="insights-ui.js"></script>
     <script src="ledger-import.js"></script>
+    <script src="payment-file.js"></script>
+    <script src="wechat-import.js"></script>
+    <script src="alipay-import.js"></script>
+    <script src="wechat-import-ui.js"></script>
     <script src="legacy-safety.js"></script>
+    <script src="bank-import.js"></script>
+    <script src="import-audit-ui.js"></script>
     <script src="script.js"></script>
     <script src="nas-connection.js"></script>
     <script src="nas-model.js"></script>

@@ -37,3 +37,6 @@ deploy/ugreen/.env
 # Superseded draft branding retained locally
 /assets/asset-tracker-logo.png
 /macos-app/Resources/AssetTracker.icns
+
+# Also ignore dependency links used by isolated worktrees
+**/node_modules

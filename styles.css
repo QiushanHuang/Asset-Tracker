@@ -1816,3 +1816,39 @@ button, a, input, select, textarea { -webkit-tap-highlight-color: transparent; }
  .btn,input,select { min-height:44px; }
  .import-export-container { grid-template-columns:minmax(0,1fr); }
 }
+
+/* One import review shared by local and NAS ledgers. */
+.wechat-dialog { width:min(760px,calc(100vw - 24px)); max-height:calc(100dvh - 32px); overflow:auto; margin:auto; padding:24px; border:1px solid var(--line); border-radius:14px; color:var(--ink); background:white; box-shadow:0 20px 70px #202b4033; }
+.wechat-dialog::backdrop { background:#202b4066; }
+.wechat-title { display:flex; align-items:center; justify-content:space-between; gap:14px; }
+.wechat-title h3 { font-size:21px; }
+.wechat-dialog h4 { margin:20px 0 6px; }
+.wechat-mappings { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin:14px 0; }
+.wechat-mappings label,.wechat-mode { display:grid; gap:7px; font-size:13px; min-width:0; }
+.wechat-mappings select,.wechat-mode select { width:100%; min-width:0; min-height:42px; }
+.wechat-counts { display:flex; gap:10px 18px; flex-wrap:wrap; margin:18px 0 10px; color:var(--muted); }
+.wechat-counts strong { color:var(--ink); font-size:18px; }
+.wechat-records { max-height:260px; overflow:auto; padding:12px; border:1px solid var(--line); border-radius:8px; }
+.wechat-records p { line-height:1.7; margin:6px 0; overflow-wrap:anywhere; }
+.wechat-records article { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px 12px; padding:10px 0; border-bottom:1px solid var(--line); font-size:12px; }
+.wechat-records article small { grid-column:1/-1; overflow-wrap:anywhere; color:var(--muted); }
+.wechat-review-choice { display:flex; gap:8px; margin:14px 0; align-items:flex-start; }
+.wechat-feedback { margin:14px 0; line-height:1.6; color:#a12033; overflow-wrap:anywhere; }
+.wechat-actions { display:flex; gap:10px; justify-content:flex-end; position:sticky; bottom:-24px; background:white; padding:14px 0; }
+@media(max-width:520px){.wechat-dialog{padding:18px}.wechat-mappings{grid-template-columns:minmax(0,1fr)}.wechat-actions{bottom:-18px;flex-wrap:wrap}.wechat-dialog .btn{min-height:44px}}
+.wechat-review-rows { max-height:240px; overflow:auto; padding:10px; border:1px solid var(--line); border-radius:8px; }
+.wechat-review-rows label { display:flex; align-items:flex-start; gap:8px; padding:10px 0; font-size:12px; }
+.wechat-review-rows input { flex:0 0 16px; margin-top:3px; }
+.wechat-review-rows span { min-width:0; overflow-wrap:anywhere; }
+.wechat-review-rows small { display:block; margin-top:5px; color:var(--muted); line-height:1.6; }
+.wechat-review-pages { display:flex; gap:12px; align-items:center; justify-content:flex-end; margin-top:10px; }
+
+.import-audit-dialog > label { display:block; min-width:0; margin:12px 0; }
+.import-audit-dialog select { display:block; width:100%; max-width:100%; min-width:0; margin-top:6px; }
+.import-audit-dialog .audit-filter { display:flex; gap:8px; align-items:center; }
+.import-audit-dialog input[type=checkbox] { min-height:0; width:16px; height:16px; }
+.import-audit-dialog .wechat-review-rows { max-height:min(55dvh,500px); }
+.import-audit-dialog article { padding:12px 0; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
+.import-audit-dialog article:first-child { padding-top:0; }
+.import-audit-dialog article p { margin:8px 0; line-height:1.6; }
+.import-audit-dialog article .btn { margin:4px 0; white-space:normal; }

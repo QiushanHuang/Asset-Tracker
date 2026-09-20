@@ -1,6 +1,6 @@
 services:
   ledger:
-    image: asset-tracker:3.2.1
+    image: asset-tracker:3.3.0
     pull_policy: never
     restart: unless-stopped
     ports:

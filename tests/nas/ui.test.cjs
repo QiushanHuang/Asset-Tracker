@@ -71,11 +71,24 @@ async function ui(t, options = {}) {
     Object.defineProperty(dom.window.crypto, "randomUUID", {
       value: undefined,
     });
+  dom.window.XLSX = require("../../vendor/xlsx.full.min.js");
+  dom.window.HTMLDialogElement.prototype.showModal = function () {
+    this.open = true;
+  };
+  dom.window.HTMLDialogElement.prototype.close = function () {
+    this.open = false;
+  };
+  dom.window.TextDecoder = TextDecoder;
   dom.window.AbortController = AbortController;
   dom.window.confirm = () => true;
   for (const file of [
     "expense-projects.js",
     "ledger-import.js",
+    "payment-file.js",
+    "wechat-import.js",
+    "alipay-import.js",
+    "wechat-import-ui.js",
+    "import-audit-ui.js",
     "nas-connection.js",
     "nas-model.js",
   ])
@@ -242,4 +255,122 @@ test("unconfigured NAS HTTP page never submits credentials", async (t) => {
   });
   assert.ok(!f.browserRequests.includes("/api/login"));
   assert.equal(f.doc.querySelector('input[name="endpoint"]'), null);
+});
+test("NAS WeChat import uses the same review, saves atomically and can recover a lost response", async (t) => {
+  const f = await ui(t);
+  f.doc.querySelector('[data-nas-action="import-wechat"]').click();
+  await wait(() => !f.node.hasAttribute("aria-busy"));
+  const csv =
+    "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号,商户单号,备注\n2026-09-19 12:00:00,商户消费,测试商户,午餐,支出,12.30,零钱,支付成功,420000000000000000000000000001,m-1,/\n";
+  const input = f.doc.querySelector("[data-nas-wechat-file]");
+  Object.defineProperty(input, "files", {
+    value: [
+      {
+        size: Buffer.byteLength(csv),
+        arrayBuffer: async () => Uint8Array.from(Buffer.from(csv)).buffer,
+      },
+    ],
+  });
+  input.dispatchEvent(new f.dom.window.Event("change", { bubbles: true }));
+  await wait(() => f.doc.querySelector(".wechat-dialog"));
+  const select = f.doc.querySelector("[data-wechat-method]");
+  select.value = "cash";
+  select.dispatchEvent(new f.dom.window.Event("change", { bubbles: true }));
+  f.lose();
+  f.doc.querySelector("[data-wechat-confirm]").click();
+  await wait(() =>
+    f.doc.querySelector(".wechat-feedback").textContent.includes("连接中断"),
+  );
+  f.doc.querySelector("[data-wechat-cancel]").click();
+  await wait(() => f.doc.querySelector('[data-nas-action="retry"]'));
+  f.doc.querySelector('[data-nas-action="retry"]').click();
+  await wait(() => f.node.textContent.includes("已安全保存到 NAS"));
+  const b = await f.call("ledgers/" + f.id, "GET", null, f.token);
+  assert.equal(b.book.transactions.length, 1);
+  assert.equal(b.book.categories.cash.balance, 0);
+  assert.equal(b.book.transactions[0].wechat.balanceMode, "history");
+  assert.equal(b.revision, 2);
+});
+test("NAS spreadsheet parser load failure is visible and a subsequent file selection can retry", async (t) => {
+  const f = await ui(t);
+  delete f.dom.window.XLSX;
+  const csv =
+    "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号\n2026-09-19 12:00:00,商户消费,测试商户,交通,支出,8,零钱,支付成功,wechat-loader-001\n";
+  const input = f.doc.querySelector("[data-nas-wechat-file]");
+  Object.defineProperty(input, "files", {
+    value: [
+      {
+        size: Buffer.byteLength(csv),
+        arrayBuffer: async () => Uint8Array.from(Buffer.from(csv)).buffer,
+      },
+    ],
+  });
+  input.dispatchEvent(new f.dom.window.Event("change", { bubbles: true }));
+  await wait(() =>
+    f.doc.querySelector('script[src="vendor/xlsx.full.min.js"]'),
+  );
+  f.doc
+    .querySelector('script[src="vendor/xlsx.full.min.js"]')
+    .dispatchEvent(new f.dom.window.Event("error"));
+  await wait(() => f.node.textContent.includes("无法加载Excel解析器"));
+  assert.equal(
+    (await f.call("ledgers/" + f.id, "GET", null, f.token)).book.transactions
+      .length,
+    0,
+  );
+  input.dispatchEvent(new f.dom.window.Event("change", { bubbles: true }));
+  await wait(() =>
+    f.doc.querySelector('script[src="vendor/xlsx.full.min.js"]'),
+  );
+  f.dom.window.XLSX = require("../../vendor/xlsx.full.min.js");
+  f.doc
+    .querySelector('script[src="vendor/xlsx.full.min.js"]')
+    .dispatchEvent(new f.dom.window.Event("load"));
+  await wait(() => f.doc.querySelector(".wechat-dialog"));
+  f.doc.querySelector("[data-wechat-cancel]").click();
+  await wait(() => !f.node.hasAttribute("aria-busy"));
+  assert.equal(
+    (await f.call("ledgers/" + f.id, "GET", null, f.token)).book.transactions
+      .length,
+    0,
+  );
+});
+test("NAS Alipay GB18030 file opens the Alipay review and retains Alipay provenance", async (t) => {
+  const f = await ui(t);
+  const bytes = fs.readFileSync(
+    path.join(__dirname, "../fixtures/alipay-synthetic-gb18030.csv"),
+  );
+  const input = f.doc.querySelector("[data-nas-wechat-file]");
+  Object.defineProperty(input, "files", {
+    value: [
+      {
+        size: bytes.length,
+        arrayBuffer: async () => Uint8Array.from(bytes).buffer,
+      },
+    ],
+  });
+  input.dispatchEvent(new f.dom.window.Event("change", { bubbles: true }));
+  await wait(() => f.doc.querySelector(".wechat-dialog"));
+  assert.match(f.doc.querySelector(".wechat-title").textContent, /支付宝/);
+  const select = f.doc.querySelector("[data-wechat-method]");
+  select.value = "cash";
+  select.dispatchEvent(new f.dom.window.Event("change", { bubbles: true }));
+  f.doc.querySelector("[data-wechat-confirm]").click();
+  await wait(() => f.node.textContent.includes("已安全保存到 NAS"));
+  const result = await f.call("ledgers/" + f.id, "GET", null, f.token);
+  assert.equal(result.book.transactions.length, 1);
+  assert.equal(
+    result.book.transactions[0].alipay.transactionId,
+    "202600000000000000000000000001",
+  );
+  assert.equal(result.book.transactions[0].wechat, undefined);
+  assert.equal(result.book.categories.cash.balance, 0);
+});
+
+test("NAS audit decisions survive lost acknowledgment with one persisted resolution", async t=>{
+ const f=await ui(t),csv="交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号\n2026-09-19 12:00:00,商户消费,测试,商品,支出,8,零钱,未知状态,audit-test-001\n";
+ const input=f.doc.querySelector('[data-nas-wechat-file]');Object.defineProperty(input,'files',{value:[{name:'synthetic.csv',size:Buffer.byteLength(csv),arrayBuffer:async()=>Uint8Array.from(Buffer.from(csv)).buffer}]});input.dispatchEvent(new f.dom.window.Event('change',{bubbles:true}));
+ await wait(()=>f.doc.querySelector('[data-wechat-method]'));const select=f.doc.querySelector('[data-wechat-method]');select.value='cash';select.dispatchEvent(new f.dom.window.Event('change',{bubbles:true}));f.doc.querySelector('[data-wechat-confirm]').click();await wait(()=>!f.doc.querySelector('.wechat-dialog'));
+ f.doc.querySelector('[data-nas-action="import-audit"]').click();await wait(()=>f.doc.querySelector('[data-decision="exclude"]'));f.lose();f.doc.querySelector('[data-decision="exclude"]').click();await wait(()=>f.doc.querySelector('.import-audit-dialog [role=status]').textContent.includes('连接中断'));f.doc.querySelector('[data-close]').click();await wait(()=>f.doc.querySelector('[data-nas-action="retry"]'));f.doc.querySelector('[data-nas-action="retry"]').click();await wait(()=>f.node.textContent.includes('已安全保存到 NAS'));
+ const result=await f.call('ledgers/'+f.id,'GET',null,f.token);assert.equal(result.revision,3);assert.equal(result.book.transactions.length,0);assert.equal(result.book.importAudits[0].items[0].decision,'excluded');assert.equal(result.book.importAudits[0].status,'completed');
 });

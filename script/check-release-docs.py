@@ -8,7 +8,7 @@ root = Path(__file__).resolve().parents[1]
 files = [root / name for name in (
     'README.md', 'README.en.md', 'CONTRIBUTORS.md', 'CONTRIBUTING.md', 'SECURITY.md',
     'THIRD_PARTY_NOTICES.md', 'docs/user-guide.md', 'docs/branding.md',
-    'docs/releases/v3.2.1.md', 'docs/validation/v3.2.1.md', 'deploy/ugreen/README.md')]
+    'docs/releases/v3.3.0.md', 'docs/validation/v3.3.0.md', 'deploy/ugreen/README.md')]
 
 def anchors(path):
     text = path.read_text()

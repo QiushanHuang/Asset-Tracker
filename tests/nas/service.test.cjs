@@ -260,6 +260,8 @@ test("untrusted origins and arbitrary files are blocked; same-origin assets cont
   assert.equal((await fetch(base + "/server/data/book.sqlite")).status, 404);
   assert.equal((await fetch(base + "/README.md")).status, 404);
   assert.equal((await fetch(base + "/")).status, 200);
+  const pdf=await fetch(base+"/vendor/pdfjs/pdf.mjs");assert.equal(pdf.status,200);assert.match(pdf.headers.get("content-type"),/javascript/);
+  assert.equal((await fetch(base+"/vendor/pdfjs/pdf.worker.mjs")).status,200);
 });
 test("malformed snapshots and prototype-shaped currencies are rejected without changing revisions", async (t) => {
   const f = await fixture(t),

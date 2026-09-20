@@ -2362,6 +2362,8 @@ class AssetTracker {
         });
 
         // 导入导出功能
+        document.getElementById('import-wechat-btn')?.addEventListener('click', () => this.importData());
+        document.getElementById('import-audit-btn')?.addEventListener('click', () => globalThis.AssetTrackerImportAuditUI.open({getBook:()=>this.data,onCommit:async next=>{this.assertWritable();if(this.validateRawBook(JSON.stringify(next)).status!=='valid')throw Error('核对记录未通过校验');const old=this.data;this.data=next;try{await this.saveData({reason:'resolve-import-audit'});}catch(e){this.data=old;throw e;}this.refreshDataViews();}}));
         document.getElementById('import-btn').addEventListener('click', () => {
             this.importData();
         });
@@ -3093,6 +3095,7 @@ class AssetTracker {
     }
 
     updateCategoryBalance(transaction) {
+        if ((transaction.wechat || transaction.alipay || transaction.icbc || transaction.ocbc)?.balanceMode === 'history') return;
         const categoryPath = this.findCategoryPath(transaction.category, transaction.subcategory, transaction.accountId);
         if (categoryPath) {
             let current = this.data.categories;
@@ -4627,13 +4630,7 @@ class AssetTracker {
         const projectErrors = ProjectLedger.validate({...this.data, transactions:[{...transaction,...projectFields}]});
         if (projectErrors.length) { this.transactionEditPending = false; if (submit) submit.disabled = false; document.getElementById('entry-error').textContent=projectErrors[0]; return; }
         // 先恢复原来的分类余额
-        this.updateCategoryBalance({
-            category: transaction.category,
-            subcategory: transaction.subcategory,
-            amount: -transaction.amount,
-            currency: transaction.currency || 'CNY',
-            accountId: transaction.accountId
-        });
+        this.updateCategoryBalance({...transaction, amount: -transaction.amount});
 
         // 处理日期和时间
         const includeTime = document.getElementById('edit-include-time').checked;
@@ -4688,11 +4685,7 @@ class AssetTracker {
 
         if (confirm(`确定要删除这条交易记录吗？\n金额：¥${transaction.amount}\n描述：${transaction.description}`)) {
             // 恢复分类余额
-            this.updateCategoryBalance({
-                category: transaction.category,
-                subcategory: transaction.subcategory,
-                amount: -transaction.amount
-            });
+            this.updateCategoryBalance({...transaction, amount: -transaction.amount});
 
             // 删除交易记录
             this.data.transactions = this.data.transactions.filter(t => t.id !== transactionId);
@@ -4841,11 +4834,28 @@ class AssetTracker {
         this.importOpening = true;
         try {
             this.assertWritable();
-            const result = await this.fileAdapter.openImport({ acceptedTypes: '.xlsx,.csv', fileInputId: 'import-file', readAs: 'binary' });
+            const result = await this.fileAdapter.openImport({ acceptedTypes: '.xlsx,.csv,.pdf', fileInputId: 'import-file', readAs: 'binary' });
             if (!result) return;
             if (result.text.length > 16 * 1024 * 1024) throw new Error('导入文件不能超过 12 MB');
             const raw = this.fileAdapter.normalizeImportedContent(result.text, result.encoding || 'binary', {output:'binary'});
-            const workbook = XLSX.read(raw, {type:'binary', codepage:65001, raw:true, sheetRows:50002});
+            let workbook,parsed;
+            if(raw.slice(0,5)==='%PDF-') parsed=await globalThis.AssetTrackerBankImport.read(raw,result.fileName||'');
+            else ({workbook}=globalThis.AssetTrackerPaymentFile.read(raw,XLSX,{type:'binary',fileName:result.fileName||''}));
+            const grids = (workbook?.SheetNames||[]).map(name => XLSX.utils.sheet_to_json(workbook.Sheets[name], {header:1,defval:'',raw:true,blankrows:true}));
+            const provider=[globalThis.AssetTrackerWechatImport,globalThis.AssetTrackerAlipayImport].find(parser=>parser&&grids.some(grid=>parser.detect(grid)));
+            if (parsed || provider) {
+                parsed ||= provider.readWorkbook(workbook,XLSX);
+                parsed.fileName=result.fileName||"";
+                const label=({wechat:"微信",alipay:"支付宝",icbc:"工商银行",ocbc:"OCBC"}[parsed.provider]);
+                await globalThis.AssetTrackerWechatUI.open({parsed,getBook:()=>this.data,onCommit:async candidate=>{
+                    this.assertWritable();
+                    if(this.validateRawBook(JSON.stringify(candidate)).status!=='valid')throw Error(label+'导入结果未通过账本校验');
+                    const previous=this.data;this.data=candidate;
+                    try{await this.saveData({reason:'import-'+parsed.provider});}catch(error){this.data=previous;throw error;}
+                    this.refreshDataViews();this.showMessage(label+'账单已保存。','success');
+                }});
+                return;
+            }
             const rows = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {defval:''});
             this.importPreview = globalThis.AssetTrackerImport.prepare(this.data, rows);
             const p = this.importPreview;
