@@ -2,6 +2,10 @@
 
 # NAS deployment
 
+**v3.4.0:** the source archive is updated; the existing `asset-tracker:3.3.0` prebuilt image and the instructions that name it remain unchanged. Workspace models run in the local Mac/web app, not in this NAS service. No running deployment is upgraded automatically.
+
+**v3.4.0：**本版更新源码包，原 `asset-tracker:3.3.0` 预构建镜像及其操作步骤继续有效。工作区模型在本地 Mac/网页运行，不在 NAS 服务执行；不会自动升级正在运行的部署。
+
 [English](#english) · [简体中文](#中文) · [Main README](../../README.md)
 
 Run Asset Tracker in its own Docker project and persistent SQLite volume.

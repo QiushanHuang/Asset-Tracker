@@ -9,7 +9,7 @@
 ### macOS
 
 1. Download the Apple-silicon macOS archive and `SHA256SUMS.txt` from the same release.
-2. In the download directory, compare `shasum -a 256 AssetTracker-v3.3.0-macos-arm64.zip` with its checksum entry.
+2. In the download directory, compare `shasum -a 256 AssetTracker-v3.4.0-macos-arm64.zip` with its checksum entry.
 3. Unzip and move `AssetTracker.app` to Applications if desired. The application is unsigned and not notarized; macOS may require your explicit approval in Privacy & Security.
 4. Open the application. A new installation starts with an empty book and default funding categories; it contains no author's ledger.
 
@@ -74,17 +74,43 @@ and clears amount/description only after a successful save.
 ### Find and edit a record
 
 Use text search, account/project filters and date bounds. A project filter shows
-its full date range; use **清除筛选** if expected records are missing. Lists render
-50 records per page. Editing project attribution does not create a second money
+its full date range; use **清除筛选** if expected records are missing. List page size adapts to the window, up to 50 records per page. Editing project attribution does not create a second money
 movement.
 
 ### Analysis and recurring rules
 
 The four analysis tabs share an explicit range and filtering context. Review
 rate assumptions and unconverted amounts before interpreting totals. The local
-app supports recurring-rule management and catch-up; the NAS service does not
+app supports recurring-rule management and catch-up draft previews; the NAS service does not
 execute those rules in the background. A JSON import preserves rule data, not
 a promise of server-side scheduling.
+
+## Workspace and model-assisted entry
+
+Open **编辑首页** or **设置与连接 → 外观与模块** to choose module visibility, order and width. Theme, density, main metric, date period and recent-row count are device preferences. Preview changes, then save or cancel. Hiding the assistant does not revoke model consent; use **模型与连接** to disable it.
+
+The overview uses the window's available height. Additional modules use pages, record lists paginate and analysis/settings use tabs. On narrow windows, pending-review details open separately with a return-to-list control. Long source text and expanded trees retain area scrolling.
+
+### Connect an existing model
+
+1. Start your model service yourself. For Ollama use `http://127.0.0.1:11434`; compatible APIs usually include `/v1` in the base URL.
+2. Select the provider/location, enter a model name or use **获取模型**, then run **测试结构输出**. This sends a synthetic sample rather than your book.
+3. Choose whether to enable the assistant and allow submitted text plus account/category candidates. Optional examples contain at most five confirmed descriptions/categories. Save the settings.
+4. Enter a sentence in **账本助手**. Check the draft in **待核对**, correct required fields and confirm. Model suggestions cannot write directly to the formal ledger.
+
+Mac API keys are scoped to the book's storage directory and endpoint in Keychain. Browser keys stay only in page memory; enter them again after a reload. Changing the endpoint clears processing consent. Local connection failure never switches to a cloud endpoint.
+
+**⌘/Ctrl K** brings the enabled assistant module into view; **N** opens direct entry when focus is not in an input. Use **取消任务** to stop a request. Execution history appears under **自动化 → 助手执行记录**. A model can return an incorrect description or category even after the synthetic test passes.
+
+### Review and preserve drafts
+
+Edits are staged while you work, including when switching rows. Use **暂存修改** to validate and explicitly save changes, or **确认这一笔** to write the formal record. Bulk confirmation applies to the selected draft IDs; check the selected count across pages. Original text is inspectable through **查看完整内容**, and confirmed transactions have a **来源** action.
+
+Choose **将这次分类保存为可编辑规则** to create an exact-description/account rule. Its edit dialog previews how many historical records match; saving does not rewrite those records. Recurring **预览待补齐项** generates drafts, not background postings.
+
+Unconfirmed workspace drafts, run history and model consent are stored separately from the formal book's JSON backup. Do not clear site data or replace a book while you still need those drafts. If workspace state cannot be read safely, settings offers a raw export or a recovery action that retains the original copy first. A newer write from another window is never silently overwritten.
+
+New original payment/bank files enter through **导入微信 / 支付宝 / 银行**; use **导入核对记录** to reopen saved audit batches. They retain their historical-balance and import-evidence rules. The new draft queue does not silently replace that workflow.
 
 ## Import and export
 
@@ -196,13 +222,36 @@ open -n /path/to/AssetTracker.app --args --preview
 2. **添加账单**：快捷表单输入正数金额，再选收入/支出；表格导入则使用收入为正、支出为负的金额。
 3. **项目账本**：旅行、装修或活动分别建立项目，可套用旅游模板。各项目消费分类独立，最多三级；允许记在父分类，汇总会包含下级并显示本级直接记录。
 4. **当前项目**只在本次会话生效，重启恢复日常记账。**保存并继续**只在保存确认后清空金额/备注，保留有用的账户和项目选择。
-5. 使用搜索、账户/项目和日期筛选寻找记录，每页50笔。项目筛选会显示项目全部日期；找不到记录时先清除筛选。
+5. 使用搜索、账户/项目和日期筛选寻找记录，每页条数随窗口调整，最多50笔。项目筛选会显示项目全部日期；找不到记录时先清除筛选。
 
 项目归属修改不会生成第二笔资金变动。已经使用的分类不能随意删除；完成的项目可归档，历史记录继续保留。
 
 **净资产**会扣除负债，并单独处理负债溢缴。盘点/初始资产是分析参考锚点，不会补造缺失流水。
 查看四个分析面板时，应同时查看时间范围、汇率口径与未折算项目。汇率为手动参考值，预测来自已输入数据和假设。
-本地自动记账支持规则管理与补记；NAS不会在后台执行导入的规则。
+本地自动记账支持规则管理与待补齐草稿预览，确认后才入账；NAS不会在后台执行导入的规则。
+
+### 首页与模型助手
+
+在“编辑首页”或“设置与连接 → 外观与模块”选择模块显示、顺序、宽度、主题、密度、主指标、默认期间和最近账单条数。先预览，再保存或取消。隐藏助手只影响显示，停用模型请到“模型与连接”。
+
+首页按窗口高度分配空间，更多模块和长账单分页，分析与设置按组切换。窄窗口核对页在列表和详情间切换；长原文与展开账户树保留区域滚动。
+
+1. 自行启动模型服务。Ollama 通常使用 `http://127.0.0.1:11434`；兼容接口一般需填写带 `/v1` 的根地址。
+2. 选择接口和运行位置，填写或获取模型，先运行“测试结构输出”。测试使用合成样例，不读取正式账目。
+3. 选择是否启用助手、是否允许提交文本及账户/分类候选。可选的已确认样例最多5条，只包含描述与用途，然后保存。
+4. 输入一句话，在“待核对”检查并修改字段，确认后入账。模型不能直接写正式账本。
+
+Mac 密钥按账本目录和服务地址保存在钥匙串；浏览器密钥只在当前页面内存中，刷新后需重新输入。切换服务地址会清除处理授权；本机连接失败不会自动切换云端。
+
+`⌘/Ctrl K` 定位已启用的助手模块，非输入状态下 `N` 打开直接记账。请求可取消，结果在“自动化 → 助手执行记录”查看。结构测试通过也不保证每次描述或分类正确。
+
+核对时切换记录会保留输入；“暂存修改”会校验并保存草稿，“确认这一笔”才写正式记录。批量确认按选中ID处理，跨页也要检查选中数量。完整原文可点开，入账后仍有“来源”入口。
+
+可勾选保存同一描述与账户的分类规则，编辑时查看历史匹配数；保存规则不修改历史账单。周期“预览待补齐项”只生成草稿，没有后台自动入账。
+
+未确认草稿、执行记录和模型授权属于独立设备暂存，不包含在正式账本 JSON 备份中。需要保留草稿时，先完成核对再换设备或替换账本。暂存无法安全读取时，设置提供原始导出或先保留原副本再恢复；其他窗口已有更新时不会静默覆盖。
+
+原始微信、支付宝与银行文件从“导入微信 / 支付宝 / 银行”进入，已保存的核对批次从“导入核对记录”重开；历史余额和来源规则保留，不被新草稿队列替代。
 
 ### 导入导出
 

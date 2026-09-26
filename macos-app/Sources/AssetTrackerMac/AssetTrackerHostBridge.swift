@@ -32,6 +32,8 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
     private let rawIOExecutor: AssetTrackerSerialRawIOExecutor
     private let storageCoordinator: AssetTrackerStorageCoordinator
     private let responsePipeline: AssetTrackerBridgeResponsePipeline
+    private lazy var workspaceStore = AssetTrackerWorkspaceStore(directoryURL: bookStore.storageDirectoryURL)
+    private lazy var agentService = AssetTrackerAgentService(credentialScope: bookStore.storageDirectoryURL.path)
 
     init(
         webView: WKWebView,
@@ -85,6 +87,11 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
 
         let payload = body["payload"] as? [String: Any] ?? [:]
         switch type {
+        case "agent.request":
+            Task { @MainActor in
+                do { let result = try await agentService.request(payload); sendResponse(id: requestID, ok: true, result: .string(result), error: nil) }
+                catch { sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription) }
+            }
         case "storage.load":
             handleStorageLoad(requestID: requestID, payload: payload)
         case "storage.confirmLoad":
@@ -182,6 +189,22 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
 
     private func handleMainThreadMessage(type: String, payload: [String: Any]) throws -> AssetTrackerBridgeJSONValue {
         switch type {
+        case "workspace.load":
+            return .string(try workspaceStore.rawText())
+        case "workspace.save":
+            guard let text = payload["text"] as? String, let expected = payload["expectedText"] as? String else { throw AssetTrackerBridgeError.invalidPayload("工作区数据或来源缺失") }
+            try workspaceStore.compareAndSave(text, expected: expected)
+            return .bool(true)
+        case "workspace.reset":
+            guard let expected = payload["expectedText"] as? String else { throw AssetTrackerBridgeError.invalidPayload("工作区恢复来源缺失") }
+            return .string(try workspaceStore.resetPreservingOriginal(expected: expected))
+        case "agent.key":
+            guard let connection = payload["connection"] as? [String: Any], let key = payload["apiKey"] as? String else { throw AssetTrackerBridgeError.invalidPayload("密钥参数无效") }
+            try agentService.storeKey(connection: connection, key: key)
+            return .bool(true)
+        case "agent.cancel":
+            if let runID = payload["runId"] as? String { agentService.cancel(runID) }
+            return .bool(true)
         case "file.openImport":
             return try openImportPanel(payload: payload)
         case "file.saveExport":

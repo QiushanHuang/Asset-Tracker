@@ -2,6 +2,32 @@
 
 All notable product changes are recorded here.
 
+## [3.4.0] - 2026-09-26
+
+### Added
+
+- Adaptive workspace with prominent surplus/income/expense, configurable modules, themes, density, layout previews and presets.
+- Optional Ollama and compatible API adapters, model discovery, structured-output checks, scoped consent, timeouts and cancellation.
+- Editable model/manual/recurring drafts, split review details, preserved source records, classification rules and execution history.
+- Native auxiliary workspace storage with atomic writes, byte-level conflict checks and recovery copies; browser Web Locks protect concurrent saves.
+
+### Improved
+
+- Default overview fits desktop and narrow screens; additional modules and long records paginate, while settings and analysis use named groups.
+- Keyboard focus and draft edits survive paging/reflow; the active assistant stays reachable when its status changes.
+- Recurring catch-up prepares drafts and uses stable identities and an indexed date lookup.
+- README, bilingual release notes and operating instructions explain the local-model workflow and retained statement imports.
+
+### Compatibility
+
+- Integrates on v3.3.0 without replacing WeChat/Alipay/bank-PDF import or persistent statement review; historical imports preserve current balances.
+- Model execution remains local-app/web functionality. No new always-on NAS scheduler, external Agent tool API or prebuilt NAS image.
+- Mac distribution is not Developer ID signed or notarized. Cloud protocol support is tested without live provider credentials.
+
+### 中文摘要
+
+融合首页、模块设置、本机小模型、可追溯草稿与一屏适配；保留原有账单导入和四类分析。周期规则先预览，建议确认后入账。详见[完整更新说明](docs/releases/v3.4.0.md#中文)。
+
 ## [3.3.0] - 2026-09-20
 
 ### Added

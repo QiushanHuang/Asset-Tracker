@@ -2395,6 +2395,14 @@
             issue(issues, '$', 'invalid-top-level', 'Book payload must be an object');
             return;
         }
+        if (payload.workspaceReceipts !== undefined && (!Array.isArray(payload.workspaceReceipts)
+            || payload.workspaceReceipts.length > 100000
+            || payload.workspaceReceipts.some(id => typeof id !== 'string' || id.length === 0 || id.length > 220))) {
+            issue(issues, '$.workspaceReceipts', 'invalid-receipts', 'Invalid workspace operation receipts');
+        }
+        if (payload.workspaceScope !== undefined && (typeof payload.workspaceScope !== 'string' || !/^[a-zA-Z0-9:_-]{1,180}$/.test(payload.workspaceScope))) {
+            issue(issues, '$.workspaceScope', 'invalid-workspace-scope', 'Invalid workspace scope identity');
+        }
         if (![...LEGACY_ROOT_FIELDS].some(field => Object.prototype.hasOwnProperty.call(payload, field))) {
             issue(issues, '$', 'unknown-root', 'No known legacy root field is present');
             return;

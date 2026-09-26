@@ -282,6 +282,7 @@ function loadAssetTracker({
     const importContent = fs.readFileSync(path.join(__dirname, '..', '..', 'ledger-import.js'), 'utf8');
     const safetyContent = fs.readFileSync(safetyPath, 'utf8');
     const scriptContent = fs.readFileSync(scriptPath, 'utf8');
+    const workspaceContent = ['workspace-model.js', 'agent-provider.js', 'workspace-fit.js', 'workspace-ui.js', 'workspace-screen.js'].map(name => fs.readFileSync(path.join(__dirname, '..', '..', name), 'utf8')).join('\n');
     const domEvents = {};
     const windowEvents = {};
     const elements = new Map();
@@ -470,6 +471,7 @@ function loadAssetTracker({
         setInterval: trackedSetInterval,
         clearInterval: trackedClearInterval,
         TextDecoder,
+        crypto: require('node:crypto').webcrypto,
         Blob,
         Event,
         queueMicrotask,
@@ -523,7 +525,7 @@ function loadAssetTracker({
             };
         `, context);
     }
-    vm.runInContext(`${projectContent}\n${projectUIContent}\n${analyticsContent}\n${analyticsUIContent}\n${safetyContent}\n${importContent}\n${paymentContent}\n${wechatContent}\n${alipayContent}\n${wechatUIContent}\n${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
+    vm.runInContext(`${projectContent}\n${projectUIContent}\n${analyticsContent}\n${analyticsUIContent}\n${safetyContent}\n${importContent}\n${paymentContent}\n${wechatContent}\n${alipayContent}\n${wechatUIContent}\n${workspaceContent}\n${scriptContent}\n;globalThis.__AssetTracker = AssetTracker;`, context);
 
     return {
         AssetTracker: context.__AssetTracker,

@@ -1443,6 +1443,7 @@ class AssetTracker {
             readOnlyRecovery: '只读保护已开启',
             terminalRecovery: '本次启动已进入终止性只读保护'
         };
+        node.dataset.state = this.appState;
         node.textContent = this.appStateDetail || labels[this.appState] || '';
     }
 
@@ -2239,6 +2240,7 @@ class AssetTracker {
         this.setupNavigation();
         this.setupEventListeners();
         this.setupProjectUI();
+        this.setupWorkspace?.();
         const folderButton = document.getElementById('reveal-storage-folder-main-btn');
         if (folderButton) folderButton.hidden = !this.storageAdapter.supportsNative;
         this.initializeTransactionFilters();
@@ -2276,7 +2278,9 @@ class AssetTracker {
 
                 // 更新标题
         const titles = {
-                    'dashboard': '资产概览',
+                    'dashboard': '总览',
+                    'workspace-review': '待核对',
+                    'workspace-settings': '设置与连接',
                     'categories': '资金账户',
                     'projects': '项目账本',
                     'transactions': '账单记录',
@@ -2287,12 +2291,13 @@ class AssetTracker {
                     'nas': 'NAS 与家庭账本'
                 };
                 document.getElementById('section-title').textContent = titles[targetSection];
+                this.workspaceNavigated?.(targetSection);
 
                 const remoteSection = targetSection === 'nas';
                 const localActions = document.querySelector('.header-right');
                 if (localActions) localActions.hidden = remoteSection;
                 const projectStatus = document.getElementById('active-project-status');
-                if (projectStatus) projectStatus.hidden = remoteSection;
+                if (projectStatus) projectStatus.hidden = remoteSection || Boolean(this.ws?.ready && !this.activeProjectId);
                 const eyebrow = document.querySelector('.header-left .eyebrow');
                 if (eyebrow) eyebrow.textContent = remoteSection ? 'NAS 协作' : '我的账本';
                 // 特殊处理
@@ -3185,7 +3190,7 @@ class AssetTracker {
                 && (!query || [item.category, item.subcategory, item.description, item.purpose, item.currency, item.amount, this.projectDescription(item)]
                     .some(value => String(value ?? '').toLocaleLowerCase().includes(query)));
         }).sort((a, b) => b.date.localeCompare(a.date));
-        const pageSize = 50;
+        const pageSize = this.ws?.transactionPageSize || 50;
         const pages = Math.max(1, Math.ceil(records.length / pageSize));
         this.transactionPage = Math.min(Math.max(0, this.transactionPage || 0), pages - 1);
         const start = this.transactionPage * pageSize;
@@ -4859,6 +4864,7 @@ class AssetTracker {
             const rows = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {defval:''});
             this.importPreview = globalThis.AssetTrackerImport.prepare(this.data, rows);
             const p = this.importPreview;
+            if (this.canQueueWorkspaceImport?.(p)) { await this.queueWorkspaceImport(p, rows); return; }
             document.getElementById('modal-body').innerHTML = `<h3>导入预览</h3>
                 <p class="helper-text">检查通过后才会一次性追加账单，不替换现有记录。收入为正数，支出为负数。</p>
                 <div class="project-metrics"><div>可新增<strong>${p.accepted.length}</strong></div><div>已存在<strong>${p.duplicates.length}</strong></div><div>需要检查<strong>${p.errors.length + p.suspected.length}</strong></div></div>
@@ -4909,7 +4915,7 @@ class AssetTracker {
     async importFullBook() {
         if (this.fullBookImportPending) return;
         this.fullBookImportPending = true;
-        let previousState, mutated = false;
+        let previousState, mutated = false, committed = false;
         try {
             this.assertWritable();
             const result = await this.fileAdapter.openImport({acceptedTypes:'.json',fileInputId:'import-book-file',readAs:'text'});
@@ -4919,6 +4925,7 @@ class AssetTracker {
             const parsed = this.parseBookPayload(text);
             if (parsed.status !== 'valid') throw new Error('该 JSON 未通过完整账本校验，未修改任何账目。');
             const nextState = this.normalizeLoadedData(parsed.payload);
+            if (this.workspaceScopeId) nextState.workspaceScope = this.workspaceScopeId();
             if (!window.confirm(`当前 ${this.data.transactions.length} 笔账单将被文件中的 ${nextState.transactions.length} 笔替换。接下来先导出当前完整备份，再替换账本。是否继续？`)) return;
             previousState = JSON.stringify(this.data);
             await this.fileAdapter.saveFile({suggestedName:`替换前账本备份_${localDateKey()}.json`,mimeType:'application/json',text:JSON.stringify(this.getBookExportPackage(),null,2)});
@@ -4926,12 +4933,14 @@ class AssetTracker {
             this.assertWritable();
             this.data = nextState; mutated = true;
             await this.saveData({reason:'import-book'});
+            committed = true;
             this.refreshDataViews();
             this.showMessage('完整账本已替换，请妥善保存替换前备份。','success');
         } catch(error) {
-            if (mutated) { this.data = this.normalizeLoadedData(JSON.parse(previousState)); this.refreshDataViews(); }
+            if (mutated && !committed) { this.data = this.normalizeLoadedData(JSON.parse(previousState)); this.refreshDataViews(); }
             if(error?.message !== '用户取消了操作' && this.lastError !== error) this.showMessage(error?.message || '完整账本导入失败','error');
         } finally { this.fullBookImportPending = false; }
+        return committed;
     }
 
     async revealStorageFolder() {
@@ -4979,20 +4988,23 @@ class AssetTracker {
         }
 
         const previousState = JSON.stringify(this.data);
+        let committed = false;
 
         try {
             this.data = this.getDefaultState();
+            if (this.workspaceScopeId) this.data.workspaceScope = this.workspaceScopeId();
             await this.saveData({ reason: 'reset-default' });
+            committed = true;
             this.refreshDataViews();
             this.showMessage('已恢复默认账本。', 'success');
         } catch (error) {
-            this.data = this.normalizeLoadedData(JSON.parse(previousState));
-            this.refreshDataViews();
+            if (!committed) { this.data = this.normalizeLoadedData(JSON.parse(previousState)); this.refreshDataViews(); }
             if (this.lastError === error) {
                 return;
             }
             this.showMessage(error?.message || '恢复默认账本失败', 'error');
         }
+        return committed;
     }
 
     // 工具方法
@@ -6099,6 +6111,8 @@ class AssetTracker {
 
 globalThis.AssetTrackerProjectUI.install(AssetTracker);
 globalThis.AssetTrackerAnalyticsUI.install(AssetTracker);
+globalThis.AssetTrackerWorkspaceUI?.install(AssetTracker);
+globalThis.AssetTrackerWorkspaceScreen?.install(AssetTracker);
 
 // 初始化应用
 document.addEventListener('DOMContentLoaded', () => {

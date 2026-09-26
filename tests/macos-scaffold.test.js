@@ -6,7 +6,51 @@ const os = require('node:os');
 const path = require('node:path');
 
 const root = path.join(__dirname, '..');
-const expectedWebAssets = ['index.html', 'styles.css', 'assets/asset-tracker-logo-v3.png', 'expense-projects.js', 'project-ui.js', 'ledger-insights.js', 'insights-ui.js', 'ledger-import.js', 'legacy-safety.js', 'script.js', 'vendor/chart.umd.min.js', 'vendor/xlsx.full.min.js', 'nas.html', 'nas.css', 'nas-connection.js', 'nas-model.js', 'nas-ui.js', 'payment-file.js', 'wechat-import.js', 'alipay-import.js', 'wechat-import-ui.js', 'bank-import.js', 'import-audit-ui.js', 'vendor/pdfjs/pdf.mjs', 'vendor/pdfjs/pdf.worker.mjs', 'vendor/pdfjs/LICENSE', 'vendor/pdfjs/pdf.classic.js', 'vendor/pdfjs/pdf.worker.classic.js'];
+const expectedWebAssets = [
+    "index.html",
+    "styles.css",
+    "assets/asset-tracker-logo-v3.png",
+    "expense-projects.js",
+    "project-ui.js",
+    "ledger-insights.js",
+    "insights-ui.js",
+    "ledger-import.js",
+    "legacy-safety.js",
+    "script.js",
+    "vendor/chart.umd.min.js",
+    "vendor/xlsx.full.min.js",
+    "nas.html",
+    "nas.css",
+    "nas-connection.js",
+    "nas-model.js",
+    "nas-ui.js",
+    "payment-file.js",
+    "wechat-import.js",
+    "alipay-import.js",
+    "wechat-import-ui.js",
+    "bank-import.js",
+    "import-audit-ui.js",
+    "vendor/pdfjs/pdf.mjs",
+    "vendor/pdfjs/pdf.worker.mjs",
+    "vendor/pdfjs/LICENSE",
+    "vendor/pdfjs/pdf.classic.js",
+    "vendor/pdfjs/pdf.worker.classic.js",
+    "workspace-model.js",
+    "agent-provider.js",
+    "workspace-fit.js",
+    "workspace-ui.js",
+    "workspace-screen.js",
+    "workspace.css",
+    "assets/icons/LICENSE",
+    "assets/icons/adjustments-horizontal.svg",
+    "assets/icons/bolt.svg",
+    "assets/icons/chart-bar.svg",
+    "assets/icons/folder.svg",
+    "assets/icons/home.svg",
+    "assets/icons/receipt.svg",
+    "assets/icons/settings.svg",
+    "assets/icons/sparkles.svg",
+];
 
 function mustExist(relativePath) {
     const fullPath = path.join(root, relativePath);
