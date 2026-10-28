@@ -146,6 +146,29 @@ function submit(f, dom) {
     new dom.window.Event("submit", { bubbles: true, cancelable: true }),
   );
 }
+test("authentication modes expose the selected action and retain the local-data boundary", (t) => {
+  const dom = new JSDOM('<div data-nas-root data-standalone="true"></div>', {
+    url: "https://example.test/", runScripts: "outside-only",
+  });
+  for (const file of ["expense-projects.js", "ledger-import.js", "nas-connection.js", "nas-model.js"]) {
+    dom.window.eval(fs.readFileSync(path.join(__dirname, "../..", file), "utf8"));
+  }
+  const content = fs.readFileSync(path.join(__dirname, "../../nas-ui.js"), "utf8")
+    .replace(/document.addEventListener\("DOMContentLoaded",[\s\S]*?\n  \);/, "");
+  dom.window.eval(content);
+  const node = dom.window.document.querySelector("[data-nas-root]");
+  dom.window.AssetTrackerNASUI.mount(node);
+  t.after(() => dom.window.close());
+  assert.equal(node.querySelector('[data-nas-action="login-mode"]').getAttribute('aria-pressed'), 'true');
+  assert.match(node.textContent, /本地账本不会自动上传/);
+  node.querySelector('input[name="username"]').value = 'synthetic_user';
+  node.querySelector('input[name="password"]').value = 'synthetic-password';
+  node.querySelector('[data-nas-action="join-mode"]').click();
+  assert.equal(node.querySelector('[data-nas-action="join-mode"]').getAttribute('aria-pressed'), 'true');
+  assert.ok(node.querySelector('input[name="code"]'));
+  assert.equal(node.querySelector('input[name="username"]').value, 'synthetic_user');
+  assert.equal(node.querySelector('input[name="password"]').value, 'synthetic-password');
+});
 test("conflict retains form values, refresh preserves the draft, and retry applies it once", async (t) => {
   const f = await ui(t);
   let form = f.doc.querySelector('[data-nas-form="entry"]');

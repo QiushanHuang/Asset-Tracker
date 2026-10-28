@@ -1,6 +1,6 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs');
 const {JSDOM}=require('../app/node_modules/jsdom');const {loadAssetTracker}=require('./helpers/asset-tracker-harness');
-function fixture(t,extra={}){const dom=new JSDOM(fs.readFileSync(require.resolve('../index.html'),'utf8'),{url:'http://localhost'});const listen=dom.window.document.addEventListener.bind(dom.window.document);dom.window.document.addEventListener=(name,...args)=>{if(name!=='DOMContentLoaded')listen(name,...args);};const app=loadAssetTracker({document:dom.window.document,lockManager:{request:async(_name,callback)=>callback()},...extra});app.context.URL=dom.window.URL;app.context.AbortController=AbortController;const tracker=new app.AssetTracker();tracker.data=tracker.getDefaultState();t.after(()=>{app.dispose();dom.window.close();});return {tracker,doc:dom.window.document,app};}
+function fixture(t,extra={}){const dom=new JSDOM(fs.readFileSync(require.resolve('../index.html'),'utf8'),{url:'http://localhost'});const listen=dom.window.document.addEventListener.bind(dom.window.document);dom.window.document.addEventListener=(name,...args)=>{if(name!=='DOMContentLoaded')listen(name,...args);};const app=loadAssetTracker({document:dom.window.document,lockManager:{request:async(_name,callback)=>callback()},...extra});app.context.URL=dom.window.URL;app.context.AbortController=AbortController;const tracker=new app.AssetTracker();tracker.data=tracker.getDefaultState();tracker.setupNavigation();t.after(()=>{app.dispose();dom.window.close();});return {tracker,doc:dom.window.document,app};}
 test('approved workspace exposes cashflow, assistant, review and module settings',t=>{const {doc}=fixture(t);for(const id of ['workspace-cashflow','workspace-assistant','workspace-review','workspace-settings'])assert.ok(doc.getElementById(id),id);});
 test('module preferences persist independently from the ledger and cancel does not apply draft edits',async t=>{
   const {tracker}=fixture(t);assert.equal(typeof tracker.setupWorkspace,'function');await tracker.setupWorkspace();
@@ -99,4 +99,62 @@ test('successful confirmation clears the submitted assistant text and its stale 
   const {tracker,doc}=fixture(t);await tracker.setupWorkspace();tracker.assertWritable=()=>{};tracker.saveData=async()=>{};tracker.refreshDataViews=()=>{};
   const text='午餐32元';tracker.ws.drafts=[{id:'done',source:'assistant',status:'pending',sourceText:text,proposal:{date:'2026-09-26',amount:'32',direction:'expense',currency:'CNY',accountId:'cash-cny',purpose:'餐饮美食',description:'午餐',projectId:'',expenseCategoryId:''}}];tracker.ws.reviewBasis=JSON.stringify(tracker.data);doc.getElementById('workspace-review').classList.add('active');doc.getElementById('workspace-agent-input').value=text;
   await tracker.commitWorkspaceDrafts(['done']);assert.equal(doc.getElementById('workspace-agent-input').value,'');assert.match(doc.getElementById('workspace-agent-result').textContent,/已保存/);
+});
+
+test('offline recognition creates review drafts without invoking a provider or changing balances',async t=>{
+ const {tracker}=fixture(t);await tracker.setupWorkspace();const before=JSON.stringify(tracker.data);tracker.workspaceModelTransport=async()=>{throw Error('unexpected model request');};
+ assert.equal(typeof tracker.recognizeWorkspaceText,'function');await tracker.recognizeWorkspaceText('2026-10-02 午餐支出32元，现金 / 人民币');
+ assert.equal(tracker.ws.drafts.length,1);assert.equal(tracker.ws.drafts[0].source,'offline');assert.equal(tracker.ws.drafts[0].proposal.amount,'32');assert.equal(JSON.stringify(tracker.data),before);
+});
+test('duplicate detail shows matched record and clears consent after editing',async t=>{
+ const {tracker,doc}=fixture(t);await tracker.setupWorkspace();tracker.assertWritable=()=>{};tracker.saveData=async()=>{};tracker.refreshDataViews=()=>{};
+ const p={date:'2026-09-26',amount:'32',direction:'expense',currency:'CNY',accountId:'cash-cny',purpose:'餐饮美食',description:'午餐',projectId:'',expenseCategoryId:''};
+ tracker.data.transactions.push({id:'old',date:p.date,amount:-32,currency:'CNY',accountId:'cash-cny',category:'现金',subcategory:'人民币',description:'午餐',type:'单次',purpose:p.purpose});
+ const d={id:'new',source:'assistant',status:'pending',proposal:p};tracker.ws.drafts=[d];tracker.ws.focusId=d.id;tracker.renderWorkspaceReview();
+ assert.match(doc.getElementById('workspace-review-detail').textContent,/old/);assert.equal(tracker.ws.drafts[0].suspected,true);assert.equal(await tracker.commitWorkspaceDrafts([d.id]),false);
+ const choice=doc.getElementById('ws-draft-duplicate');choice.checked=true;choice.dispatchEvent(new doc.defaultView.Event('change',{bubbles:true}));
+ assert.ok(tracker.ws.drafts[0].duplicateDecision);const description=doc.getElementById('ws-draft-description');description.value=' 午餐 ';description.dispatchEvent(new doc.defaultView.Event('input',{bubbles:true}));assert.equal(tracker.ws.drafts[0].duplicateDecision,undefined);
+ assert.equal(await tracker.commitWorkspaceDrafts([d.id]),false);
+});
+test('review can correct transaction time and preserves an untouched precise timestamp',async t=>{
+ const {tracker,doc}=fixture(t);await tracker.setupWorkspace();await tracker.recognizeWorkspaceText('2026-10-02 12:30:15 午餐支出32元，现金 / 人民币');
+ assert.equal(doc.getElementById('ws-draft-time').value,'12:30:15');
+ const time=doc.getElementById('ws-draft-time');time.value='13:10:30';time.dispatchEvent(new doc.defaultView.Event('input',{bubbles:true}));assert.equal(tracker.ws.drafts[0].proposal.date,'2026-10-02T13:10:30');
+});
+test('oversized spreadsheet previews cannot silently discard trailing bill rows',async t=>{
+ const {tracker,doc,app}=fixture(t);await tracker.setupWorkspace();tracker.openWorkspaceRecognition();
+ const X=require('../vendor/xlsx.full.min.js');app.context.XLSX=X;
+ const rows=[['交易时间','金额(元)','收/支','支付方式'],...Array.from({length:1105},()=>['2026-10-02',32,'支出','现金 / 人民币'])];
+ const b=X.utils.book_new();X.utils.book_append_sheet(b,X.utils.aoa_to_sheet(rows),'bill');
+ tracker.fileAdapter.openImport=async()=>({fileName:'large.xlsx',encoding:'base64',text:X.write(b,{bookType:'xlsx',type:'base64'})});
+ await doc.getElementById('ws-recognition-file').onclick();assert.match(doc.getElementById('ws-recognition-status').textContent,/超过|上限/);assert.equal(tracker.ws.drafts.length,0);
+});
+
+test('selecting review rows preserves the editor node, selection and unsaved text',async t=>{
+ const {tracker,doc}=fixture(t);await tracker.setupWorkspace();
+ tracker.ws.drafts=['a','b'].map((id,i)=>({id,status:'pending',source:'manual',proposal:{date:'2026-10-02',amount:String(20+i),direction:'expense',currency:'CNY',accountId:'cash-cny',purpose:'',description:id,projectId:'',expenseCategoryId:''}}));tracker.ws.focusId='a';tracker.renderWorkspaceReview();
+ const input=doc.getElementById('ws-draft-description');input.value='editing';input.focus();input.setSelectionRange(2,4);input.dispatchEvent(new doc.defaultView.Event('input',{bubbles:true}));
+ const checkbox=doc.querySelector('[data-select-draft="b"]');checkbox.checked=true;checkbox.dispatchEvent(new doc.defaultView.Event('change',{bubbles:true}));
+ assert.equal(doc.getElementById('ws-draft-description'),input);assert.equal(doc.activeElement,input);assert.equal(input.selectionStart,2);assert.equal(input.selectionEnd,4);assert.equal(input.value,'editing');assert.equal(tracker.ws.selected.has('b'),true);
+});
+test('changing review focus reuses list rows and shows the selected draft',async t=>{
+ const {tracker,doc}=fixture(t);await tracker.setupWorkspace();tracker.ws.drafts=['a','b'].map((id,i)=>({id,status:'pending',source:'manual',proposal:{date:'2026-10-02',amount:String(20+i),direction:'expense',currency:'CNY',accountId:'cash-cny',purpose:'',description:id,projectId:'',expenseCategoryId:''}}));tracker.ws.focusId='a';tracker.renderWorkspaceReview();
+ const row=doc.querySelector('[data-ws-action="select-draft"][data-id="b"]');tracker.workspaceAction('select-draft',{dataset:{id:'b'}});
+ assert.equal(doc.querySelector('[data-ws-action="select-draft"][data-id="b"]'),row);assert.equal(doc.getElementById('ws-draft-description').value,'b');
+});
+test('review actions are outside the scroll region and conflict gating stays explicit',async t=>{
+ const {tracker,doc}=fixture(t);await tracker.setupWorkspace();await tracker.recognizeWorkspaceText('2026-10-02 午餐支出32元，现金 / 人民币');await tracker.recognizeWorkspaceText('2026-10-02 午餐支出32元，现金 / 人民币');
+ const scroll=doc.querySelector('.ws-draft-scroll'),actions=doc.querySelector('.ws-review-detail-actions');assert.ok(scroll);assert.ok(actions);assert.equal(scroll.contains(actions),false);
+ assert.equal(doc.getElementById('ws-confirm-draft').disabled,true);assert.match(doc.getElementById('ws-draft-submit-hint').textContent,/重复|核对/);
+ const choice=doc.getElementById('ws-draft-duplicate');choice.checked=true;choice.dispatchEvent(new doc.defaultView.Event('change',{bubbles:true}));assert.equal(doc.getElementById('ws-confirm-draft').disabled,false);
+});
+test('offline recognition opens with the existing text field focused',async t=>{
+ const {tracker,doc}=fixture(t);await tracker.setupWorkspace();tracker.openWorkspaceRecognition();assert.equal(doc.activeElement,doc.getElementById('ws-recognition-text'));
+});
+test('full source remains readable for dismissed drafts and read-only workspace',async t=>{
+ const {tracker,doc}=fixture(t);await tracker.setupWorkspace();
+ for(const [status,readOnly] of [['dismissed',false],['pending',true]]){
+  tracker.ws.filter=status;tracker.ws.storageReadOnly=readOnly;tracker.ws.drafts=[{id:'source',status,source:'offline',sourceText:'完整原文 marker-123',proposal:{date:'2026-10-02',amount:'20',direction:'expense',currency:'CNY',accountId:'cash-cny',description:'只读测试',purpose:'',projectId:'',expenseCategoryId:''}}];tracker.renderWorkspaceReview();
+  doc.querySelector('[data-ws-action="draft-source"]').click();assert.match(doc.getElementById('modal-body').textContent,/marker-123/);tracker.closeModal();
+ }
 });

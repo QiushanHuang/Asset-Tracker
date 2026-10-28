@@ -9,8 +9,8 @@
 ### macOS
 
 1. Download the Apple-silicon macOS archive and `SHA256SUMS.txt` from the same release.
-2. In the download directory, compare `shasum -a 256 AssetTracker-v3.4.0-macos-arm64.zip` with its checksum entry.
-3. Unzip and move `AssetTracker.app` to Applications if desired. The application is unsigned and not notarized; macOS may require your explicit approval in Privacy & Security.
+2. In the download directory, compare `shasum -a 256 AssetTracker-v3.5.0-macos-arm64.zip` with its checksum entry.
+3. Unzip and move `AssetTracker.app` to Applications if desired. The application is ad-hoc signed, not Developer ID signed or notarized; macOS may require your explicit approval in Privacy & Security.
 4. Open the application. A new installation starts with an empty book and default funding categories; it contains no author's ledger.
 
 The native book is outside the application bundle:
@@ -73,8 +73,7 @@ and clears amount/description only after a successful save.
 
 ### Find and edit a record
 
-Use text search, account/project filters and date bounds. A project filter shows
-its full date range; use **清除筛选** if expected records are missing. List page size adapts to the window, up to 50 records per page. Editing project attribution does not create a second money
+Use text search, account/project filters and date bounds. Changing the project filter keeps the selected date range; use **清除筛选** if expected records are missing. List page size adapts to the window, up to 50 records per page. Editing project attribution does not create a second money
 movement.
 
 ### Analysis and recurring rules
@@ -87,9 +86,13 @@ a promise of server-side scheduling.
 
 ## Workspace and model-assisted entry
 
-Open **编辑首页** or **设置与连接 → 外观与模块** to choose module visibility, order and width. Theme, density, main metric, date period and recent-row count are device preferences. Preview changes, then save or cancel. Hiding the assistant does not revoke model consent; use **模型与连接** to disable it.
+Open **编辑首页** or **界面与模型 → 外观与模块** to choose module visibility, order and width. Theme, density, main metric, date period and recent-row count are device preferences. Preview changes, then save or cancel. Hiding the assistant does not revoke model consent; use **模型与连接** to disable it.
 
 The overview uses the window's available height. Additional modules use pages, record lists paginate and analysis/settings use tabs. On narrow windows, pending-review details open separately with a return-to-list control. Long source text and expanded trees retain area scrolling.
+
+### Offline recognition
+
+Choose **离线识别** in the assistant or **识别账单** in the review page. Paste text or select a supported text/table file to prepare editable drafts. On Mac, **选择图片** uses the system Vision engine on the selected image. Check dates, amounts and accounts before confirming; recognition does not post a bill automatically. Original payment and bank statements continue through their dedicated audited import flow.
 
 ### Connect an existing model
 
@@ -197,7 +200,7 @@ balance with the original records. This release does not rewrite existing books.
 
 ### 安装与更新
 
-**macOS：**下载同一版本的 Apple 芯片安装包和 `SHA256SUMS.txt`，通过 `shasum -a 256 文件名`核对摘要后解压。应用未签名、未公证，必要时由你在系统“隐私与安全性”中允许打开。
+**macOS：**下载同一版本的 Apple 芯片安装包和 `SHA256SUMS.txt`，通过 `shasum -a 256 文件名`核对摘要后解压。应用使用临时签名，未做 Developer ID 分发签名或公证；必要时由你在系统“隐私与安全性”中允许打开。
 
 全新安装只有空账本和默认账户分类，不包含作者的真实数据。正式账本位于：
 
@@ -222,7 +225,7 @@ open -n /path/to/AssetTracker.app --args --preview
 2. **添加账单**：快捷表单输入正数金额，再选收入/支出；表格导入则使用收入为正、支出为负的金额。
 3. **项目账本**：旅行、装修或活动分别建立项目，可套用旅游模板。各项目消费分类独立，最多三级；允许记在父分类，汇总会包含下级并显示本级直接记录。
 4. **当前项目**只在本次会话生效，重启恢复日常记账。**保存并继续**只在保存确认后清空金额/备注，保留有用的账户和项目选择。
-5. 使用搜索、账户/项目和日期筛选寻找记录，每页条数随窗口调整，最多50笔。项目筛选会显示项目全部日期；找不到记录时先清除筛选。
+5. 使用搜索、账户/项目和日期筛选寻找记录，每页条数随窗口调整，最多50笔。切换项目筛选会保留已选日期；找不到记录时先清除筛选。
 
 项目归属修改不会生成第二笔资金变动。已经使用的分类不能随意删除；完成的项目可归档，历史记录继续保留。
 
@@ -232,7 +235,9 @@ open -n /path/to/AssetTracker.app --args --preview
 
 ### 首页与模型助手
 
-在“编辑首页”或“设置与连接 → 外观与模块”选择模块显示、顺序、宽度、主题、密度、主指标、默认期间和最近账单条数。先预览，再保存或取消。隐藏助手只影响显示，停用模型请到“模型与连接”。
+在助手选择“离线识别”，或在待核对页选择“识别账单”，可粘贴文字或选择文本、表格文件生成草稿。Mac 的“选择图片”使用系统 Vision 在本机提取文字；日期、金额和账户需要核对，确认后才入账。原始支付平台和银行账单仍使用独立的导入核对流程。
+
+在“编辑首页”或“界面与模型 → 外观与模块”选择模块显示、顺序、宽度、主题、密度、主指标、默认期间和最近账单条数。先预览，再保存或取消。隐藏助手只影响显示，停用模型请到“模型与连接”。
 
 首页按窗口高度分配空间，更多模块和长账单分页，分析与设置按组切换。窄窗口核对页在列表和详情间切换；长原文与展开账户树保留区域滚动。
 
@@ -259,7 +264,7 @@ Mac 密钥按账本目录和服务地址保存在钥匙串；浏览器密钥只�
 | --- | --- |
 | Excel/CSV导入 | 先预检、预览，再确认追加；单次最多50,000行 |
 | Excel导出 | 账单和账户余额表，含稳定记录/账户/项目/分类ID |
-| 本地完整JSON导入 | 校验后替换整个本地账本，替换前先请求导出原账本 |
+| 本地完整JSON导入 | 在“恢复与重置”中选择；校验后替换整个本地账本，替换前先请求导出原账本 |
 | NAS JSON导入/上传 | 创建新的个人私有账本 |
 | NAS JSON导出 | 导出所选账本，不包含账号、成员权限和服务版本历史 |
 

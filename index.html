@@ -36,9 +36,9 @@
         <nav class="sidebar" aria-label="主导航">
             <div class="logo">
                 <img class="brand-icon" src="assets/asset-tracker-logo-v3.png" alt="" width="56" height="56">
-                <h1>Asset Tracker</h1><p>个人资产账本</p>
+                <h1>Asset Tracker</h1>
             </div>
-            <ul class="nav-menu workspace-navigation">
+            <ul id="workspace-navigation" class="nav-menu workspace-navigation">
                 <li><a href="#dashboard" class="nav-link active" aria-current="page" data-section="dashboard"><img src="assets/icons/home.svg" alt="">总览</a></li>
                 <li><a href="#transactions" class="nav-link" data-section="transactions"><img src="assets/icons/receipt.svg" alt="">账单</a></li>
                 <li class="nav-subitem"><a href="#workspace-review" class="nav-link" data-section="workspace-review">待核对 <span id="workspace-review-badge" class="ws-badge">0</span></a></li>
@@ -49,10 +49,10 @@
                 <li><a href="#categories" class="nav-link ws-secondary-nav" data-section="categories">资金账户</a></li>
                 <li><a href="#import-export" class="nav-link ws-secondary-nav" data-section="import-export">导入与备份</a></li>
                 <li><a href="#nas" class="nav-link ws-secondary-nav" data-section="nas">NAS 与家庭账本</a></li>
-                <li><a href="#settings" class="nav-link ws-secondary-nav" data-section="settings">账本设置</a></li>
-                <li class="workspace-settings-link"><a href="#workspace-settings" class="nav-link" data-section="workspace-settings"><img src="assets/icons/settings.svg" alt="">设置与连接</a></li>
+                <li><a href="#settings" class="nav-link ws-secondary-nav" data-section="settings">账本与汇率</a></li>
+                <li class="workspace-settings-link"><a href="#workspace-settings" class="nav-link" data-section="workspace-settings"><img src="assets/icons/settings.svg" alt="">界面与模型</a></li>
             </ul>
-            <div class="sidebar-footer"><span class="local-badge">本地账本</span><p>收支有迹可循，资产心中有数。</p></div>
+            <div class="sidebar-footer"><span class="local-badge">本地账本</span></div>
         </nav>
 
         <!-- 主内容区域 -->
@@ -60,7 +60,7 @@
             <!-- 头部工具栏 -->
             <header class="header">
                 <div class="header-left">
-                    <p class="eyebrow">个人账本 · 本地</p><h2 id="section-title" tabindex="-1">总览</h2><div id="workspace-period-controls"><label class="sr-only" for="workspace-period">总览期间</label><select id="workspace-period"><option value="month-to-date">本月</option><option value="last-30-days">最近 30 天</option></select><span id="workspace-period-label"></span></div>
+                    <h2 id="section-title" tabindex="-1">总览</h2><div id="workspace-period-controls"><label class="sr-only" for="workspace-period">总览期间</label><select id="workspace-period"><option value="month-to-date">本月</option><option value="last-30-days">最近 30 天</option></select><span id="workspace-period-label"></span></div>
                 </div>
                 <div class="header-right">
                     <button type="button" class="btn btn-secondary" id="workspace-edit-layout"><img src="assets/icons/adjustments-horizontal.svg" alt="">编辑首页</button><button class="btn btn-primary" id="add-transaction-btn">+ 添加账单</button>
@@ -71,7 +71,6 @@
 
             <div id="active-project-status" class="active-project-status" role="status" aria-live="polite"></div>
             <section id="projects" class="content-section">
-                <div class="card-header"><div><h3>为一件事，记一本明白账</h3><p class="helper-text">项目独立分类 · 最多三级 · 与资金账户分开</p></div><button type="button" class="btn btn-primary" data-project-action="new">新建项目</button></div>
                 <div class="project-workspace"><aside id="project-list" aria-label="项目列表"></aside><div id="project-detail" class="card"></div></div>
             </section>
             <!-- 资产概览页面 -->
@@ -83,19 +82,20 @@
                         <button class="summary-item" type="button" onclick="assetTracker.showAssetDetails('balance')"><span class="label">资产余额</span><strong class="value current-balance">¥0.00</strong></button>
                         <button class="summary-item" type="button" onclick="assetTracker.showAssetDetails('debt')"><span class="label">待还款</span><strong class="value debt-assets">¥0.00</strong></button>
                         <div class="ws-legacy-values" hidden><span class="digital-assets"></span><span class="cash-assets"></span></div>
-                        <p id="net-assets-note" class="helper-text">当前余额，按设置汇率折算</p>
+                        <details class="ui-info"><summary aria-label="净资产计算口径">i</summary><div class="ui-info-panel">净资产按资产余额减去待还款；负债溢缴计入资产权益。使用当前设置汇率。</div></details>
+                        <p id="net-assets-note" class="helper-text" role="status"></p>
                     </section>
                     <section class="ws-module chart-container ws-trend" data-ws-module="trend">
-                        <div class="chart-header"><h3>净资产趋势</h3><div class="chart-controls"><select id="trend-time-range" aria-label="趋势时间范围"><option value="7">7 天</option><option value="30" selected>30 天</option><option value="90">90 天</option><option value="180">半年</option><option value="365">一年</option><option value="all">全部</option></select><button class="btn btn-sm" onclick="assetTracker.updateAssetTrendChart()">刷新</button></div></div>
-                        <div class="chart-plot"><canvas id="assetTrendChart" role="img" aria-label="净资产、余额与债务趋势"></canvas></div><p class="helper-text">按当前余额与账单回推，使用当前设置汇率。</p>
+                        <div class="chart-header"><div class="ui-title"><h3>净资产趋势</h3><details class="ui-info"><summary aria-label="净资产趋势计算口径">i</summary><div class="ui-info-panel">按当前余额与账单回推，使用当前设置汇率。</div></details></div><div class="chart-controls"><select id="trend-time-range" aria-label="趋势时间范围"><option value="7">7 天</option><option value="30" selected>30 天</option><option value="90">90 天</option><option value="180">半年</option><option value="365">一年</option><option value="all">全部</option></select><button class="btn btn-sm" onclick="assetTracker.updateAssetTrendChart()">刷新</button></div></div>
+                        <div class="chart-plot"><canvas id="assetTrendChart" role="img" aria-label="净资产、余额与债务趋势"></canvas></div>
                     </section>
                     <section class="ws-module" data-ws-module="review" id="workspace-review-summary"></section>
                     <section class="ws-module recent-transactions" data-ws-module="recent"><div class="ws-section-heading"><h3>最近账单</h3><button type="button" class="ws-text-button" data-ws-action="transactions">查看全部</button></div><div id="recent-transactions-list"></div></section>
                     <section class="ws-module" data-ws-module="automation" id="workspace-automation-summary"></section>
                     <section class="ws-module ws-assistant" data-ws-module="assistant" id="workspace-assistant">
-                        <div class="ws-assistant-title"><img src="assets/icons/sparkles.svg" alt=""><div><h3>账本助手</h3><p>有依据的整理，确认后入账</p></div></div>
+                        <div class="ws-assistant-title"><img src="assets/icons/sparkles.svg" alt=""><div><h3>账本助手</h3></div></div>
                         <form id="workspace-agent-form"><label class="sr-only" for="workspace-agent-input">输入账单或问题</label><input id="workspace-agent-input" maxlength="4000" placeholder="记一笔：今天午餐 32 元，用现金…" autocomplete="off"><button class="btn btn-primary" type="submit" id="workspace-agent-submit">生成草稿</button></form>
-                        <div class="ws-assistant-actions"><button type="button" data-ws-action="explain" class="ws-text-button">解释本月收支</button><button type="button" data-ws-action="duplicates" class="ws-text-button">检查重复</button><button type="button" data-ws-action="connection" class="ws-text-button">模型连接</button><button type="button" data-ws-action="cancel-agent" id="workspace-agent-cancel" hidden class="ws-text-button">取消任务</button></div>
+                        <div class="ws-assistant-actions"><label class="ws-recognition-mode"><span>处理方式</span><select id="workspace-recognition-mode" aria-label="账单处理方式"><option value="offline">离线识别</option><option value="agent">模型助手</option></select></label><button type="button" data-ws-action="recognize-bill" class="ws-text-button">识别文件 / 收据</button><button type="button" data-ws-action="explain" class="ws-text-button">解释本月收支</button><button type="button" data-ws-action="duplicates" class="ws-text-button">检查重复</button><button type="button" data-ws-action="connection" class="ws-text-button">模型连接</button><button type="button" data-ws-action="cancel-agent" id="workspace-agent-cancel" hidden class="ws-text-button">取消任务</button></div>
                         <div id="workspace-agent-result" role="status" aria-live="polite"></div>
                     </section>
                     <section class="ws-module chart-container" data-ws-module="allocation"><div class="chart-header"><h3>资产分布</h3><select id="pie-chart-level" aria-label="资产分布层级"><option value="top">顶级分类</option><option value="all" selected>所有子分类</option><option value="leaf">最底层分类</option></select></div><div class="chart-plot"><p id="asset-pie-empty" class="chart-empty" hidden>暂无正资产分布</p><canvas id="assetPieChart" role="img" aria-label="资产分类分布"></canvas></div></section>
@@ -105,14 +105,14 @@
                 <div id="workspace-empty-layout" class="ws-empty" hidden>首页模块已隐藏。<button type="button" class="btn btn-secondary" data-ws-action="layout">编辑首页</button></div>
             </section>
             <section id="workspace-review" class="content-section"><p id="workspace-review-status" class="ws-status" role="status" aria-live="polite"></p><div class="ws-review-layout"><div class="ws-review-main"><div id="workspace-review-toolbar"></div><div id="workspace-review-list" aria-label="待核对记录"></div></div><aside id="workspace-review-detail" aria-label="记录详情"></aside></div></section>
-            <section id="workspace-settings" class="content-section"><div class="ws-settings-tabs"><button type="button" class="btn btn-secondary" data-ws-action="layout">外观与模块</button><button type="button" class="btn btn-secondary" data-ws-action="connection">模型与连接</button></div><p id="workspace-settings-status" class="ws-status" role="status" aria-live="polite"></p><div id="workspace-layout-settings"></div><div id="workspace-connection-settings" hidden></div></section>
+            <section id="workspace-settings" class="content-section"><div class="ws-settings-tabs" aria-label="设置分类"><button type="button" class="btn btn-secondary" data-ws-action="layout" aria-pressed="true">外观与模块</button><button type="button" class="btn btn-secondary" data-ws-action="connection" aria-pressed="false">模型与连接</button></div><p id="workspace-settings-status" class="ws-status" role="status" aria-live="polite"></p><div id="workspace-layout-settings"></div><div id="workspace-connection-settings" hidden></div></section>
             <!-- 分类管理页面 -->
             <section id="categories" class="content-section">
                 <div class="categories-container">
                     <div class="card">
                         <div class="card-header">
-                            <h3>资金账户</h3><p class="helper-text">这里管理钱存在哪里；餐饮、住宿等消费用途在项目账本中分类。</p>
-                            <button class="btn btn-primary" id="add-category-btn">+ 添加分类</button>
+                            <h3>账户列表</h3>
+                            <button class="btn btn-primary" id="add-category-btn">+ 添加账户或分组</button>
                         </div>
                         <div class="categories-tree" id="categories-tree">
                             <!-- 分类树将在这里动态生成 -->
@@ -126,9 +126,9 @@
                 <div class="transactions-container">
                     <div class="card">
                         <div class="card-header">
-                            <div><h3>账单记录</h3><p id="transaction-range" class="helper-text"></p></div>
+                            <p id="transaction-range" class="helper-text" aria-live="polite"></p>
                         </div>
-                        <div class="project-filter-bar"><label for="project-filter">项目</label><select id="project-filter"><option value="">全部项目</option></select><select id="project-category-filter" aria-label="筛选项目消费分类" hidden><option value="">全部消费分类</option></select><span class="helper-text">选择项目时查看该项目全部日期</span></div>
+                        <div class="project-filter-bar"><label for="project-filter">项目</label><select id="project-filter"><option value="">全部项目</option></select><select id="project-category-filter" aria-label="筛选项目消费分类" hidden><option value="">全部消费分类</option></select></div>
                         <div class="transaction-toolbar">
                             <input type="search" id="transaction-search" placeholder="搜索描述、分类或金额" aria-label="搜索账单">
                             <div class="filter-controls">
@@ -137,7 +137,7 @@
                                 </select>
                                 <label>从 <input type="date" id="date-from" aria-label="开始日期"></label>
                                 <label>至 <input type="date" id="date-to" aria-label="结束日期"></label>
-                                <button class="btn btn-secondary" id="filter-btn">筛选</button><button class="btn btn-secondary" id="clear-transaction-filters">清除筛选</button>
+                                <button class="btn btn-secondary" id="filter-btn" hidden>筛选</button><button class="btn btn-secondary" id="clear-transaction-filters">清除筛选</button>
                             </div>
                         </div>
                         <div class="transactions-table" tabindex="0" role="region" aria-label="账单列表，可横向滚动">
@@ -169,7 +169,7 @@
                 <div class="automation-container">
                     <div class="card">
                         <div class="card-header">
-                            <h3>自动记账规则</h3>
+                            <h3>周期记账规则</h3>
                             <button class="btn btn-primary" id="add-rule-btn">+ 添加规则</button>
                         </div>
                         <div id="automation-rules">
@@ -235,7 +235,7 @@
                         <h3>汇率设置</h3>
                         <div class="currency-settings">
                             <div class="form-group">
-                                <label>基准币种</label>
+                                <label for="base-currency">基准币种</label>
                                 <select id="base-currency">
                                     <option value="CNY">人民币 (CNY)</option>
                                     <option value="SGD">新加坡元 (SGD)</option>
@@ -258,7 +258,7 @@
                                 </label>
                             </div>
                             <div class="form-group">
-                                <label>备份间隔（小时）</label>
+                                <label for="backup-interval">备份间隔（小时）</label>
                                 <input type="number" id="backup-interval" min="1" max="168" value="24">
                             </div>
                             <button class="btn btn-primary" id="save-backup-btn">保存备份设置</button>
@@ -269,26 +269,26 @@
                         <div class="asset-initialization">
                             <p>设置指定时间节点的资产初始值，独立于历史交易记录</p>
                             <div class="form-group">
-                                <label>初始化时间</label>
+                                <label for="init-asset-time">初始化时间</label>
                                 <input type="datetime-local" id="init-asset-time" required>
                             </div>
                             <div class="form-group">
-                                <label>选择资产分类</label>
+                                <label for="init-asset-category">选择资产分类</label>
                                 <select id="init-asset-category" required>
                                     <option value="">请选择分类</option>
                                 </select>
                             </div>
                             <div class="form-group">
-                                <label>子分类（可选）</label>
+                                <label for="init-asset-subcategory">子分类（可选）</label>
                                 <select id="init-asset-subcategory">
                                     <option value="">请选择子分类</option>
                                 </select>
                             </div>
                             <div class="form-group">
-                                <label>初始余额</label>
+                                <label for="init-asset-amount">初始余额</label>
                                 <div class="amount-input-group">
                                     <input type="number" id="init-asset-amount" step="0.01" required>
-                                    <select id="init-asset-currency" class="currency-selector">
+                                    <select id="init-asset-currency" class="currency-selector" aria-label="初始余额币种">
                                         <option value="CNY">CNY ¥</option>
                                         <option value="SGD">SGD S$</option>
                                         <option value="USD">USD $</option>
@@ -319,14 +319,12 @@
             <section id="import-export" class="content-section">
                 <div class="import-export-container">
                     <div class="card">
-                        <h3>追加账单</h3><p class="helper-text">微信 / 支付宝 / 工行 PDF / OCBC PDF：先预览，检查账户、错误与重复，再确认追加。不会覆盖现有账单。</p>
+                        <h3>追加账单</h3><p class="helper-text">导入前可预览，不覆盖现有账单。</p>
                         <div class="import-section">
                             <input type="file" id="import-file" accept=".xlsx,.csv,.pdf" hidden aria-label="选择账单表格或银行 PDF">
                             <button class="btn btn-primary" id="import-wechat-btn">导入微信 / 支付宝 / 银行</button>
                             <button class="btn btn-secondary" id="import-audit-btn">导入核对记录</button>
                             <button class="btn btn-secondary" id="import-btn">选择 Excel / CSV 并预览</button>
-                            <input type="file" id="import-book-file" accept=".json" style="display:none">
-                            <button class="btn btn-secondary" id="import-book-btn">导入完整账本（替换）</button>
                             <a href="#" id="download-template" class="btn btn-secondary">下载Excel模板</a>
                         </div>
                     </div>
@@ -341,10 +339,10 @@
                         </div>
                     </div>
                 </div>
-                <details class="card danger-zone"><summary>恢复与重置</summary><p class="helper-text">恢复默认会清空当前账本。请先导出完整 JSON 备份，再进行重置。</p><button type="button" class="btn btn-danger" id="reset-data-btn">恢复默认账本</button></details>
+                <section class="card danger-zone"><h3>恢复与重置</h3><p class="helper-text">导入完整账本会替换当前账户、账单和设置；替换前需要导出备份。</p><input type="file" id="import-book-file" accept=".json" hidden aria-label="选择完整账本"><button class="btn btn-secondary" id="import-book-btn">导入完整账本（替换）</button><p class="helper-text">恢复默认会清空当前账本。请先导出完整 JSON 备份，再进行重置。</p><button type="button" class="btn btn-danger" id="reset-data-btn">恢复默认账本</button></section>
             </section>
         </main>
-        <nav id="workspace-mobile-nav" aria-label="移动导航"><button type="button" data-ws-action="dashboard">总览</button><button type="button" data-ws-action="transactions">账单</button><button type="button" class="ws-mobile-primary" data-ws-action="quick-entry">记一笔</button><button type="button" data-ws-action="projects">项目</button><button type="button" data-ws-action="mobile-more">更多</button></nav>
+        <nav id="workspace-mobile-nav" aria-label="移动导航"><button type="button" data-ws-action="dashboard" aria-current="page">总览</button><button type="button" data-ws-action="transactions">账单</button><button type="button" class="ws-mobile-primary" data-ws-action="quick-entry">记一笔</button><button type="button" data-ws-action="projects">项目</button><button type="button" data-ws-action="mobile-more" aria-controls="workspace-navigation" aria-expanded="false">更多</button></nav>
     </div>
 
     <!-- 弹窗模态框 -->
@@ -362,6 +360,8 @@
     <script src="project-ui.js"></script>
     <script src="ledger-insights.js"></script>
     <script src="insights-ui.js"></script>
+    <script src="ledger-dedup.js"></script>
+    <script src="bill-recognition.js"></script>
     <script src="ledger-import.js"></script>
     <script src="payment-file.js"></script>
     <script src="wechat-import.js"></script>
@@ -374,6 +374,8 @@
     <script src="agent-provider.js"></script>
     <script src="workspace-fit.js"></script>
     <script src="workspace-ui.js"></script>
+    <script src="bill-ui.js"></script>
+    <script src="dedup-review-ui.js"></script>
     <script src="workspace-screen.js"></script>
     <script src="script.js"></script>
     <script src="nas-connection.js"></script>

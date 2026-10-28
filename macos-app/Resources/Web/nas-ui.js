@@ -298,7 +298,7 @@
     }
     function render() {
       if (!token) {
-        view.innerHTML = `<div class="nas-intro"><p class="eyebrow">个人 · 共同 · 家庭</p><h3>一本账，按你的边界共享</h3><p>个人账本默认只有自己可见。共同和家庭账本通过邀请加入，已有本地账目不会自动上传。</p></div><div class="nas-auth card"><div class="nas-actions">${button("login-mode", "登录")}${button("join-mode", "凭邀请加入")}${button("setup-mode", "首次初始化")}</div>
+        view.innerHTML = `<div class="nas-intro"><p>本地账本不会自动上传。</p></div><div class="nas-auth card"><div class="nas-actions" aria-label="连接方式">${button("login-mode", "登录", `aria-pressed="${mode === "login"}"`)}${button("join-mode", "凭邀请加入", `aria-pressed="${mode === "join"}"`)}${button("setup-mode", "首次初始化", `aria-pressed="${mode === "setup"}"`)}</div>
  <form data-nas-form="auth">${standalone ? '<p class="helper-text">已从 NAS 打开，无需填写服务地址。请使用记账服务的账户登录。</p>' : `<label>NAS 记账服务地址<input name="endpoint" type="url" value="${h(base)}" required placeholder="https://book.example.com" autocomplete="url"></label><p class="helper-text">填写部署后的记账服务地址，不是绿联管理后台或 UGREENlink 地址。</p>`}
  ${mode === "setup" ? '<label>初始化口令<input name="bootstrapToken" type="password" required autocomplete="off"></label>' : ""}${mode === "join" ? '<label>邀请口令<input name="code" required autocomplete="off"></label>' : ""}
  <label>用户名<input name="username" required minlength="3" maxlength="64" pattern="[A-Za-z0-9_.-]+" autocomplete="username"></label><label>密码<input name="password" type="password" required minlength="12" maxlength="256" autocomplete="${mode === "login" ? "current-password" : "new-password"}"></label><p class="helper-text">这是记账服务的独立账户，不使用绿联管理员密码。用户名为英文/数字，密码至少 12 位。</p><button class="btn btn-primary" type="submit">${mode === "setup" ? "创建第一个账户" : mode === "join" ? "注册并加入" : "连接并登录"}</button></form></div>`;
@@ -306,7 +306,7 @@
       }
       view.innerHTML = `<div class="nas-top"><div><h3>NAS 协作空间</h3><p class="helper-text">${h(me?.username)} · ${h(base)} · 在线保存 · ${ledgers.length} 本账</p></div><div class="nas-actions">${button("refresh", "刷新账本")}${button("import-json", "导入 JSON 为新私有账本")}${root.assetTracker ? button("upload-local", "复制本地账本") : ""}<input type="file" data-nas-import accept=".json" hidden aria-label="导入 NAS 私有账本">${retryButton()}${button("logout", "退出登录")}</div></div>
  ${current ? `<nav class="nas-jump" aria-label="账本快捷跳转">${current.role !== "viewer" ? '<a class="btn btn-secondary" href="#nas-entry">记一笔</a>' : ""}<a class="btn btn-secondary" href="#nas-history">看账单</a><a class="btn btn-secondary" href="#nas-household">家庭汇总</a></nav>` : ""}<div class="nas-workspace"><aside class="nas-ledgers" aria-label="NAS 账本">${ledgers.map((l) => button("open", `${h(l.name)}<small>${kind[l.kind]} · ${roles[l.role]}</small>`, `data-id="${h(l.id)}" class-extra="" aria-pressed="${current?.id === l.id}"`)).join("") || '<p class="helper-text">还没有账本，先创建一本。</p>'}<details class="card"><summary>新建账本</summary><form data-nas-form="create"><label>名称<input name="name" required maxlength="120"></label><label>归属<select name="kind"><option value="personal">个人私有</option><option value="shared">共同账本</option><option value="family">家庭账本</option></select></label><button type="submit" class="btn btn-primary">创建账本</button></form></details><details class="card"><summary>接受邀请</summary><form data-nas-form="accept"><label>邀请口令<input name="code" required></label><button type="submit" class="btn btn-primary">加入账本</button></form></details></aside>
- <div class="nas-detail">${current ? detail() : `<div class="card nas-empty"><h3>从一本个人账开始</h3><p>创建个人、共同或家庭账本。这里的账本存储在你连接的 NAS 上。</p>${root.assetTracker ? button("upload-local", "将本地账本复制为新的私有账本") : ""}</div>`}</div></div>${household()}`;
+ <div class="nas-detail">${current ? detail() : `<div class="card nas-empty"><h3>暂无账本</h3>${root.assetTracker ? button("upload-local", "将本地账本复制为新的私有账本") : ""}</div>`}</div></div>${household()}`;
     }
     function household() {
       const totals = M.household(ledgers, [...selected]);
@@ -481,8 +481,12 @@
       const a = b.dataset.nasAction;
       if (busy) return;
       if (a.endsWith("-mode")) {
+        const form = view.querySelector('form[data-nas-form="auth"]');
+        const values = Object.fromEntries(["endpoint", "username", "password"].map(name => [name, form?.elements[name]?.value || ""]));
         mode = a.split("-")[0];
         render();
+        const next = view.querySelector('form[data-nas-form="auth"]');
+        for (const [name, value] of Object.entries(values)) if (next?.elements[name]) next.elements[name].value = value;
         notify("");
         return;
       }

@@ -58,3 +58,47 @@ test('rule catch-up is a preview, clamps month-end and survives rule renames',()
   assert.deepEqual(drafts.map(d=>d.proposal.date),['2026-01-31','2026-02-28']);assert.equal(JSON.stringify(b),before);
   b.automationRules=[{...rule}];const saved=W.applyDrafts(b,drafts);assert.equal(saved.automationRules[0].lastExecuted,'2026-02-28');rule.name='新房租';assert.equal(W.ruleDrafts(saved,rule,'2026-03-02',schedule).length,0);
 });
+
+test('all draft sources require current duplicate evidence before committing',()=>{
+  const b=book(); b.transactions=[{id:'old',date:'2026-09-26T12:00',amount:-32,currency:'CNY',accountId:'cash',description:'午餐'}];
+  for(const source of ['offline','assistant','mcp','import']) {
+    const d={...draft(source),source};
+    assert.throws(()=>W.applyDrafts(b,[d]),/重复/);
+    const review=W.reviewDuplicates(b,d);assert.equal(review.matches[0].transactionId,'old');
+    d.duplicateDecision={signature:review.signature,action:'keep'};
+    assert.equal(W.applyDrafts(b,[d]).transactions.length,2);
+    d.proposal.description='午餐 ';assert.throws(()=>W.applyDrafts(b,[d]),/重复/);
+  }
+});
+test('duplicate decisions expire when matched evidence changes and batches are checked internally',()=>{
+  const b=book(),a=draft('a'),d=draft('b');
+  assert.throws(()=>W.applyDrafts(b,[a,d]),/重复/);
+  const next=W.applyDrafts(b,[a]);d.duplicateDecision={signature:W.reviewDuplicates(next,d).signature,action:'keep'};
+  next.transactions[0].description=' 午餐';assert.throws(()=>W.applyDrafts(next,[d]),/重复/);
+});
+test('source identities persist and conflicting IDs never silently commit',()=>{
+  const d=draft();d.sourceIdentity={provider:'alipay',id:'0000123456789'};
+  const b=W.applyDrafts(book(),[d]);assert.deepEqual(b.transactions[0].sourceIdentity,d.sourceIdentity);
+  const other={...draft('other'),sourceIdentity:d.sourceIdentity};
+  const review=W.reviewDuplicates(b,other);assert.equal(review.matches[0].level,'exact');
+  other.duplicateDecision={signature:review.signature,action:'keep'};assert.throws(()=>W.applyDrafts(b,[other]),/来源|已有|重复/);
+  d.proposal.amount='99';assert.throws(()=>W.applyDrafts(b,[d]),/冲突/);
+});
+test('reconciliation does not hide a conflicting import behind an existing receipt',()=>{
+ const d={...draft(),source:'import',sourceId:'same'},b=W.applyDrafts(book(),[d]);d.proposal.amount='90';
+ const recovered=W.reconcile(b,[d])[0];assert.equal(recovered.status,'pending');assert.match(recovered.error,/冲突/);
+});
+test('reconciling unchanged draft status retains editor identity without mutating status changes',()=>{
+ const b=book(),d=draft(),same=W.reconcile(b,[d]);assert.equal(same[0],d);
+ const saved=W.applyDrafts(b,[d]),next=W.reconcile(saved,[d]);assert.notEqual(next[0],d);assert.equal(next[0].status,'committed');assert.equal(d.status,'pending');
+});
+test('audit evidence changes invalidate duplicate cache and prior confirmation',()=>{
+ const b=book(),d=draft('audit');b.transactions=[{id:'old',date:d.proposal.date,amount:-32,currency:'CNY',accountId:'cash',description:'午餐'}];b.importAudits=[{provider:'icbc',items:[]}];
+ const before=W.duplicateReviewBasis(b,[d]);d.duplicateDecision={action:'keep',signature:W.reviewDuplicates(b,d).signature};
+ assert.equal(W.applyDrafts(b,[d]).transactions.length,2);b.importAudits[0].items.push({row:1,decision:'excluded',record:{id:'evidence',date:'2026-09-26T09:00:00',amount:20,currency:'CNY'}});
+ assert.notEqual(W.duplicateReviewBasis(b,[d]),before);assert.throws(()=>W.applyDrafts(b,[d]),/重新核对|重复/);
+});
+test('legacy account alias changes invalidate existing confirmation signatures',()=>{
+ const b=book(),d=draft('alias');b.transactions=[{id:'old',date:d.proposal.date,amount:-32,currency:'CNY',accountId:'cash',description:'午餐'}];b.categories.cash.sourceCategoryId='old-cash';
+ d.duplicateDecision={action:'keep',signature:W.reviewDuplicates(b,d).signature};b.categories.cash.sourceCategoryId='new-alias';assert.throws(()=>W.applyDrafts(b,[d]),/重新核对|重复/);
+});

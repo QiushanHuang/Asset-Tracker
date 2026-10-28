@@ -76,7 +76,7 @@ test('keyboard assistant shortcut selects its dashboard page before focusing the
 test('an active assistant remains visible when its status forces dashboard pagination',async t=>{
   const {tracker,doc} = fixture(t);
   await tracker.setupWorkspace();
-  const section = dashboardGeometry(doc,{height:470});
+  const section = dashboardGeometry(doc,{height:490});
   tracker.fitWorkspaceDashboard(section);
   assert.equal(tracker.ws.dashboardPlan.pages.length,1);
   const assistant = doc.getElementById('workspace-assistant'), input = doc.getElementById('workspace-agent-input');
@@ -193,4 +193,40 @@ test('book settings panels retain unsaved values when switching between their ca
     assert.equal(currency.value,'USD'); assert.equal(interval.value,'72'); assert.equal(amount.value,'1234.50');
   }
   assert.equal(JSON.stringify(tracker.data),before);
+});
+
+test('assistant sizing measures wrapped controls instead of its allocated stretched height',async t=>{
+  const {tracker,doc,app}=fixture(t);await tracker.setupWorkspace();
+  const card=doc.getElementById('workspace-assistant'), actions=card.querySelector('.ws-assistant-actions');
+  let allocatedHeight=500;
+  card.getBoundingClientRect=()=>({width:1000,height:allocatedHeight,top:0,bottom:allocatedHeight});
+  const rect=(top,height)=>({width:80,height,top,bottom:top+height});
+  card.querySelector('.ws-assistant-title img').getBoundingClientRect=()=>rect(10,24);
+  card.querySelector('.ws-assistant-title>div').getBoundingClientRect=()=>rect(10,40);
+  doc.getElementById('workspace-agent-input').getBoundingClientRect=()=>rect(60,36);
+  doc.getElementById('workspace-agent-submit').getBoundingClientRect=()=>rect(60,36);
+  [...actions.children].forEach((node,index)=>node.getBoundingClientRect=()=>rect(index<3?110:150,30));
+  app.context.getComputedStyle=node=>({paddingTop:node===card?'12px':'0px',paddingBottom:node===card?'12px':'0px',
+    borderTopWidth:'0px',borderBottomWidth:'0px',marginTop:node===actions?'6px':'0px',marginBottom:'0px',rowGap:node===card?'4px':'0px'});
+  tracker.ws.prefs.modules.forEach(module=>module.visible=['assets','assistant'].includes(module.id));
+  const section=dashboardGeometry(doc,{height:196});
+  tracker.fitWorkspaceDashboard(section);
+  assert.ok(tracker.ws.dashboardPlan.pages.length>1,'wrapped controls need their own readable page');
+  const before=JSON.stringify(tracker.ws.dashboardPlan);
+  allocatedHeight=1000;tracker.fitWorkspaceDashboard(section);
+  assert.equal(JSON.stringify(tracker.ws.dashboardPlan),before,'allocated grid stretch must not inflate the next fit');
+  const naturalMinimum=tracker.workspaceAssistantMinHeight(1000);
+  card.querySelector('.sr-only').getBoundingClientRect=()=>rect(-1000,1);
+  tracker.fitWorkspaceDashboard(section);
+  assert.equal(tracker.workspaceAssistantMinHeight(1000),naturalMinimum);
+  assert.equal(JSON.stringify(tracker.ws.dashboardPlan),before,'visually hidden accessible labels do not consume layout space');
+});
+
+test('unmeasurable narrow assistant reserves space for the existing title and actions',async t=>{
+  const {tracker,doc,app}=fixture(t);app.context.innerWidth=390;await tracker.setupWorkspace();
+  tracker.ws.prefs.modules.forEach(module=>module.visible=['assets','assistant'].includes(module.id));
+  const section=dashboardGeometry(doc,{height:195,width:390});tracker.fitWorkspaceDashboard(section);
+  assert.ok(tracker.ws.dashboardPlan.pages.length>1);
+  const assistant=tracker.ws.dashboardPlan.pages.flatMap(page=>page.items).find(item=>item.id==='assistant');
+  assert.ok(assistant.height>=142);
 });

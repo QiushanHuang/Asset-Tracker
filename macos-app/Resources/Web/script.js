@@ -2280,14 +2280,14 @@ class AssetTracker {
         const titles = {
                     'dashboard': '总览',
                     'workspace-review': '待核对',
-                    'workspace-settings': '设置与连接',
+                    'workspace-settings': '界面与模型',
                     'categories': '资金账户',
                     'projects': '项目账本',
                     'transactions': '账单记录',
-                    'automation': '自动记账',
+                    'automation': '自动化',
                     'analytics': '数据分析',
-                    'settings': '系统设置',
-                    'import-export': '导入导出',
+                    'settings': '账本与汇率',
+                    'import-export': '导入与备份',
                     'nas': 'NAS 与家庭账本'
                 };
                 document.getElementById('section-title').textContent = titles[targetSection];
@@ -2326,11 +2326,20 @@ class AssetTracker {
             clearTimeout(this.transactionSearchTimer);
             this.transactionSearchTimer = setTimeout(() => this.filterTransactions(), 150);
         });
+        for (const id of ['category-filter', 'date-from', 'date-to']) {
+            document.getElementById(id)?.addEventListener('change', () => this.filterTransactions());
+        }
         document.getElementById('clear-transaction-filters')?.addEventListener('click', () => this.resetTransactionFilters());
         document.getElementById('previous-transactions')?.addEventListener('click', () => this.changeTransactionPage(-1));
         document.getElementById('next-transactions')?.addEventListener('click', () => this.changeTransactionPage(1));
         document.getElementById('pie-chart-level')?.addEventListener('change', () => this.updateAssetPieChart());
         document.addEventListener('keydown', event => {
+            const region = event.target;
+            if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && region?.matches?.('.analysis-table, .transactions-table') && region.scrollWidth > region.clientWidth) {
+                event.preventDefault();
+                region.scrollLeft += event.key === 'ArrowRight' ? 80 : -80;
+                return;
+            }
             const modal = document.getElementById('modal');
             if (modal?.style.display !== 'block') return;
             if (event.key === 'Escape') { event.preventDefault(); this.closeModal(); return; }
@@ -2717,24 +2726,32 @@ class AssetTracker {
 
         const hasChildren = category.children && Object.keys(category.children).length > 0;
         const collapseIcon = hasChildren ? (category.collapsed ? '▶' : '▼') : '';
-
+        const baseCurrency = this.data.settings.baseCurrency;
+        const missingRates = new Set();
+        this.traverseCategories({root: category}, item => {
+            if (item.children && Object.keys(item.children).length) return;
+            const currency = item.currency || baseCurrency;
+            const rate = this.data.settings.exchangeRates?.[currency];
+            if (item.balance && currency !== baseCurrency && !(Number.isFinite(rate) && rate > 0)) missingRates.add(currency);
+        });
         let displayBalance, currencyInfo, debtInfo;
 
         if (hasChildren) {
             // 父类别：显示自动计算的汇总数据
             const summary = this.calculateCategorySummary(category);
-            displayBalance = this.formatCurrency(summary.totalAssets);
+            displayBalance = missingRates.size ? '—' : this.formatCurrency(summary.totalAssets);
 
             // 构建外币信息
-            const foreignCurrencies = Object.keys(summary.foreignCurrencies).filter(curr => curr !== this.data.settings.baseCurrency);
+            const foreignCurrencies = Object.keys(summary.foreignCurrencies).filter(curr => curr !== baseCurrency && summary.foreignCurrencies[curr] !== 0);
             if (foreignCurrencies.length > 0) {
                 const foreignItems = foreignCurrencies.map(curr => {
                     const foreignAmount = summary.foreignCurrencies[curr];
-                    const baseCurrencyAmount = this.convertToBaseCurrency(foreignAmount, curr);
+                    const rate = this.data.settings.exchangeRates?.[curr];
+                    const baseCurrencyAmount = Number.isFinite(rate) && rate > 0 ? foreignAmount * rate : null;
                     return `
                         <div class="foreign-currency-item">
                             <span class="foreign-amount">${this.formatCurrency(foreignAmount, curr)}</span>
-                            <span class="base-amount">(≈${this.formatCurrency(baseCurrencyAmount)})</span>
+                            <span class="base-amount">${baseCurrencyAmount === null ? '未折算' : `(≈${this.formatCurrency(baseCurrencyAmount)})`}</span>
                         </div>
                     `;
                 }).join('');
@@ -2743,55 +2760,45 @@ class AssetTracker {
                 currencyInfo = '';
             }
 
-            debtInfo = `
-                <div class="category-summary compact">
-                    <div class="summary-row">
-                        <span class="summary-item">总: ${this.formatCurrency(summary.totalAssets, null, true)}</span>
-                        <span class="summary-item">现: ${this.formatCurrency(summary.currentBalance, null, true)}</span>
-                        <span class="summary-item">债: ${this.formatCurrency(summary.totalDebt, null, true)}</span>
-                    </div>
-                    <div class="summary-row">
-                        <span class="summary-item base-currency-item">${this.data.settings.baseCurrency}: ${this.formatCurrency(summary.baseCurrencyTotal, this.data.settings.baseCurrency, true)}</span>
-                        ${Object.keys(summary.foreignCurrencies).filter(curr => curr !== this.data.settings.baseCurrency).length > 0 ? `
-                            <span class="summary-item foreign-currency-summary">外币总计: ${this.formatCurrency(summary.totalAssets - summary.baseCurrencyTotal, null, true)}</span>
-                        ` : ''}
-                    </div>
-                </div>
-            `;
+            const detail = missingRates.size
+                ? `缺少 ${[...missingRates].map(escapeHTML).join('、')} 汇率，折算总额暂不显示。`
+                : `净资产 ${this.formatCurrency(summary.totalAssets)}<br>资产余额 ${this.formatCurrency(summary.currentBalance)}<br>待还款 ${this.formatCurrency(summary.totalDebt)}<br>${escapeHTML(baseCurrency)} 净额 ${this.formatCurrency(summary.baseCurrencyTotal, baseCurrency)}`;
+            debtInfo = `<details class="ui-info category-summary-info" onclick="event.stopPropagation()"><summary aria-label="${escapeHTML(category.name)}账户汇总">i</summary><div class="ui-info-panel">${detail}</div></details>`;
         } else {
             // 叶子节点：显示实际余额，只允许编辑
-            const balanceInBaseCurrency = this.convertToBaseCurrency(category.balance, category.currency);
-            displayBalance = this.formatCurrency(balanceInBaseCurrency);
+            const balanceInBaseCurrency = missingRates.size ? null : this.convertToBaseCurrency(category.balance, category.currency);
+            displayBalance = balanceInBaseCurrency === null ? '—' : this.formatCurrency(balanceInBaseCurrency);
 
-            const currencyTag = category.currency !== this.data.settings.baseCurrency ?
-                `<span class="currency-tag">${escapeHTML(category.currency)}</span>` : '';
-            const originalAmount = category.currency !== this.data.settings.baseCurrency ?
-                `<span class="original-amount">(${this.formatCurrency(category.balance, category.currency)})</span>` : '';
+            const currency = category.currency || baseCurrency;
+            const currencyTag = currency !== baseCurrency ?
+                `<span class="currency-tag">${escapeHTML(currency)}</span>` : '';
+            const originalAmount = currency !== baseCurrency ?
+                `<span class="original-amount">(${this.formatCurrency(category.balance, currency)})</span>` : '';
 
-            currencyInfo = `${currencyTag} ${originalAmount}`;
+            currencyInfo = `${currencyTag} ${originalAmount}${missingRates.size ? '<span class="base-amount">未折算</span>' : ''}`;
             debtInfo = '';
         }
 
-        const debtIndicator = category.isDebt ? '<span class="debt-indicator">💳</span>' : '';
+        const debtIndicator = category.isDebt ? '<span class="debt-indicator">负债</span>' : '';
         const isEditable = !hasChildren; // 只有叶子节点可编辑
 
         div.innerHTML = `
             <div class="category-header" onclick="window.assetTracker.toggleCategoryCollapse(${inlineArgument(category.id)})">
                 <span class="drag-handle" title="拖拽排序" onclick="event.stopPropagation()">⋮⋮</span>
-                <span class="collapse-icon">${collapseIcon}</span>
+                ${hasChildren ? `<button type="button" class="category-toggle" data-category-toggle="${escapeHTML(category.id)}" aria-expanded="${!category.collapsed}" aria-label="${category.collapsed ? '展开' : '收起'}${escapeHTML(category.name)}" onclick="event.stopPropagation(); window.assetTracker.toggleCategoryCollapse(${inlineArgument(category.id)})">${collapseIcon}</button>` : '<span class="category-toggle-placeholder" aria-hidden="true"></span>'}
                 <span class="category-name">${escapeHTML(category.name)} ${debtIndicator}</span>
                 <div class="category-balance-container">
                     <span class="category-balance ${category.isDebt ? 'debt' : ''}">${displayBalance}</span>
                     ${currencyInfo}
+                    ${debtInfo}
                 </div>
                 <div class="category-actions">
-                    <button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.editCategoryName(${inlineArgument(category.id)})">改名</button>
-                    ${isEditable ? `<button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.editCategory(${inlineArgument(category.id)})">编辑</button>` : ''}
-                    <button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.deleteCategory(${inlineArgument(category.id)})">删除</button>
-                    ${isEditable ? `<button class="btn btn-sm" onclick="event.stopPropagation(); window.assetTracker.showExchangeRateModal(${inlineArgument(category.id)})">汇率</button>` : ''}
+                    ${!isEditable ? `<button class="btn btn-sm" aria-label="重命名${escapeHTML(category.name)}" onclick="event.stopPropagation(); window.assetTracker.editCategoryName(${inlineArgument(category.id)})">改名</button>` : ''}
+                    ${isEditable ? `<button class="btn btn-sm" aria-label="编辑${escapeHTML(category.name)}" onclick="event.stopPropagation(); window.assetTracker.editCategory(${inlineArgument(category.id)})">编辑</button>` : ''}
+                    <button class="btn btn-sm btn-danger" aria-label="删除${escapeHTML(category.name)}" onclick="event.stopPropagation(); window.assetTracker.deleteCategory(${inlineArgument(category.id)})">删除</button>
+                    ${isEditable && category.currency && category.currency !== baseCurrency ? `<button class="btn btn-sm" aria-label="设置${escapeHTML(category.currency)}汇率" onclick="event.stopPropagation(); window.assetTracker.showExchangeRateModal(${inlineArgument(category.id)})">汇率</button>` : ''}
                 </div>
             </div>
-            ${debtInfo}
         `;
 
         if (hasChildren) {
@@ -3074,9 +3081,11 @@ class AssetTracker {
     toggleCategoryCollapse(categoryId) {
         const category = this.findCategoryById(categoryId);
         if (category && category.children) {
+            const returnFocus = document.activeElement?.dataset?.categoryToggle === String(categoryId);
             category.collapsed = !category.collapsed;
             this.persistData();
             this.renderCategories();
+            if (returnFocus) [...document.querySelectorAll('[data-category-toggle]')].find(node => node.dataset.categoryToggle === String(categoryId))?.focus();
         }
     }
 
@@ -4018,7 +4027,7 @@ class AssetTracker {
                     <label>金额</label>
                     <div class="amount-input-group">
                         <input type="number" id="transaction-amount" step="0.01" aria-describedby="amount-hint" required>
-                        <select id="transaction-currency" class="currency-selector">
+                        <select id="transaction-currency" class="currency-selector" aria-label="账单币种">
                             <option value="CNY">CNY ¥</option>
                             <option value="SGD">SGD S$</option>
                             <option value="USD">USD $</option>
@@ -4158,16 +4167,16 @@ class AssetTracker {
     showCategoryModal() {
         const modalBody = document.getElementById('modal-body');
         modalBody.innerHTML = `
-            <h3>添加分类</h3>
+            <h3>添加账户或分组</h3>
             <form id="category-form">
                 <div class="form-group">
-                    <label>分类名称</label>
+                    <label>名称</label>
                     <input type="text" id="category-name" required>
                 </div>
                 <div class="form-group">
-                    <label>父分类</label>
+                    <label>上级分组</label>
                     <select id="parent-category">
-                        <option value="">顶级分类</option>
+                        <option value="">不指定（顶级）</option>
                         ${this.generateCategoryOptions()}
                     </select>
                 </div>
@@ -4176,7 +4185,7 @@ class AssetTracker {
                     <input type="number" id="category-balance" step="0.01" value="0">
                 </div>
                 <div class="form-group">
-                    <button type="submit" class="btn btn-primary">添加分类</button>
+                    <button type="submit" class="btn btn-primary">添加账户或分组</button>
                 </div>
             </form>
         `;
@@ -4402,19 +4411,31 @@ class AssetTracker {
     }
 
     // 删除分类
-    deleteCategory(categoryId) {
+    async deleteCategory(categoryId) {
+        if (this.categoryDeletePending) return;
         const category = this.findCategoryById(categoryId);
         if (!category) {
             this.showMessage('分类不存在！', 'error');
             return;
         }
 
-        if (confirm(`确定要删除分类 "${category.name}" 吗？这将同时删除其所有子分类和相关交易记录。`)) {
-            this.removeCategoryById(categoryId);
-            this.persistData();
-            this.renderCategories();
-            this.updateDashboard();
-            this.showMessage('分类删除成功！', 'success');
+        if (confirm(`删除账户“${category.name}”及其所有下级账户？已有账单会保留，但可能无法再关联原账户。此操作无法撤销。`)) {
+            let saved = false;
+            try {
+                this.assertWritable();
+                this.categoryDeletePending = true;
+                this.removeCategoryById(categoryId);
+                await this.persistData({ reason: 'delete-account' });
+                saved = true;
+                this.categoryDeletePending = false;
+                this.analysisDataReference = null;
+                this.renderCategories();
+                this.updateDashboard();
+                this.showMessage('账户已删除', 'success');
+            } catch (error) {
+                if (saved) this.categoryDeletePending = true;
+                this.showMessage(saved ? '账户已删除，但界面刷新失败。请重新打开账本。' : this.categoryDeletePending ? '删除保存未确认，请按数据保护提示处理。' : '当前账本不可修改。', 'error');
+            }
         }
     }
 
@@ -4541,7 +4562,7 @@ class AssetTracker {
                     <label>金额</label>
                     <div class="amount-input-group">
                         <input type="number" id="edit-transaction-amount" step="0.01" value="${transaction.amount}" required>
-                        <select id="edit-transaction-currency" class="currency-selector">
+                        <select id="edit-transaction-currency" class="currency-selector" aria-label="账单币种">
                             <option value="CNY" ${currentCurrency === 'CNY' ? 'selected' : ''}>CNY ¥</option>
                             <option value="SGD" ${currentCurrency === 'SGD' ? 'selected' : ''}>SGD S$</option>
                             <option value="USD" ${currentCurrency === 'USD' ? 'selected' : ''}>USD $</option>
@@ -4681,25 +4702,48 @@ class AssetTracker {
     }
 
     // 删除交易
-    deleteTransaction(transactionId) {
+    async deleteTransaction(transactionId) {
+        if (this.transactionDeletePending) return;
         const transaction = this.data.transactions.find(t => t.id === transactionId);
         if (!transaction) {
             this.showMessage('交易记录不存在！', 'error');
             return;
         }
-
-        if (confirm(`确定要删除这条交易记录吗？\n金额：¥${transaction.amount}\n描述：${transaction.description}`)) {
-            // 恢复分类余额
-            this.updateCategoryBalance({...transaction, amount: -transaction.amount});
-
-            // 删除交易记录
-            this.data.transactions = this.data.transactions.filter(t => t.id !== transactionId);
-
-            this.persistData();
-            this.renderTransactions();
-            this.renderCategories();
-            this.updateDashboard();
-            this.showMessage('交易记录删除成功！', 'success');
+        const path = this.findCategoryPath(transaction.category, transaction.subcategory, transaction.accountId);
+        let nodes = this.data.categories, account = null;
+        for (const key of path || []) { account = nodes[key]; nodes = account?.children || {}; }
+        const base = this.data.settings.baseCurrency;
+        const transactionCurrency = transaction.currency || base, accountCurrency = account?.currency || base;
+        const historicalImport = (transaction.wechat || transaction.alipay || transaction.icbc || transaction.ocbc)?.balanceMode === 'history';
+        const crossCurrency = !historicalImport && account && transactionCurrency !== accountCurrency;
+        if (crossCurrency) {
+            const missing = [transactionCurrency, accountCurrency].filter(currency => currency !== base && !(Number.isFinite(this.data.settings.exchangeRates?.[currency]) && this.data.settings.exchangeRates[currency] > 0));
+            if (missing.length) { this.showMessage(`缺少 ${[...new Set(missing)].join('、')} 汇率，无法计算余额变动；请先设置汇率。`, 'error'); return; }
+        }
+        const effect = historicalImport ? '这是历史导入账单，删除不会改变账户余额。'
+            : !account ? '原账户无法定位，删除后不会自动调整账户余额。'
+            : crossCurrency ? '将按当前设置汇率调整账户余额；汇率变化时，余额可能与入账前不同。'
+            : '将撤销这笔账单对账户余额的影响。';
+        if (confirm(`删除这条账单？\n金额：${this.formatCurrency(transaction.amount, transaction.currency)}\n描述：${transaction.description || '无'}\n${effect}此操作无法撤销。`)) {
+            let saved = false;
+            try {
+                this.assertWritable();
+                this.transactionDeletePending = true;
+                // Preserve the stable account ID and original currency when reversing the entry.
+                this.updateCategoryBalance({ ...transaction, amount: -transaction.amount });
+                this.data.transactions = this.data.transactions.filter(t => t.id !== transactionId);
+                await this.persistData({ reason: 'delete-transaction' });
+                saved = true;
+                this.transactionDeletePending = false;
+                this.analysisDataReference = null;
+                this.renderTransactions();
+                this.renderCategories();
+                this.updateDashboard();
+                this.showMessage('账单已删除', 'success');
+            } catch (error) {
+                if (saved) this.transactionDeletePending = true;
+                this.showMessage(saved ? '账单已删除，但界面刷新失败。请重新打开账本。' : this.transactionDeletePending ? '删除保存未确认，请按数据保护提示处理。' : '当前账本不可修改。', 'error');
+            }
         }
     }
 
@@ -5014,7 +5058,11 @@ class AssetTracker {
         if (!wasOpen) this.modalTrigger = document.activeElement;
         modal.style.display = 'block';
         modal.setAttribute('role', 'dialog');
-        modal.setAttribute('aria-modal', 'true');
+        // WKWebView can hide this dialog's entire accessibility subtree when
+        // aria-modal and an inert sibling are combined. The native path keeps
+        // the labelled dialog, inert background and keyboard focus trap.
+        if (window.AssetTrackerHost?.isNative) modal.removeAttribute('aria-modal');
+        else modal.setAttribute('aria-modal', 'true');
         const heading = modal.querySelector('h3');
         if (heading) { heading.id = 'modal-title'; modal.setAttribute('aria-labelledby', heading.id); }
         // Associate existing labels with fields without changing the saved data format.
@@ -5058,7 +5106,8 @@ class AssetTracker {
     showAutomationRuleModal() {
         const modalBody = document.getElementById('modal-body');
         modalBody.innerHTML = `
-            <h3>添加自动记账规则</h3>
+            <h3>新建周期规则</h3>
+            <p class="helper-text">手动预览待补齐项，确认后入账。</p>
             <form id="automation-rule-form">
                 <div class="form-group">
                     <label>规则名称</label>
@@ -5073,7 +5122,7 @@ class AssetTracker {
                     </select>
                 </div>
                 <div class="form-group">
-                    <label>金额</label>
+                    <label>金额（支出为负，收入为正）</label>
                     <input type="number" id="rule-amount" step="0.01" required>
                 </div>
                 <div class="form-group">
@@ -5107,7 +5156,8 @@ class AssetTracker {
         this.showModal();
     }
 
-    submitAutomationRule() {
+    async submitAutomationRule() {
+        if (this.automationRulePending) return;
         const rule = {
             id: Date.now().toString(),
             name: document.getElementById('rule-name').value,
@@ -5120,17 +5170,32 @@ class AssetTracker {
             active: true
         };
 
-        this.data.automationRules.push(rule);
-        this.persistData();
-        this.renderAutomationRules();
-        this.closeModal();
-        this.showMessage('自动记账规则添加成功！', 'success');
+        const submit = document.querySelector('#automation-rule-form button[type="submit"]');
+        let saved = false;
+        try {
+            this.assertWritable();
+            this.automationRulePending = true;
+            if (submit) { submit.disabled = true; submit.textContent = '正在保存…'; }
+            this.data.automationRules.push(rule);
+            await this.persistData({reason:'create-automation-rule'});
+            saved = true;
+            this.automationRulePending = false;
+            this.analysisDataReference = null;
+            this.renderAutomationRules();
+            this.renderWorkspace?.();
+            this.closeModal();
+            this.showMessage('周期规则已保存', 'success');
+        } catch (error) {
+            if (saved) this.automationRulePending = true;
+            if (submit && this.automationRulePending) submit.textContent = saved ? '已保存，刷新失败' : '保存未确认';
+            this.showMessage(saved ? '规则已保存，但界面刷新失败。请重新打开账本。' : this.automationRulePending ? '规则保存未确认，请按数据保护提示处理。' : '当前账本不可修改。', 'error');
+        }
     }
 
     renderAutomationRules() {
         const container = document.getElementById('automation-rules');
         if (this.data.automationRules.length === 0) {
-            container.innerHTML = '<p class="empty-state">暂无自动记账规则</p>';
+            container.innerHTML = '<p class="empty-state">暂无周期规则</p>';
             return;
         }
 
@@ -5148,12 +5213,47 @@ class AssetTracker {
                     <button class="btn btn-sm" onclick="window.assetTracker.toggleRule(${inlineArgument(rule.id)})">
                         ${rule.active ? '暂停' : '启用'}
                     </button>
-                    <button class="btn btn-sm btn-primary" onclick="window.assetTracker.fillToToday(${inlineArgument(rule.id)})">补齐到今天</button>
+                    <button class="btn btn-sm btn-primary" onclick="window.assetTracker.fillToToday(${inlineArgument(rule.id)})" ${rule.active ? '' : 'disabled'}>${this.ws?.ready ? '预览待补齐项' : '补齐到今天'}</button>
                     <button class="btn btn-sm" onclick="window.assetTracker.deleteRule(${inlineArgument(rule.id)})">删除</button>
                 </div>
             </div>
         `).join('');
     }
+
+    async updateAutomationRule(ruleId, remove = false) {
+        if (this.automationRulePending) return;
+        const rule = this.data.automationRules.find(item => item.id === ruleId);
+        if (!rule) return;
+        if (remove && !confirm(`删除规则“${rule.name}”？此后不会再按此规则生成草稿，已有账单保留。`)) return;
+        let saved = false;
+        try {
+            this.assertWritable();
+            this.automationRulePending = true;
+            const container = document.getElementById('automation-rules');
+            container?.setAttribute('aria-busy', 'true');
+            container?.querySelectorAll('.rule-actions button').forEach(button => { button.disabled = true; });
+            if (remove) this.data.automationRules = this.data.automationRules.filter(item => item.id !== ruleId);
+            else rule.active = !rule.active;
+            await this.persistData({reason: remove ? 'delete-automation-rule' : 'toggle-automation-rule'});
+            saved = true;
+            this.automationRulePending = false;
+            container?.removeAttribute('aria-busy');
+            this.analysisDataReference = null;
+            this.renderAutomationRules();
+            this.renderWorkspace?.();
+            this.showMessage(remove ? '规则已删除' : (rule.active ? '规则已启用' : '规则已暂停'), 'success');
+        } catch (error) {
+            if (saved) {
+                this.automationRulePending = true;
+                document.querySelectorAll('#automation-rules .rule-actions button').forEach(button => { button.disabled = true; });
+            }
+            document.getElementById('automation-rules')?.removeAttribute('aria-busy');
+            this.showMessage(saved ? '规则已保存，但界面刷新失败。请重新打开账本。' : this.automationRulePending ? '规则保存未确认，请按数据保护提示处理。' : '当前账本不可修改。', 'error');
+        }
+    }
+
+    toggleRule(ruleId) { return this.updateAutomationRule(ruleId); }
+    deleteRule(ruleId) { return this.updateAutomationRule(ruleId, true); }
 
     getFrequencyText(frequency) {
         const map = {
@@ -5191,6 +5291,8 @@ class AssetTracker {
             this.showMessage('已无需补齐的交易！', 'success');
             return;
         }
+
+        if (!confirm(`将直接添加 ${missingTransactions.length} 笔账单并改变账户余额。此操作无法一次撤销，是否继续？`)) return;
 
         this.ruleCatchUpPending = true;
         try {
@@ -5800,13 +5902,24 @@ class AssetTracker {
         container.innerHTML = assetsHtml;
     }
 
-    deleteInitialAsset(assetId) {
-        if (!this.data.initialAssets) return;
-
-        this.data.initialAssets = this.data.initialAssets.filter(asset => asset.id !== assetId);
-        this.persistData();
-        this.renderInitialAssetsList();
-        this.showMessage('初始资产已删除', 'success');
+    async deleteInitialAsset(assetId) {
+        if (this.initialAssetDeletePending || !this.data.initialAssets?.some(asset => asset.id === assetId)) return;
+        if (!confirm('删除这条初始资产记录？基于盘点锚点的历史分析可能改变，已有账单保留。')) return;
+        let saved = false;
+        try {
+            this.assertWritable();
+            this.initialAssetDeletePending = true;
+            this.data.initialAssets = this.data.initialAssets.filter(asset => asset.id !== assetId);
+            await this.persistData({reason:'delete-initial-asset'});
+            saved = true;
+            this.initialAssetDeletePending = false;
+            this.analysisDataReference = null;
+            this.renderInitialAssetsList();
+            this.showMessage('初始资产已删除', 'success');
+        } catch (error) {
+            if (saved) this.initialAssetDeletePending = true;
+            this.showMessage(saved ? '初始资产已删除，但界面刷新失败。请重新打开账本。' : this.initialAssetDeletePending ? '删除保存未确认，请按数据保护提示处理。' : '当前账本不可修改。', 'error');
+        }
     }
 
     clearInitialAssetForm() {
@@ -6112,6 +6225,8 @@ class AssetTracker {
 globalThis.AssetTrackerProjectUI.install(AssetTracker);
 globalThis.AssetTrackerAnalyticsUI.install(AssetTracker);
 globalThis.AssetTrackerWorkspaceUI?.install(AssetTracker);
+globalThis.AssetTrackerBillUI?.install(AssetTracker);
+globalThis.AssetTrackerDedupReviewUI?.install(AssetTracker);
 globalThis.AssetTrackerWorkspaceScreen?.install(AssetTracker);
 
 // 初始化应用

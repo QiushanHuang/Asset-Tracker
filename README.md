@@ -17,12 +17,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A local-first ledger for daily spending, multi-currency accounts and project
-costs. See this month's surplus, income and expenses together. Use an optional
-local model to prepare entries, check the details, then save. Share a separate
+costs. See this month's surplus, income and expenses together. Prepare entries with offline recognition or an optional
+local model, check the details, then save. Share a separate
 family book on your own NAS when you need collaboration.
 
-**[Download v3.4.0](https://github.com/QiushanHuang/Asset-Tracker/releases/tag/v3.4.0)** ·
-[What's new](docs/releases/v3.4.0.md#english) · [User guide](docs/user-guide.md#english)
+**[Download v3.5.0](https://github.com/QiushanHuang/Asset-Tracker/releases/tag/v3.5.0)** ·
+[What's new](docs/releases/v3.5.0.md#english) · [User guide](docs/user-guide.md#english)
 
 ![Customizable workspace with fictional demonstration data](docs/images/workspace.jpg)
 
@@ -34,26 +34,25 @@ family book on your own NAS when you need collaboration.
 | --- | --- |
 | See the important numbers at a glance | Surplus, income and expenses lead the overview; assets, trends, review items and the assistant share an adaptive screen |
 | Arrange the app around your routine | Show, hide, reorder and resize modules; choose a theme, density, primary metric and default period |
-| Spend less time entering records | Type a sentence into the optional model assistant, then correct and confirm the proposed fields |
+| Spend less time entering records | Use offline text recognition or the optional model assistant, then correct and confirm the draft |
 | Review a spreadsheet or statement | Preview Excel/CSV, WeChat, Alipay and supported ICBC/OCBC text PDFs; keep original currencies and review evidence |
 | Understand a trip or renovation | Separate project expense categories from the account used to pay; drill into that project's spending |
 | Keep recurring work manageable | Preview missing recurring entries, save editable classification rules and inspect assistant run results |
 
-The default home fits a 1280×720 desktop and a 390×844 narrow viewport. More
-modules or smaller windows use pages. Long lists paginate; settings and analysis
-use named groups. Expanded trees and long source text can scroll within their
-own area.
+The home adapts to desktop and narrow windows. When the available space is
+insufficient, modules use pages. Long lists paginate; settings and analysis use
+named groups. Expanded trees and long source text can scroll within their own area.
 
 ## Install
 
 Download an archive and `SHA256SUMS.txt` from the same
-[release](https://github.com/QiushanHuang/Asset-Tracker/releases/tag/v3.4.0).
+[release](https://github.com/QiushanHuang/Asset-Tracker/releases/tag/v3.5.0).
 
 | Archive | For |
 | --- | --- |
-| `AssetTracker-v3.4.0-macos-arm64.zip` | Apple silicon, macOS 14 or newer |
-| `AssetTracker-v3.4.0-web.zip` | The local web app, with bundled chart, spreadsheet and PDF libraries |
-| `AssetTracker-v3.4.0-nas.zip` | NAS service sources, Docker configuration and deployment guide |
+| `AssetTracker-v3.5.0-macos-arm64.zip` | Apple silicon, macOS 14 or newer |
+| `AssetTracker-v3.5.0-web.zip` | The local web app, with bundled chart, spreadsheet and PDF libraries |
+| `AssetTracker-v3.5.0-nas.zip` | NAS service sources, Docker configuration and deployment guide |
 
 The macOS app is **not Developer ID signed or notarized**. Check its checksum
 before opening. Export a full JSON backup before replacing an older app, and
@@ -74,7 +73,7 @@ return to the same book.
 1. Set up **资金账户**: where money is held or owed, with each account's currency.
 2. Use **添加账单** for direct entry. For a trip or event, select a project and
    its expense category separately from the funding account.
-3. To use a model, open **设置与连接 → 模型与连接**. Enter your running service and
+3. To use a model, open **界面与模型 → 模型与连接**. Enter your running service and
    model, fetch its model list, test structured output, then save your chosen scope.
 4. Type a sentence in **账本助手**. Review its amount, date, account and category in
    **待核对**; only confirmation writes it to the ledger.
@@ -128,7 +127,7 @@ does not change records or permissions. Recurring entries are previewed in the
 local app; there is no new always-on NAS scheduler in this release.
 
 Follow the [NAS guide](deploy/ugreen/README.md#english) for Docker deployment and
-trusted-LAN/HTTPS choices. v3.4.0 includes a source archive; the existing v3.3.0
+trusted-LAN/HTTPS choices. v3.5.0 includes a source archive; the existing v3.3.0
 prebuilt NAS image remains available from its release.
 
 ## Imports, backups and updates
@@ -144,8 +143,8 @@ prebuilt NAS image remains available from its release.
 - **Updating:** back up, close the old app, replace the application, then confirm
   the expected book opens. Installing an update does not upload your ledger.
 
-[Release notes](docs/releases/v3.4.0.md#english) · [Changelog](CHANGELOG.md) ·
-[Validation](docs/validation/v3.4.0.md) · [Recovery guide](docs/user-guide.md#save-failures-conflicts-and-recovery)
+[Release notes](docs/releases/v3.5.0.md#english) · [Changelog](CHANGELOG.md) ·
+[Validation](docs/validation/v3.5.0.md) · [Recovery guide](docs/user-guide.md#save-failures-conflicts-and-recovery)
 
 ## Development
 
@@ -179,9 +178,9 @@ See [Contributing](CONTRIBUTING.md) for native fault-recovery checks and
 
 **账户、收支与项目，一眼看清。**
 
-本地优先的个人账本，用来记录日常消费、多币种账户和项目开支。首页集中显示本月结余、收入和支出；可用本机小模型准备账单，核对后入账。需要共同记账时，在自己的 NAS 上另建家庭账本。
+本地优先的个人账本，用来记录日常消费、多币种账户和项目开支。首页集中显示本月结余、收入和支出；可用离线识别或本机小模型准备账单，核对后入账。需要共同记账时，在自己的 NAS 上另建家庭账本。
 
-**[下载 v3.4.0](https://github.com/QiushanHuang/Asset-Tracker/releases/tag/v3.4.0)** · [更新说明](docs/releases/v3.4.0.md#中文) · [操作手册](docs/user-guide.md#中文)
+**[下载 v3.5.0](https://github.com/QiushanHuang/Asset-Tracker/releases/tag/v3.5.0)** · [更新说明](docs/releases/v3.5.0.md#中文) · [操作手册](docs/user-guide.md#中文)
 
 ![自定义工作区，使用虚构演示账目](docs/images/workspace.jpg)
 
@@ -192,21 +191,22 @@ See [Contributing](CONTRIBUTING.md) for native fault-recovery checks and
 | 打开就看到重点 | 结余、收入、支出醒目呈现；资产、趋势、待核对和助手随窗口适配 |
 | 按自己的习惯安排首页 | 模块显示、排序、宽度自由调整，支持主题、密度、主指标和默认期间 |
 | 少填几个字段 | 输入一句话，让可选模型准备草稿，再核对金额、日期、账户和分类 |
+| 离线准备草稿 | 粘贴账单文字；Mac 可在本机识别收据图片，核对后入账 |
 | 整理表格与原始账单 | Excel/CSV、微信、支付宝和受支持的工行/OCBC 文字 PDF 导入，保留原币与核对依据 |
 | 看清一次旅行或装修 | 项目消费分类独立于资金账户，可逐层查看这一件事的开支 |
 | 管好重复工作 | 预览周期待补齐项、编辑分类规则、查看助手执行结果 |
 
-默认首页在 **1280×720 桌面和 390×844 窄屏**可一屏显示。更多模块或更小窗口使用分页；长列表分页，设置与分析按组切换。展开的账户树和长原文保留区域滚动。
+首页适配桌面和窄屏，空间不足时使用模块分页；长列表分页，设置与分析按组切换。展开的账户树和长原文保留区域滚动。
 
 ## 安装与开始使用
 
-从同一个 [Release](https://github.com/QiushanHuang/Asset-Tracker/releases/tag/v3.4.0) 下载对应压缩包和 `SHA256SUMS.txt`：
+从同一个 [Release](https://github.com/QiushanHuang/Asset-Tracker/releases/tag/v3.5.0) 下载对应压缩包和 `SHA256SUMS.txt`：
 
 | 下载包 | 用途 |
 | --- | --- |
-| `AssetTracker-v3.4.0-macos-arm64.zip` | Apple 芯片，macOS 14 或以上 |
-| `AssetTracker-v3.4.0-web.zip` | 本地网页，包含图表、表格和 PDF 依赖 |
-| `AssetTracker-v3.4.0-nas.zip` | NAS 服务源码、Docker 配置和部署指南 |
+| `AssetTracker-v3.5.0-macos-arm64.zip` | Apple 芯片，macOS 14 或以上 |
+| `AssetTracker-v3.5.0-web.zip` | 本地网页，包含图表、表格和 PDF 依赖 |
+| `AssetTracker-v3.5.0-nas.zip` | NAS 服务源码、Docker 配置和部署指南 |
 
 Mac 包**未做 Developer ID 分发签名和公证**。打开前核对校验值；升级前导出完整 JSON 并关闭旧版 App，保留原数据目录。[安装手册](docs/user-guide.md#installation)也说明了独立 `--preview` 预览方式。
 
@@ -214,7 +214,7 @@ Mac 包**未做 Developer ID 分发签名和公证**。打开前核对校验值�
 
 1. 在 **资金账户** 设置钱存在哪里、欠在哪里，以及账户币种。
 2. 点 **添加账单** 直接记录；旅行或活动可另选项目与消费分类。
-3. 想用模型时，在 **设置与连接 → 模型与连接** 填写已经运行的服务和模型，获取列表、测试结构输出，再保存授权范围。
+3. 想用模型时，在 **界面与模型 → 模型与连接** 填写已经运行的服务和模型，获取列表、测试结构输出，再保存授权范围。
 4. 在 **账本助手** 输入一句话，进入 **待核对** 修改字段，确认后写入账本。
 5. 在总览或分析中查看变化，定期导出完整 JSON 备份。
 
@@ -237,7 +237,7 @@ Ollama 默认地址为 `http://127.0.0.1:11434`；LM Studio / 兼容接口通常
 
 本地 Mac/网页提供完整工作区、模型与分析；NAS 提供私有、共同、家庭账本，以及所有者/编辑者/查看者权限、冲突检查与版本恢复。两者不会自动同步，向 NAS 导入 JSON 会创建独立私有账本。
 
-隐藏首页模块只改变显示。周期待补齐项由本地 App 预览，本版没有新增 NAS 常驻调度器。部署步骤见 [NAS 指南](deploy/ugreen/README.md#中文)。v3.4.0 提供 NAS 源码包；原 v3.3.0 预构建镜像仍可在对应 Release 下载。
+隐藏首页模块只改变显示。周期待补齐项由本地 App 预览，本版没有新增 NAS 常驻调度器。部署步骤见 [NAS 指南](deploy/ugreen/README.md#中文)。v3.5.0 提供 NAS 源码包；原 v3.3.0 预构建镜像仍可在对应 Release 下载。
 
 ## 导入、备份与更新
 
@@ -246,6 +246,6 @@ Ollama 默认地址为 `http://127.0.0.1:11434`；LM Studio / 兼容接口通常
 - 完整 JSON 保留正式账本、导入决定与已确认来源。未确认工作区草稿和模型设置保留在本设备，换设备或替换账本前，先处理需要保留的草稿。
 - 更新前备份、关闭旧版、替换 App，再确认账本正常打开。安装更新不会上传个人账本。
 
-[更新说明](docs/releases/v3.4.0.md#中文) · [更新日志](CHANGELOG.md) · [验证记录](docs/validation/v3.4.0.md) · [操作手册](docs/user-guide.md#中文)
+[更新说明](docs/releases/v3.5.0.md#中文) · [更新日志](CHANGELOG.md) · [验证记录](docs/validation/v3.5.0.md) · [操作手册](docs/user-guide.md#中文)
 
 开发命令见上方 [Development](#development)。维护者：[QiushanHuang · Qiushan](https://github.com/QiushanHuang)；许可：[MIT](LICENSE)。

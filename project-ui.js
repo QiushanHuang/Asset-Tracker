@@ -43,7 +43,6 @@
                 });
                 el('project-filter')?.addEventListener('change',()=>{
                     el('project-category-filter').value='';
-                    if (el('project-filter').value) {el('date-from').value='';el('date-to').value='';}
                     this.renderProjectSelectors();this.filterTransactions();
                 });
                 el('project-category-filter')?.addEventListener('change',()=>this.filterTransactions());
@@ -73,8 +72,11 @@
                 if(!active)this.activeProjectId=null;
                 const badge=el('active-project-status');
                 if(badge) badge.innerHTML=active ? `<span>正在记：<strong>${h(active.name)}</strong></span>${action('daily','退出项目模式')}` : '<span>日常记账 · 可随时选择项目</span>';
-                el('project-list').innerHTML=projects.length ? projects.map(item=>`<button type="button" class="project-card ${p?.id===item.id?'selected':''}" data-project-action="select" data-id="${h(item.id)}" aria-pressed="${p?.id===item.id}"><strong>${h(item.name)}</strong><span>${item.archived?'已归档':item.id===this.activeProjectId?'当前记账项目':'点击查看项目'}</span></button>`).join('') : '<p class="empty-state">把一次旅行、装修或活动的支出放在一起。</p>';
-                if(!p){el('project-detail').innerHTML='<div class="project-welcome"><p class="eyebrow">按事情记账</p><h3>这一趟，钱花在哪里？</h3><p>建一个旅行项目，餐饮、住宿和交通各有归属。回来后，一眼看清整趟花销。</p>'+action('new','新建第一个项目')+'</div>';this.renderProjectSelectors();return;}
+                const projectList=el('project-list');
+                projectList.hidden=!projects.length;
+                projectList.parentElement?.classList.toggle('is-empty',!projects.length);
+                projectList.innerHTML=projects.length ? '<button type="button" class="btn btn-primary project-create" data-project-action="new">+ 新建项目</button>'+projects.map(item=>`<button type="button" class="project-card ${p?.id===item.id?'selected':''}" data-project-action="select" data-id="${h(item.id)}" aria-pressed="${p?.id===item.id}"><strong>${h(item.name)}</strong>${item.archived?'<span>已归档</span>':item.id===this.activeProjectId?'<span>当前记账项目</span>':''}</button>`).join('') : '';
+                if(!p){el('project-detail').innerHTML='<div class="project-welcome"><div class="ui-title"><h3>暂无项目</h3><details class="ui-info"><summary aria-label="项目账本说明">i</summary><div class="ui-info-panel">按旅行、装修等事件汇总账单。项目消费分类与资金账户分开管理。</div></details></div><button type="button" class="btn btn-primary" data-project-action="new">新建项目</button></div>';this.renderProjectSelectors();return;}
                 if(this.projectCategoryView && !p.categories.some(n=>n.id===this.projectCategoryView))this.projectCategoryView=null;
                 const parent=this.projectCategoryView || null, summary=P.summarize(this.data,p.id,parent);
                 const chain=P.chain(p,parent),back=chain.length>1?chain[chain.length-2].id:'';
@@ -86,7 +88,7 @@
                     return `<div class="project-breakdown-row"><div class="breakdown-title">${special?`<strong>${h(row.name)}</strong>`:action('drill',h(row.name)+' ›',row.id)}<small>${row.count} 笔${row.income?' · 收入 '+h(this.formatCurrency(row.income)):''}</small></div><div class="breakdown-track" aria-hidden="true"><span style="width:${percent}%"></span></div><strong>${h(this.formatCurrency(row.expense))}</strong>${action('records','查看账单',category)}</div>`;
                 }).join('');
                 el('project-detail').innerHTML=`<div class="card-header"><div><p class="eyebrow">${p.archived?'归档项目 · 历史记录保留':'项目账本'}</p><h3>${h(p.name)}</h3></div><div class="project-actions">${!p.archived?action('active',p.id===this.activeProjectId?'已设为当前项目':'设为当前项目',p.id):''}${!p.archived?action('entry','记一笔'):''}${action('rename','重命名',p.id)}${action('archive',p.archived?'恢复项目':'归档',p.id)}</div></div>
-                    <p class="helper-text">选定项目后，新增账单默认带上它；关闭 App 后回到日常记账。</p>
+                    <p class="helper-text">关闭应用后恢复日常记账。</p>
                     <div class="project-metrics"><div><span>${parent?'当前分类':'项目累计'}支出${unknown.length?'（已折算部分）':''}</span><strong>${h(this.formatCurrency(summary.expense))}</strong></div><div><span>收入 · 单独统计</span><strong>${h(this.formatCurrency(summary.income))}</strong></div><div><span>账单笔数</span><strong>${summary.count}</strong></div></div>
                     ${unknown.length?`<p class="project-warning" role="status">缺少 ${unknown.map(h).join('、')} 汇率，相关原币记录保留在账单中，未计入折算金额。</p>`:''}
                     <div class="card-header breakdown-heading"><div><h3>${parent?h(P.path(p,parent)):'消费去向'}</h3><p class="helper-text">支出含下级分类 · ${h(this.data.settings.baseCurrency)} · 当前设置汇率 · 全部日期</p></div>${parent?action('drill','返回上一级',back):action('records','查看全部账单','')}</div>
@@ -140,6 +142,8 @@
             },
             async deleteExpenseCategory(id) {
                 if(!P.canDelete(this.data,this.projectViewId,id)){this.showMessage('该分类已有下级或账单，不能直接删除','error');return;}
+                const category=current(this)?.categories.find(node=>node.id===id);
+                if(!window.confirm(`删除消费分类“${category?.name || ''}”？分类将被移除，已有账单不受影响。`))return;
                 const next=list(this).map(p=>p.id===this.projectViewId?{...p,categories:p.categories.filter(n=>n.id!==id)}:p);
                 return this.commitProjectList(next);
             },
@@ -157,7 +161,7 @@
                 amount.min='0.01';amount.placeholder='0.00';amount.inputMode='decimal';if(editing)amount.value=Math.abs(editing.amount);
                 const direction=document.createElement('fieldset');direction.className='entry-direction';
                 direction.innerHTML=`<legend class="sr-only">收支方向</legend><label><input type="radio" name="entry-direction" value="expense" ${!editing || editing.amount<0?'checked':''}>支出</label><label><input type="radio" name="entry-direction" value="income" ${editing?.amount>=0?'checked':''}>收入</label>`;form.prepend(direction);
-                const hint=el('amount-hint');if(hint)hint.textContent='只需填写正数，选择支出或收入即可。';
+                const hint=el('amount-hint');if(hint){hint.textContent='只需填写正数，选择支出或收入即可。';hint.hidden=true;}
                 const projectId=editing ? editing.projectId || '' : this.activeProjectId || '';
                 const group=document.createElement('div');group.className='entry-project-fields form-wide';
                 group.innerHTML=`<div class="form-group"><label for="entry-project">归属项目</label><select id="entry-project">${option('','日常 · 无项目')+list(this).filter(p=>!p.archived || p.id===projectId).map(p=>option(p.id,p.name+(p.archived?' · 已归档':''))).join('')}</select></div><div id="entry-expense-categories"><label for="expense-level-1">项目消费分类 <span class="helper-text">选到任意层即可</span></label><div class="expense-levels"><select id="expense-level-1" aria-label="一级消费分类"></select><select id="expense-level-2" aria-label="二级消费分类" hidden></select><select id="expense-level-3" aria-label="三级消费分类" hidden></select></div></div>`;
@@ -182,9 +186,9 @@
                     el('entry-account-note').textContent=account.node.isDebt?'负债账户：支出增加待还款，入账减少待还款。':'';
                 };
                 el('entry-account').addEventListener('change',selectAccount);if(!editing && initial)selectAccount();
-                const advanced=document.createElement('details');advanced.className='entry-advanced form-wide';advanced.innerHTML='<summary>更多选项 <span>日期、时间、旧账单类型与模板</span></summary>';
-                const date=el(prefix+'transaction-date'),type=el(prefix+'transaction-type'),time=el(prefix+'transaction-time'),include=el(editing?'edit-include-time':'include-time');
-                for(const field of [date,include,time,type])if(field)advanced.append(field.closest('.form-group'));
+                const advanced=document.createElement('details');advanced.className='entry-advanced form-wide';advanced.innerHTML='<summary>时间、类型与模板</summary>';
+                const type=el(prefix+'transaction-type'),time=el(prefix+'transaction-time'),include=el(editing?'edit-include-time':'include-time');
+                for(const field of [include,time,type])if(field)advanced.append(field.closest('.form-group'));
                 const templates=el('modal-body').querySelector('.template-buttons')?.closest('.form-group');if(templates)advanced.append(templates);
                 form.insertBefore(advanced,form.lastElementChild);
                 const finalGroup=form.lastElementChild;finalGroup.classList.add('entry-submit-actions');

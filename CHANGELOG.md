@@ -2,6 +2,22 @@
 
 All notable product changes are recorded here.
 
+## [3.5.0] - 2026-10-28
+
+### Added and improved
+
+- Refined the overview, account tree, entry/review forms, navigation and light/dark responsive layouts; calculation notes are available on demand.
+- Added offline text/table recognition and macOS Vision image OCR that produce editable drafts, plus local duplicate comparison with evidence and bounded scans.
+- Kept selected dates when filtering projects; exposed required draft fields and account-group expansion to keyboard users.
+- Restored working periodic-rule controls, protected classification rules from the automation layout state, and wait for save confirmation before reporting rule changes.
+- Grouped full-book replacement with recovery and reset. Deletion prompts describe balance effects; cross-currency reversal is explicitly based on the current exchange rate.
+
+### Compatibility and distribution
+
+- Retains the audited WeChat, Alipay and supported ICBC/OCBC text-PDF flows and history-only balance semantics from v3.3/3.4.
+- Apple-silicon macOS 14+, local Web and NAS source archives; the Mac app is ad-hoc signed and not notarized. No running NAS deployment or model service is changed.
+- See [release notes](docs/releases/v3.5.0.md) and [validation](docs/validation/v3.5.0.md).
+
 ## [3.4.0] - 2026-09-26
 
 ### Added

@@ -1,7 +1,7 @@
 (function(root){root.AssetTrackerAnalyticsUI={install(Tracker){
 'use strict';const A=root.AssetTrackerAnalytics,h=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),el=id=>document.getElementById(id);const palette=['#6754bd','#18796e','#c67425','#9b487f','#426ba9','#7f8040','#b5564a','#507e8d'];
-const table=(heads,rows)=>`<div class="analysis-table" tabindex="0"><table><thead><tr>${heads.map(x=>`<th>${h(x)}</th>`).join('')}</tr></thead><tbody>${rows.length?rows.map(row=>`<tr>${row.map(x=>`<td>${x}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${heads.length}" class="empty-state">该范围暂无记录</td></tr>`}</tbody></table></div>`;
-const card=(title,body,note='')=>`<article class="card analysis-card"><h3>${title}</h3>${note?`<p class="helper-text">${note}</p>`:''}${body}</article>`;
+const table=(heads,rows)=>`<div class="analysis-table" tabindex="0" role="region" aria-label="分析明细，可横向滚动"><table><thead><tr>${heads.map(x=>`<th>${h(x)}</th>`).join('')}</tr></thead><tbody>${rows.length?rows.map(row=>`<tr>${row.map(x=>`<td>${x}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${heads.length}" class="empty-state">该范围暂无记录</td></tr>`}</tbody></table></div>`;
+const card=(title,body,note='')=>`<article class="card analysis-card"><div class="ui-title"><h3>${title}</h3>${note?`<details class="ui-info"><summary aria-label="${h(title)}计算说明">i</summary><div class="ui-info-panel">${h(note)}</div></details>`:''}</div>${body}</article>`;
 const plot=id=>`<div class="analysis-plot"><canvas id="${id}" role="img" aria-label="${id==='analysis-main-chart'?'当前分析图表':'分析辅助图表'}"></canvas></div>`;
 const previousDashboard=Tracker.prototype.updateDashboard;
 Tracker.prototype.updateDashboard=function(...args){previousDashboard.apply(this,args);if(this.analyticsBound&&el('analytics')?.classList.contains('active'))this.generateAnalytics();};
@@ -49,7 +49,7 @@ Object.assign(Tracker.prototype,{
   }else if(view==='forecast'){
    const scenarioType=el('analytics-scenario-type').value,value=Number(el('analytics-scenario-value').value),days=s.forecast.length-1;
    if(!el('analytics-scenario-value').value.trim())throw Error('请输入假设数值');const values=A.scenario(s.current[metric],days,{type:scenarioType,value});
-   output.innerHTML=card('未来预计曲线',plot('analysis-main-chart'),`按已登记的未来账单和 ${s.activeRuleCount} 条启用规则推演；不创建账单，不写余额，不代表实际收益。虚线为独立假设情景，不与周期基线重复相加。`)+card('周期现金流热区',plot('analysis-cashflow-chart')+table(['规则','预测期次数','支出','收入'],s.cashflowProjection.map(r=>[h(r.name),r.count,m(r.expense),m(r.income)])),'累计预测期内实际出现的次数；停用规则与已登记的同日规则账单不重复生成。')+card('未来逐日明细',table(['日期',metricNames[metric]+'基线','假设情景'],s.forecast.map((r,i)=>[h(r.date),r.missing.length?'缺少汇率':m(r[metric]),m(values[i])])));
+   output.innerHTML=card('未来预计曲线','<p class="analysis-caution">预测仅作情景分析，不代表实际收益。</p>'+plot('analysis-main-chart'),`按已登记的未来账单和 ${s.activeRuleCount} 条启用规则推演；不创建账单，不写余额。虚线为独立假设情景，不与周期基线重复相加。`)+card('周期现金流热区',plot('analysis-cashflow-chart')+table(['规则','预测期次数','支出','收入'],s.cashflowProjection.map(r=>[h(r.name),r.count,m(r.expense),m(r.income)])),'累计预测期内实际出现的次数；停用规则与已登记的同日规则账单不重复生成。')+card('未来逐日明细',table(['日期',metricNames[metric]+'基线','假设情景'],s.forecast.map((r,i)=>[h(r.date),r.missing.length?'缺少汇率':m(r[metric]),m(values[i])])));
    this.drawAnalysisChart('analysis-main-chart','line',s.forecast.map(r=>r.date),[{label:'周期基线 · '+metricNames[metric],data:s.forecast.map(r=>r.missing.length?null:r[metric])},{label:'假设情景',data:s.current.missing.length?values.map(()=>null):values,borderDash:[5,4]}]);
    this.drawAnalysisChart('analysis-cashflow-chart','bar',s.cashflowProjection.map(r=>r.name),[{label:'预计支出',data:s.cashflowProjection.map(r=>r.expense)},{label:'预计收入',data:s.cashflowProjection.map(r=>r.income)}]);
   }else{

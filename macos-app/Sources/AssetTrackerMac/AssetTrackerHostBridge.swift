@@ -26,6 +26,7 @@ private enum AssetTrackerBridgeError: LocalizedError {
 
 @MainActor
 final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
+    private var billOCRInProgress = false
     private weak var webView: WKWebView?
     private weak var hostWindow: NSWindow?
     private let bookStore: AssetTrackerBookStore
@@ -87,6 +88,8 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
 
         let payload = body["payload"] as? [String: Any] ?? [:]
         switch type {
+        case "bill.ocr":
+            handleBillOCR(requestID: requestID)
         case "agent.request":
             Task { @MainActor in
                 do { let result = try await agentService.request(payload); sendResponse(id: requestID, ok: true, result: .string(result), error: nil) }
@@ -406,6 +409,38 @@ final class AssetTrackerHostBridge: NSObject, WKScriptMessageHandler {
             throw AssetTrackerBridgeError.invalidPayload("无效的 \(key)")
         }
         return string
+    }
+
+    private func handleBillOCR(requestID: String) {
+        guard !billOCRInProgress else {
+            sendResponse(id: requestID, ok: false, result: nil, error: "图片正在识别，请稍候")
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.png, .jpeg, .heic]
+        panel.message = "选择账单截图，文字只在这台 Mac 上识别"
+        guard panel.runModal() == .OK, let url = panel.url else {
+            sendResponse(id: requestID, ok: false, result: nil, error: "用户取消了操作")
+            return
+        }
+        billOCRInProgress = true
+        Task { @MainActor in
+            defer { billOCRInProgress = false }
+            do {
+                let text = try await Task.detached(priority: .userInitiated) {
+                    let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+                    guard size > 0, size <= 12 * 1024 * 1024 else {
+                        throw NSError(domain: "AssetTrackerBillOCR", code: 1, userInfo: [NSLocalizedDescriptionKey: "图片为空或超过 12 MB"])
+                    }
+                    return try AssetTrackerBillOCR.recognize(data: Data(contentsOf: url))
+                }.value
+                sendResponse(id: requestID, ok: true, result: .object(["text": .string(text), "engine": .string("macOS Vision · offline")]), error: nil)
+            } catch {
+                sendResponse(id: requestID, ok: false, result: nil, error: error.localizedDescription)
+            }
+        }
     }
 
     private func openImportPanel(payload: [String: Any]) throws -> AssetTrackerBridgeJSONValue {

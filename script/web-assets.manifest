@@ -5,6 +5,8 @@ expense-projects.js
 project-ui.js
 ledger-insights.js
 insights-ui.js
+ledger-dedup.js
+bill-recognition.js
 ledger-import.js
 legacy-safety.js
 script.js
@@ -30,6 +32,8 @@ workspace-model.js
 agent-provider.js
 workspace-fit.js
 workspace-ui.js
+bill-ui.js
+dedup-review-ui.js
 workspace-screen.js
 workspace.css
 assets/icons/LICENSE

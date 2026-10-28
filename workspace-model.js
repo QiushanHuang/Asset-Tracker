@@ -1,8 +1,8 @@
 (function (root, factory) {
-  const api = factory();
+  const api = factory(typeof module === 'object' && module.exports ? require('./ledger-dedup') : root.AssetTrackerDedup, typeof module === 'object' && module.exports ? require('./legacy-safety') : root.AssetTrackerLegacySafety);
   if (typeof module === 'object' && module.exports) module.exports = api;
   root.AssetTrackerWorkspace = api;
-})(globalThis, function () {
+})(globalThis, function (D, S) {
   'use strict';
   const clone = value => JSON.parse(JSON.stringify(value));
   const round = value => Math.round((value + Number.EPSILON) * 100) / 100;
@@ -93,31 +93,64 @@
     if(typeof draft.id!=='string'||!/^[a-zA-Z0-9:_-]{1,180}$/.test(draft.id))throw Error('草稿身份无效');
     return draft.source==='import'&&typeof draft.sourceId==='string'&&draft.sourceId.length<=200?draft.sourceId:'draft:'+draft.id;
   }
-  function applyDrafts(book,drafts,expectedSource) {
+  function draftTransaction(draft) {
+    const p=draft.proposal||{};
+    return {id:transactionId(draft),date:p.date,accountId:p.accountId,amount:p.amount?Number(p.amount)*(p.direction==='expense'?-1:1):NaN,currency:p.currency,description:p.description||'',purpose:p.purpose||'',projectId:p.projectId||'',expenseCategoryId:p.expenseCategoryId||'',...(draft.sourceIdentity?{sourceIdentity:clone(draft.sourceIdentity)}:{})};
+  }
+  function duplicateReviewBasis(book,pendingDrafts=[],scope) {
+    // Recompute this value on every check: ledger objects and account trees can
+    // change in place. Decisions and presentation-only draft fields are excluded.
+    return JSON.stringify([D.RULE_VERSION||'1',scope??null,book.workspaceScope||'legacy-local',book.categories,book.settings?.baseCurrency,book.importAudits||[],
+      book.transactions||[],pendingDrafts.filter(d=>d.status==='pending').map(d=>[d.id,draftTransaction(d)])]);
+  }
+  function createDuplicateReviewer(book,pendingDrafts=[]) {
+    const known=new Set((book.transactions||[]).map(t=>t.id)),positions=new Map(),index=D.createIndex(book.transactions||[],{book});
+    const auditContext=book.importAudits?.length?S.sha256Hex(new TextEncoder().encode(JSON.stringify(book.importAudits))):'';
+    const accountContext=[D.RULE_VERSION||'1',auditContext,book.workspaceScope||'legacy-local',book.settings?.baseCurrency,
+      accounts(book).map(a=>[a.id,a.name,a.currency,a.isDebt,a.node?.sourceCategoryId??null])];
+    for(const d of pendingDrafts)if(d.status==='pending'&&!known.has(transactionId(d)))positions.set(d.id,index.add(draftTransaction(d)));
+    return draft=>{
+      const candidate=draftTransaction(draft),matches=index.findMatches(candidate,{excludePosition:positions.get(draft.id)});
+      const signature=JSON.stringify([accountContext,candidate,matches.total,matches.map(m=>[m.level,m.transaction,m.kind,m.evidence,m.reasons,m.differences]).sort((a,b)=>String(a[1].id).localeCompare(String(b[1].id)))]);
+      return {matches,matchCount:matches.total,signature,blocked:matches.total>20||matches.some(m=>m.level==='exact'||m.level==='conflict')};
+    };
+  }
+  function reviewDuplicates(book,draft,pendingDrafts=[]) {return createDuplicateReviewer(book,pendingDrafts)(draft);}
+  function applyDrafts(book,drafts,expectedSource,{pendingDrafts=drafts}={}) {
     if(expectedSource!==undefined&&JSON.stringify(book)!==expectedSource)throw Error('账本已有变化，请重新核对');
     if(!Array.isArray(drafts)||!drafts.length||drafts.length>1000)throw Error('请选择 1–1000 笔草稿');
     const next=clone(book),existing=new Set([...next.transactions.map(t=>t.id),...(next.workspaceReceipts||[])]),map=new Map(accounts(next).map(a=>[a.id,a]));
     next.workspaceReceipts=[...new Set(next.workspaceReceipts||[])];
-    for(const draft of drafts){const id=transactionId(draft);if(existing.has(id))continue;
+    const reviewDraft=createDuplicateReviewer(book,pendingDrafts);
+    for(const draft of drafts){const id=transactionId(draft);
+      const stored=next.transactions.find(t=>t.id===id);
+      if(stored){if(D.compare(draftTransaction(draft),stored,{book:next})?.level!=='exact')throw Error('记录ID内容冲突，请重新核对');continue;}
+      if(existing.has(id))continue;
+      const review=reviewDraft(draft);
+      if(review.blocked)throw Error('来源或记录ID已有记录或内容冲突，请核对重复来源，不能重复入账');
+      if(review.matches.length&&!(draft.duplicateDecision?.action==='keep'&&draft.duplicateDecision.signature===review.signature))throw Error('请重新核对疑似重复记录及其匹配依据');
       if(draft.status!=='pending')throw Error('草稿状态不能提交');if(draft.error)throw Error(draft.error);
       const p=proposal(next,draft.proposal),a=map.get(p.accountId),amount=Number(p.amount)*(p.direction==='expense'?-1:1);
       const converted=amount*rate(next,p.currency)/rate(next,a.currency);
       a.node.balance+=a.isDebt?-converted:converted;if(!Number.isFinite(a.node.balance)||Math.abs(a.node.balance)>1e15)throw Error('余额超出范围');
       next.transactions.push({id,date:p.date,accountId:a.id,category:a.names[0],subcategory:a.names.length>1?a.names.at(-1):'',amount,currency:p.currency,type:'单次',purpose:p.purpose,description:p.description,projectId:p.projectId,expenseCategoryId:p.expenseCategoryId,
-        sourceDraftId:draft.id,reviewSource:{kind:String(draft.source||'manual'),text:String(draft.sourceText||''),evidence:String(draft.evidence||'')},...(draft.sourceAutomationRuleId?{sourceAutomationRuleId:draft.sourceAutomationRuleId}: {})});
+        ...(draft.sourceIdentity?{sourceIdentity:clone(draft.sourceIdentity)}:{}),sourceDraftId:draft.id,reviewSource:{kind:String(draft.source||'manual'),text:String(draft.sourceText||''),evidence:String(draft.evidence||'')},...(draft.sourceAutomationRuleId?{sourceAutomationRuleId:draft.sourceAutomationRuleId}: {})});
       existing.add(id);
       next.workspaceReceipts.push(id);
       if(draft.sourceAutomationRuleId){const rule=(next.automationRules||[]).find(r=>r.id===draft.sourceAutomationRuleId);if(rule&&(!rule.lastExecuted||String(rule.lastExecuted).slice(0,10)<p.date.slice(0,10)))rule.lastExecuted=p.date;}
     }
     return next;
   }
-  function reconcile(book,drafts) {const ids=new Set([...(book.transactions||[]).map(t=>t.id),...(book.workspaceReceipts||[])]);return drafts.map(d=>({...d,status:ids.has(transactionId(d))?'committed':d.status}));}
-  function compactDrafts(drafts){return [...drafts.filter(d=>d.status==='pending'),...drafts.filter(d=>d.status!=='pending').slice(-200)];}
-  function duplicateGroups(book) {
-    const map=new Map();for(const t of book.transactions||[]){if(t.transferId)continue;const key=JSON.stringify([dateKey(t.date),t.accountId||[t.category,t.subcategory],t.amount,t.currency,t.description||'']);const g=map.get(key)||[];g.push(t);map.set(key,g);}
-    return [...map.values()].filter(g=>g.length>1);
+  function reconcile(book,drafts) {
+    const existing=new Map((book.transactions||[]).map(t=>[t.id,t])),receipts=new Set(book.workspaceReceipts||[]);
+    return drafts.map(d=>{const id=transactionId(d),t=existing.get(id);
+      if(t&&D.compare(draftTransaction(d),t,{book})?.level!=='exact')return d.status==='pending'&&d.error==='记录ID内容冲突，请核对原记录'?d:{...d,status:'pending',error:'记录ID内容冲突，请核对原记录'};
+      const status=t||receipts.has(id)?'committed':d.status;return status===d.status?d:{...d,status};
+    });
   }
-  function fromTransaction(t,id,source='import') {return {id,source,sourceId:t.id,status:'pending',sourceAutomationRuleId:t.sourceAutomationRuleId,
+  function compactDrafts(drafts){return [...drafts.filter(d=>d.status==='pending'),...drafts.filter(d=>d.status!=='pending').slice(-200)];}
+  function duplicateGroups(book) { return D.scan(book.transactions||[],{book}).map(m=>[m.left,m.right]); }
+  function fromTransaction(t,id,source='import') {return {id,source,sourceId:t.id,status:'pending',...(t.sourceIdentity?{sourceIdentity:clone(t.sourceIdentity)}:{}),sourceAutomationRuleId:t.sourceAutomationRuleId,
     proposal:{date:t.date,amount:String(Math.abs(t.amount)),direction:t.amount<0?'expense':'income',currency:t.currency||'CNY',accountId:t.accountId||'',purpose:t.purpose||'',description:t.description||'',projectId:t.projectId||'',expenseCategoryId:t.expenseCategoryId||''}};}
   function ruleDrafts(book,rule,at,schedule){
     if(!rule.active)return [];let day=dateKey(rule.startDate);at=dateKey(at);const end=rule.endDate&&rule.endDate<at?dateKey(rule.endDate):at;
@@ -132,5 +165,5 @@
       const next=new Date(day+'T12:00:00Z');next.setUTCDate(next.getUTCDate()+1);day=next.toISOString().slice(0,10);
     }return result;
   }
-  return Object.freeze({MODULES,preferences,preset,dateKey,today,accounts,cashflow,proposal,applyDrafts,reconcile,transactionId,duplicateGroups,fromTransaction,ruleDrafts,compactDrafts});
+  return Object.freeze({MODULES,preferences,preset,dateKey,today,accounts,cashflow,proposal,applyDrafts,reconcile,transactionId,draftTransaction,duplicateReviewBasis,reviewDuplicates,createDuplicateReviewer,duplicateGroups,fromTransaction,ruleDrafts,compactDrafts});
 });

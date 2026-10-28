@@ -279,10 +279,10 @@ function loadAssetTracker({
     const alipayContent = fs.readFileSync(path.join(__dirname, '..', '..', 'alipay-import.js'), 'utf8');
     const wechatContent = fs.readFileSync(path.join(__dirname, '..', '..', 'wechat-import.js'), 'utf8');
     const wechatUIContent = fs.readFileSync(path.join(__dirname, '..', '..', 'wechat-import-ui.js'), 'utf8');
-    const importContent = fs.readFileSync(path.join(__dirname, '..', '..', 'ledger-import.js'), 'utf8');
+    const importContent = ['ledger-dedup.js', 'bill-recognition.js', 'ledger-import.js'].map(name => fs.readFileSync(path.join(__dirname, '..', '..', name), 'utf8')).join('\n');
     const safetyContent = fs.readFileSync(safetyPath, 'utf8');
     const scriptContent = fs.readFileSync(scriptPath, 'utf8');
-    const workspaceContent = ['workspace-model.js', 'agent-provider.js', 'workspace-fit.js', 'workspace-ui.js', 'workspace-screen.js'].map(name => fs.readFileSync(path.join(__dirname, '..', '..', name), 'utf8')).join('\n');
+    const workspaceContent = ['workspace-model.js', 'agent-provider.js', 'workspace-fit.js', 'workspace-ui.js', 'bill-ui.js', 'dedup-review-ui.js', 'workspace-screen.js'].map(name => fs.readFileSync(path.join(__dirname, '..', '..', name), 'utf8')).join('\n');
     const domEvents = {};
     const windowEvents = {};
     const elements = new Map();
@@ -471,6 +471,7 @@ function loadAssetTracker({
         setInterval: trackedSetInterval,
         clearInterval: trackedClearInterval,
         TextDecoder,
+        TextEncoder,
         crypto: require('node:crypto').webcrypto,
         Blob,
         Event,

@@ -25,7 +25,8 @@
   min-height: 24px;
   margin: 8px 0 18px;
   padding: 10px 14px;
-  background: #eeecfb;
+  background: var(--ws-soft, #eeecfb);
+  color: var(--ws-ink, #202b40);
   border-radius: 8px;
   overflow-wrap: anywhere;
 }
@@ -34,17 +35,23 @@
 }
 .nas-status.negative {
   background: #fceced;
+  color: #8e2637;
 }
 .nas-intro {
-  margin: 24px 0;
+  margin: 12px 0 18px;
   max-width: 640px;
+}
+.nas-auth .nas-actions [aria-pressed="true"] {
+  background: var(--ws-soft, #eeecfb);
+  border-color: var(--ws-accent, #5545bf);
+  color: var(--ws-accent, #5545bf);
 }
 .nas-intro h3 {
   font-size: 28px;
   margin: 8px 0 14px;
 }
 .nas-intro p {
-  color: #627088;
+  color: var(--ws-muted, #526079);
   line-height: 1.8;
 }
 .nas-auth {
@@ -60,7 +67,7 @@
   flex-direction: column;
   gap: 7px;
   font-size: 13px;
-  color: #526079;
+  color: var(--ws-muted, #526079);
   min-width: 0;
 }
 [data-nas-root] input,
@@ -69,9 +76,10 @@
   width: 100%;
   min-width: 0;
   padding: 9px 11px;
-  border: 1px solid #d8deea;
+  border: 1px solid var(--ws-line, #d8deea);
   border-radius: 8px;
-  background: white;
+  background: var(--ws-surface, white);
+  color: var(--ws-ink, #202b40);
   font: inherit;
 }
 [data-nas-root] input[type="checkbox"] {
@@ -119,13 +127,13 @@
 .nas-ledgers small {
   display: block;
   margin-top: 7px;
-  color: #627088;
+  color: var(--ws-muted, #526079);
   font-weight: 400;
 }
 .nas-ledgers [aria-pressed="true"] {
-  background: #eeecfb;
-  border-color: #a69add;
-  color: #44359c;
+  background: var(--ws-soft, #eeecfb);
+  border-color: var(--ws-accent, #a69add);
+  color: var(--ws-accent, #44359c);
 }
 .nas-ledgers .card {
   margin-bottom: 0;
@@ -145,7 +153,7 @@
   margin: 18px 0;
 }
 .nas-account-balances > div {
-  background: #f6f7fb;
+  background: var(--ws-sidebar, #f6f7fb);
   padding: 14px;
   border-radius: 8px;
   min-width: 0;
@@ -156,7 +164,7 @@
   overflow-wrap: anywhere;
 }
 .nas-account-balances span {
-  color: #627088;
+  color: var(--ws-muted, #526079);
   font-size: 12px;
   margin-bottom: 8px;
 }
@@ -182,7 +190,7 @@
   justify-content: space-between;
   align-items: center;
   padding: 15px 0;
-  border-bottom: 1px solid #e1e6ef;
+  border-bottom: 1px solid var(--ws-line, #e1e6ef);
   gap: 14px;
 }
 .nas-record-list article > div {
@@ -191,7 +199,7 @@
 }
 .nas-record-list small {
   display: block;
-  color: #627088;
+  color: var(--ws-muted, #526079);
   font-size: 12px;
   font-weight: 400;
   margin-top: 5px;
@@ -210,7 +218,7 @@
   align-items: center;
   gap: 12px;
   padding: 10px 0;
-  border-bottom: 1px solid #e1e6ef;
+  border-bottom: 1px solid var(--ws-line, #e1e6ef);
 }
 .nas-version-list {
   max-height: 300px;
@@ -229,7 +237,7 @@
   flex-wrap: wrap;
   align-items: center;
   padding: 16px 0;
-  border-bottom: 1px solid #e1e6ef;
+  border-bottom: 1px solid var(--ws-line, #e1e6ef);
 }
 .nas-household .nas-actions {
   margin: 18px 0;

@@ -2,6 +2,9 @@
   'use strict';
   const el=id=>document.getElementById(id);
   const fit=root.AssetTrackerWorkspaceFit;
+  const set=(object,key,value)=>{if(object[key]!==value)object[key]=value;};
+  const attribute=(node,name,value)=>{if(node.getAttribute(name)!==value)node.setAttribute(name,value);};
+  const toggle=(node,name,value)=>{if(node.classList.contains(name)!==value)node.classList.toggle(name,value);};
   root.AssetTrackerWorkspaceScreen={install(Tracker){
     const setup=Tracker.prototype.setupWorkspace;
     Tracker.prototype.setupWorkspace=async function(...args){
@@ -10,8 +13,15 @@
       this.ws.screenReady=true;
       window.addEventListener('resize',()=>this.scheduleWorkspaceFit());
       if(typeof root.MutationObserver==='function'){
-        this.ws.screenObserver=new root.MutationObserver(()=>this.scheduleWorkspaceFit());
-        for(const id of ['data-safety-status','app-status','workspace-agent-result'])if(el(id))this.ws.screenObserver.observe(el(id),{childList:true,subtree:true,characterData:true});
+        const nodes=['data-safety-status','app-status','workspace-agent-result'].map(el).filter(Boolean);
+        const signature=node=>JSON.stringify([node.innerHTML,node.hidden,node.className,node.style.cssText,node.dataset.state]);
+        const previous=new Map(nodes.map(node=>[node,signature(node)]));
+        this.ws.screenObserver=new root.MutationObserver(()=>{
+          let changed=false;
+          for(const node of nodes){const value=signature(node);if(previous.get(node)!==value){previous.set(node,value);changed=true;}}
+          if(changed)this.scheduleWorkspaceFit();
+        });
+        for(const node of nodes)this.ws.screenObserver.observe(node,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['hidden','class','style','data-state']});
       }
       this.scheduleWorkspaceFit();
     };
@@ -27,10 +37,11 @@
       fitWorkspace(){
         const shell=el('normal-app-shell'),section=document.querySelector('.content-section.active');
         // Non-layout environments (including data tests) keep the regular document flow.
-        if(!shell||!section||!shell.getBoundingClientRect().width||!root.innerHeight)return;
-        document.documentElement.dataset.workspaceFit='true';
-        document.documentElement.dataset.workspaceShort=String(root.innerHeight<820);
-        shell.style.height=Math.max(240,root.innerHeight-Math.max(0,shell.getBoundingClientRect().top))+'px';
+        if(!shell||!section||!root.innerHeight)return;
+        const bounds=shell.getBoundingClientRect();if(!bounds.width)return;
+        set(document.documentElement.dataset,'workspaceFit','true');
+        set(document.documentElement.dataset,'workspaceShort',String(root.innerHeight<820));
+        set(shell.style,'height',Math.max(240,root.innerHeight-Math.max(0,bounds.top))+'px');
         if(section.id==='dashboard')this.fitWorkspaceDashboard(section);
         else if(section.id==='workspace-review')this.fitWorkspaceReview(section);
         else if(section.id==='transactions')this.fitWorkspaceTransactions(section);
@@ -38,7 +49,7 @@
         else if(section.id==='settings')this.workspacePanels(section,[...section.querySelectorAll('.settings-container>.card')],'bookSettings');
         else if(section.id==='import-export')this.workspacePanels(section,[...section.querySelectorAll('.import-export-container>.card'),section.querySelector('.danger-zone')],'files');
         else if(section.id==='automation'){
-          this.workspacePanels(section,[section.querySelector('.automation-container'),...section.querySelectorAll('#workspace-automation-log>section')],'rules');
+          this.workspacePanels(section,[section.querySelector('.automation-container'),...section.querySelectorAll('#workspace-automation-log>section')],'automationPanel');
           this.fitWorkspaceTable(section.querySelector('.ws-panel-current .ws-ledger-table'),section);
         }
         else if(section.id==='analytics')this.fitWorkspaceAnalytics(section);
@@ -48,12 +59,13 @@
         if(height<=0||width<=0)return;
         const p=this.ws.prefs,modules=p.modules.filter(m=>m.visible).map(m=>({...m}));
         const assistant=modules.find(m=>m.id==='assistant');
-        if(assistant)assistant.minHeight=(width<600?94:80)+(el('workspace-agent-result').textContent.trim()?32:0);
-        const assets=modules.find(m=>m.id==='assets');if(assets)assets.minHeight=width<600?70:54;
+        if(assistant)assistant.minHeight=this.workspaceAssistantMinHeight(width);
+        const assets=modules.find(m=>m.id==='assets');if(assets)assets.minHeight=width<600?60:54;
         const cashflow=modules.find(m=>m.id==='cashflow');if(cashflow&&el('workspace-cashflow').querySelector('.ws-inline-note'))cashflow.minHeight=106;
         if(p.metricEmphasis==='net-assets'){const index=modules.findIndex(m=>m.id==='assets');if(index>0)modules.unshift(modules.splice(index,1)[0]);}
-        let plan=fit.plan(modules,{width,height,gap:6});
-        if(plan.pages.length>1)plan=fit.plan(modules,{width,height:height-36,gap:6});
+        const planKey=JSON.stringify([width,height,modules]);
+        let plan=this.ws.dashboardFitCache?.key===planKey?this.ws.dashboardFitCache.plan:null;
+        if(!plan){plan=fit.plan(modules,{width,height,gap:6});if(plan.pages.length>1)plan=fit.plan(modules,{width,height:height-36,gap:6});this.ws.dashboardFitCache={key:planKey,plan};}
         const focused=document.activeElement?.closest?.('[data-ws-module]')?.dataset.wsModule;
         const anchor=focused||this.ws.dashboardAnchor;
         const anchorPage=anchor?plan.pages.findIndex(page=>page.items.some(item=>item.id===anchor)):-1;
@@ -62,29 +74,69 @@
         this.ws.dashboardPlan=plan;
         const page=plan.pages[this.ws.dashboardPage];
         this.ws.dashboardAnchor=focused||page?.items[0]?.id;
-        grid.style.gridTemplateRows=page?.rows.map(h=>h+'px').join(' ')||'none';
-        grid.dataset.compact=String(plan.compact);
+        set(grid.style,'gridTemplateRows',page?.rows.map(h=>h+'px').join(' ')||'none');
+        set(grid.dataset,'compact',String(plan.compact));
         const onPage=new Map(page?.items.map(item=>[item.id,item])||[]);
         grid.querySelectorAll('[data-ws-module]').forEach(node=>{
-          const item=onPage.get(node.dataset.wsModule);node.classList.toggle('ws-off-page',!item);
+          const item=onPage.get(node.dataset.wsModule),wasOff=node.classList.contains('ws-off-page');toggle(node,'ws-off-page',!item);
           if(!item)return;
-          node.style.gridRow=String(item.row+1);node.style.gridColumn=`${item.column+1} / span ${item.span}`;
-          node.style.height=item.height+'px';node.dataset.short=String(item.height<130);
+          set(node.style,'gridRow',String(item.row+1));set(node.style,'gridColumn',`${item.column+1} / span ${item.span}`);
+          set(node.style,'height',item.height+'px');set(node.dataset,'short',String(item.height<130));
+          // A hidden assistant cannot be measured. Recheck its natural controls
+          // once after revealing it; subsequent stable fits do not reschedule.
+          if(node.dataset.wsModule==='assistant'&&wasOff)this.scheduleWorkspaceFit();
           if(node.dataset.wsModule==='recent'){
             const count=Math.max(1,Math.min(p.recentCount,Math.floor((item.height-60)/29)));
-            node.querySelectorAll('tbody tr').forEach((row,index)=>row.hidden=index>=count);
+            node.querySelectorAll('tbody tr').forEach((row,index)=>set(row,'hidden',index>=count));
           }
         });
         this.workspacePager(section,'workspace-home-pages',this.ws.dashboardPage,plan.pages.length,index=>{this.ws.dashboardPage=index;this.ws.dashboardAnchor=plan.pages[index]?.items[0]?.id;this.scheduleWorkspaceFit();},'首页模块');
-        Object.values(this.charts||{}).forEach(chart=>chart?.resize?.());
+        this.resizeWorkspaceCharts(Object.values(this.charts||{}));
+      },
+      workspaceAssistantMinHeight(width){
+        const card=el('workspace-assistant'),narrow=width<600,fallback=narrow?142:100,result=el('workspace-agent-result');
+        const hasResult=!!result?.textContent.trim()&&!result.hidden;
+        const css=node=>typeof root.getComputedStyle==='function'?root.getComputedStyle(node):{};
+        const px=(style,name)=>parseFloat(style[name])||0;
+        const outer=(node,includeMargin=true)=>{const s=css(node);return px(s,'paddingTop')+px(s,'paddingBottom')+px(s,'borderTopWidth')+px(s,'borderBottomWidth')+(includeMargin?px(s,'marginTop')+px(s,'marginBottom'):0);};
+        // Measure controls, not their grid row or the card's assigned height:
+        // 1fr/stretch otherwise turns spare space into a growing minimum.
+        const contentHeight=node=>{
+          if(!node)return 0;
+          const rects=[...node.children].filter(child=>!child.hidden&&!child.classList.contains('sr-only')).map(child=>child.getBoundingClientRect()).filter(rect=>rect.width>0&&rect.height>0);
+          return rects.length?Math.max(...rects.map(rect=>rect.bottom))-Math.min(...rects.map(rect=>rect.top)):0;
+        };
+        const title=card.querySelector('.ws-assistant-title'),form=el('workspace-agent-form'),actions=card.querySelector('.ws-assistant-actions');
+        const titleHeight=contentHeight(title),formHeight=contentHeight(form),actionsHeight=contentHeight(actions);
+        let minimum;
+        if(!formHeight||!actionsHeight){minimum=Math.max(fallback,this.ws.assistantHeight?.width===width?this.ws.assistantHeight.height:0);}
+        else{
+          const gap=px(css(card),'rowGap'),controls=formHeight+outer(form)+actionsHeight+outer(actions)+gap;
+          minimum=Math.max(fallback,outer(card,false)+(narrow?titleHeight+outer(title)+controls+gap:Math.max(titleHeight+outer(title),controls)));
+          this.ws.assistantHeight={width,height:minimum};
+        }
+        if(hasResult){const s=css(result),rect=result.getBoundingClientRect();minimum+=(rect.height>0?rect.height+px(s,'marginTop')+px(s,'marginBottom'):32)+px(css(card),'rowGap');}
+        return Math.ceil(minimum);
+      },
+      resizeWorkspaceCharts(charts){
+        const sizes=this.ws.chartFitSizes||(this.ws.chartFitSizes=new WeakMap());
+        for(const chart of charts){
+          if(typeof chart?.resize!=='function')continue;
+          const container=chart.canvas?.parentElement;
+          if(!container){chart.resize();continue;}
+          const rect=container.getBoundingClientRect();if(!rect.width||!rect.height){sizes.delete(chart);continue;}
+          const key=`${rect.width}:${rect.height}:${root.devicePixelRatio||1}`;
+          if(sizes.get(chart)===key)continue;
+          chart.resize();sizes.set(chart,key);
+        }
       },
       workspacePager(parent,id,page,pages,change,label){
         let node=el(id);if(!node){node=document.createElement('nav');node.id=id;node.className='ws-page-switch';node.setAttribute('aria-label',label+'分页');parent.append(node);}
-        node.hidden=pages<=1;
+        set(node,'hidden',pages<=1);
         if(!node.children.length)node.innerHTML='<button type="button" class="btn btn-sm">上一页</button><span></span><button type="button" class="btn btn-sm">下一页</button>';
-        node.querySelector('span').textContent=`${page+1} / ${Math.max(1,pages)}`;
-        const buttons=node.querySelectorAll('button');buttons[0].disabled=page<=0;buttons[1].disabled=page>=pages-1;
-        buttons[0].setAttribute('aria-label','上一页'+label);buttons[1].setAttribute('aria-label','下一页'+label);
+        set(node.querySelector('span'),'textContent',`${page+1} / ${Math.max(1,pages)}`);
+        const buttons=node.querySelectorAll('button');set(buttons[0],'disabled',page<=0);set(buttons[1],'disabled',page>=pages-1);
+        attribute(buttons[0],'aria-label','上一页'+label);attribute(buttons[1],'aria-label','下一页'+label);
         buttons[0].onclick=()=>change(page-1);buttons[1].onclick=()=>change(page+1);
       },
       focusWorkspaceAssistant(){
@@ -147,7 +199,7 @@
         controls.classList.toggle('ws-controls-open',!!this.ws.analysisControlsOpen);
         const current=output.querySelector('.ws-panel-current');
         this.fitWorkspaceTable(current?.querySelector('.analysis-table'),current);
-        (this.analysisCharts||[]).forEach(chart=>chart?.resize?.());
+        this.resizeWorkspaceCharts(this.analysisCharts||[]);
       },
       fitWorkspaceTable(table,container){
         if(!table||!container||!table.getBoundingClientRect().height)return;

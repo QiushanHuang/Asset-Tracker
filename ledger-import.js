@@ -1,8 +1,8 @@
 (function (root, factory) {
-  const api = factory();
+  const api = factory(typeof module === 'object' && module.exports ? require('./ledger-dedup') : root.AssetTrackerDedup);
   if (typeof module === "object" && module.exports) module.exports = api;
   root.AssetTrackerImport = api;
-})(globalThis, function () {
+})(globalThis, function (D) {
   "use strict";
   const clone = (x) => JSON.parse(JSON.stringify(x));
   const text = (x) => String(x ?? "").trim();
@@ -76,6 +76,8 @@
     );
     return book.transactions.map((t) => ({
       记录ID: t.id,
+      来源平台: t.sourceIdentity?.provider || "",
+      来源交易号: t.sourceIdentity?.id || "",
       日期: t.date,
       账户ID: t.accountId || "",
       类别: t.category,
@@ -100,7 +102,7 @@
       throw Error("单次导入最多 50,000 行");
     const available = accounts(book),
       ids = new Map(book.transactions.map((t) => [t.id, t])),
-      seen = new Set(book.transactions.map(fingerprint));
+      index = D.createIndex(book.transactions, { book });
     const plan = {
       source: JSON.stringify(book),
       accepted: [],
@@ -110,6 +112,7 @@
       total: input.length,
     };
     input.forEach((r, i) => {
+      let t;
       try {
         if (text(r["内部转账ID"]) || text(r["用途分类"]) === "内部转账")
           throw Error("内部转账必须保留配对信息，请使用完整 JSON 导入");
@@ -136,7 +139,7 @@
         if (matches.length !== 1)
           throw Error("无法唯一匹配资金账户，请填写账户ID或修正类别");
         const a = matches[0];
-        const t = {
+        t = {
           id:
             text(r["记录ID"]) ||
             "import-" + Date.now().toString(36) + "-" + ++sequence,
@@ -152,6 +155,10 @@
           projectId: text(r["项目ID"]) || null,
           expenseCategoryId: text(r["消费分类ID"]) || null,
         };
+        if (text(r["来源平台"]) || text(r["来源交易号"])) {
+          if (typeof r["来源交易号"] !== 'string' || !text(r["来源交易号"]) || !text(r["来源平台"])) throw Error('来源平台和交易号须同时为文本；长数字请使用文本格式');
+          t.sourceIdentity = { provider: text(r["来源平台"]), id: text(r["来源交易号"]) };
+        }
         t.includeTime = t.date.includes("T");
         if (
           Object.values(t).some((v) => typeof v === "string" && v.length > 2000)
@@ -177,18 +184,21 @@
         const key = fingerprint(t);
         const existing = ids.get(t.id);
         if (existing) {
-          if (fingerprint(existing) !== key)
+          if (fingerprint(existing) !== key || D.compare(t, existing, { book })?.level !== "exact")
             throw Error("记录ID内容冲突，请人工核对");
           plan.duplicates.push({ row: i + 2, transaction: t });
           return;
         }
-        const item = { row: i + 2, transaction: t };
-        if (seen.has(key)) plan.suspected.push(item);
+        const duplicateMatches = index.findMatches(t);
+        const item = { row: i + 2, transaction: t, matches: duplicateMatches, matchCount: duplicateMatches.total };
+        if (duplicateMatches.some(m => m.level === 'conflict')) throw Error('来源交易号内容冲突，请人工核对');
+        if (duplicateMatches.some(m => m.level === 'exact')) { plan.duplicates.push(item); return; }
+        if (duplicateMatches.length) plan.suspected.push(item);
         else plan.accepted.push(item);
         ids.set(t.id, t);
-        seen.add(key);
+        index.add(t);
       } catch (e) {
-        plan.errors.push({ row: i + 2, message: e.message });
+        plan.errors.push({ row: i + 2, message: e.message, ...(t ? { transaction: t } : {}) });
       }
     });
     return plan;
